@@ -1,0 +1,14 @@
+# server runtime data
+server/data/
+
+# Android build outputs
+android/.gradle/
+android/build/
+android/app/build/
+android/local.properties
+android/.idea/
+android/*.iml
+
+# packaged extension
+firefox-extension/*.zip
+firefox-extension/*.xpi

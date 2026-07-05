@@ -1,0 +1,31 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <style>
+    body { font: 13px system-ui, sans-serif; width: 300px; margin: 0; padding: 14px; }
+    h1 { font-size: 14px; margin: 0 0 4px; }
+    #page-title { color: #555; margin: 0 0 12px; max-height: 3em; overflow: hidden; }
+    button { width: 100%; padding: 10px; font-size: 14px; border: 0; border-radius: 6px;
+             background: #b45309; color: #fff; cursor: pointer; }
+    button:disabled { background: #bbb; cursor: default; }
+    #status { margin-top: 10px; min-height: 1.2em; }
+    #status.ok { color: #15803d; }
+    #status.err { color: #b91c1c; }
+    a { color: #b45309; font-size: 12px; }
+    .footer { margin-top: 12px; text-align: right; }
+    @media (prefers-color-scheme: dark) {
+      body { background: #1f1f1f; color: #eee; }
+      #page-title { color: #aaa; }
+    }
+  </style>
+</head>
+<body>
+  <h1>ReadLater</h1>
+  <p id="page-title">…</p>
+  <button id="save">Save this page</button>
+  <div id="status"></div>
+  <div class="footer"><a href="#" id="open-options">Settings</a></div>
+  <script src="popup.js"></script>
+</body>
+</html>
