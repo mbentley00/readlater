@@ -13,7 +13,7 @@ read-position sync, and text-to-speech playback that keeps going with the screen
 
 ### Android Studio (recommended)
 
-1. Open the `readlater/android` folder in Android Studio (Koala / AGP 8.5 compatible or newer).
+1. Open the `android` folder in Android Studio (Koala / AGP 8.5 compatible or newer).
 2. Let it sync — the project uses Gradle 8.14.3, AGP 8.5.2, Kotlin 2.0.20, JDK 17.
 3. Run the `app` configuration on a device or emulator (API 26+).
 
@@ -24,7 +24,7 @@ is checked in (no wrapper jar), so either use a locally installed Gradle (8.x) o
 generate the wrapper first:
 
 ```sh
-cd readlater/android
+cd android
 
 # Point the build at your SDK, either via env var...
 export ANDROID_HOME=/path/to/android-sdk

@@ -26,7 +26,7 @@ keeps reading with the screen off.
 Needs Node.js ≥ 18. No `npm install` required.
 
 ```sh
-cd readlater/server
+cd server
 node server.js
 ```
 
@@ -42,7 +42,7 @@ Run the test suite with `node test.js`.
 ## 2. Install the Firefox extension
 
 1. Open `about:debugging#/runtime/this-firefox` → **Load Temporary Add-on…** →
-   pick `readlater/firefox-extension/manifest.json`.
+   pick `firefox-extension/manifest.json`.
    (For a permanent install, zip the folder contents and sign it via
    [addons.mozilla.org](https://addons.mozilla.org/developers/) as an unlisted
    add-on, or use Firefox Developer Edition with `xpinstall.signatures.required=false`.)
@@ -61,10 +61,10 @@ and ships that HTML to your server. If you can read it, you can save it.
 ## 3. Build & install the Android app
 
 See [`android/README.md`](android/README.md). Short version: open
-`readlater/android` in Android Studio and run it, or:
+`android` in Android Studio and run it, or:
 
 ```sh
-cd readlater/android
+cd android
 ANDROID_HOME=/path/to/sdk gradle assembleDebug
 adb install app/build/outputs/apk/debug/app-debug.apk
 ```
