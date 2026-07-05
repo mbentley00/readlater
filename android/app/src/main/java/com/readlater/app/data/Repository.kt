@@ -132,6 +132,17 @@ class Repository(db: AppDatabase, private val api: ApiClient) {
         }
     }
 
+    /**
+     * Save the read position locally only — no immediate network call. The dirty
+     * flag defers the push to the next sync (or the next pushing save). Meant for
+     * high-frequency callers: scroll tracking and per-paragraph TTS advances.
+     */
+    fun saveReadPositionLocal(articleId: String, paragraphIndex: Int) {
+        bgScope.launch {
+            articleDao.setReadParagraph(articleId, paragraphIndex)
+        }
+    }
+
     fun addHighlight(articleId: String, text: String, note: String?, paragraphIndex: Int) {
         bgScope.launch {
             val highlight = HighlightEntity(

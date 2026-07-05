@@ -66,6 +66,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -83,6 +84,9 @@ import com.readlater.app.data.Block
 import com.readlater.app.data.HighlightEntity
 import com.readlater.app.data.HtmlParser
 import com.readlater.app.tts.TtsService
+import kotlinx.coroutines.FlowPreview
+import kotlinx.coroutines.flow.debounce
+import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.launch
 import java.util.Locale
 
@@ -109,7 +113,7 @@ private fun sendTtsCommand(
     }
 }
 
-@OptIn(ExperimentalMaterial3Api::class)
+@OptIn(ExperimentalMaterial3Api::class, FlowPreview::class)
 @Composable
 fun ReaderScreen(articleId: String, onBack: () -> Unit) {
     val context = LocalContext.current
@@ -147,6 +151,21 @@ fun ReaderScreen(articleId: String, onBack: () -> Unit) {
         if (isTtsThisArticle && ttsState.isPlaying && ttsState.paragraphIndex in blocks.indices) {
             listState.animateScrollToItem(ttsState.paragraphIndex)
         }
+    }
+
+    // Continuously persist the scroll position while reading (debounced, local-only;
+    // the dirty flag gets it pushed on the next sync). Survives the app being killed
+    // mid-read. Suspended while TTS is reading this article — the spoken position wins.
+    LaunchedEffect(didInitialScroll, isTtsThisArticle, ttsState.isPlaying) {
+        if (!didInitialScroll || (isTtsThisArticle && ttsState.isPlaying)) return@LaunchedEffect
+        snapshotFlow { listState.firstVisibleItemIndex }
+            .distinctUntilChanged()
+            .debounce(800)
+            .collect { index ->
+                if (currentBlocks.isNotEmpty()) {
+                    repo.saveReadPositionLocal(articleId, index.coerceIn(0, currentBlocks.size - 1))
+                }
+            }
     }
 
     // Persist the reading position when leaving the screen (works without TTS too).

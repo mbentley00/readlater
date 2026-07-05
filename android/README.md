@@ -68,6 +68,20 @@ Firefox extension saves articles to).
   speech rate 0.5×–2.0×). The spoken paragraph is highlighted and followed in the
   reader, and the read position is saved as it advances.
 
+## Read position
+
+Your place in every article is saved automatically and synced to the server:
+
+- While scrolling, the position is persisted continuously (debounced ~1s,
+  written locally so it survives the app being killed mid-read; it is pushed
+  to the server on the next sync or pushing save).
+- Leaving the reader pushes the position to the server immediately.
+- During text-to-speech the spoken paragraph is saved as playback advances,
+  and pause/stop/end-of-article push it to the server.
+
+Reopening an article scrolls straight back to where you left off, and the
+article list shows an "In progress" marker with the paragraph you reached.
+
 ## Highlighting
 
 Long-press any paragraph in the reader to open the highlight sheet: trim the

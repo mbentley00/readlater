@@ -169,6 +169,8 @@ class TtsService : Service() {
         isPlaying = false
         tts?.stop()
         releaseWakeLock()
+        // Pushing save: sync the paused position to the server right away.
+        articleId?.let { app.repository.saveReadPosition(it, currentIndex) }
         publishState()
         updatePlaybackState()
         updateNotification()
@@ -194,7 +196,7 @@ class TtsService : Service() {
         }
         val next = nextSpeakable(currentIndex + 1) ?: return
         currentIndex = next
-        articleId?.let { app.repository.saveReadPosition(it, next) }
+        articleId?.let { app.repository.saveReadPositionLocal(it, next) }
         if (isPlaying) speakCurrent() else {
             publishState()
             updateNotification()
@@ -208,7 +210,7 @@ class TtsService : Service() {
         }
         val prev = prevSpeakable(currentIndex - 1) ?: return
         currentIndex = prev
-        articleId?.let { app.repository.saveReadPosition(it, prev) }
+        articleId?.let { app.repository.saveReadPositionLocal(it, prev) }
         if (isPlaying) speakCurrent() else {
             publishState()
             updateNotification()
@@ -219,6 +221,8 @@ class TtsService : Service() {
         isPlaying = false
         tts?.stop()
         releaseWakeLock()
+        // Pushing save: sync the final position to the server on the way out.
+        articleId?.let { app.repository.saveReadPosition(it, currentIndex) }
         stateFlow.value = TtsPlaybackState()
         updatePlaybackState()
         stopForeground(STOP_FOREGROUND_REMOVE)
@@ -265,12 +269,12 @@ class TtsService : Service() {
     private fun advanceAndSpeak() {
         val next = nextSpeakable(currentIndex + 1)
         if (next == null) {
-            // Finished the article.
-            articleId?.let { app.repository.saveReadPosition(it, blocks.size - 1) }
+            // Finished the article; handleStop pushes the final position.
+            currentIndex = blocks.size - 1
             handleStop()
         } else {
             currentIndex = next
-            articleId?.let { app.repository.saveReadPosition(it, next) }
+            articleId?.let { app.repository.saveReadPositionLocal(it, next) }
             speakCurrent()
         }
     }
