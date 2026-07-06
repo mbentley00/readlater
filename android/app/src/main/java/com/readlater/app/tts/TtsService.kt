@@ -494,11 +494,12 @@ class TtsService : Service() {
 
     private fun initTts() {
         val chosen = app.settings.ttsEngine
-        val preferred = when {
+        var preferred = when {
             chosen.isNotBlank() && isEngineInstalled(chosen) -> chosen
             chosen.isBlank() && isEngineInstalled(sherpaEngine) -> sherpaEngine
             else -> null
         }
+        if (preferred != null && preferred == engineBlockedThisSession) preferred = null
         // Re-init when the preferred engine changed (e.g. sherpa was installed
         // or the user picked a different engine while this service was alive).
         if (tts != null && preferred != initializedEngine) {
@@ -523,6 +524,12 @@ class TtsService : Service() {
                     if (isPlaying) speakCurrent()
                 } else if (engine != null) {
                     // preferred engine failed to initialize — fall back to default
+                    Toast.makeText(
+                        this@TtsService,
+                        "Voice engine failed to start — using the system voice",
+                        Toast.LENGTH_LONG
+                    ).show()
+                    engineBlockedThisSession = engine
                     tts = null
                     initializedEngine = null
                     initTtsWith(null)
@@ -601,24 +608,30 @@ class TtsService : Service() {
                 synthesizing.remove(idx)
                 readyFiles.add(idx)
                 if (idx == awaitingPlayIndex && isPlaying) {
+                    watchdogGeneration++ // disarm
                     awaitingPlayIndex = -1
                     startPlayback(idx)
                 }
             }
         }
 
-        @Deprecated("Deprecated in Java")
-        override fun onError(utteranceId: String?) {
+        private fun synthFailed(utteranceId: String?) {
             mainHandler.post {
                 val idx = utteranceId?.removePrefix("synth-")?.toIntOrNull() ?: return@post
                 synthesizing.remove(idx)
+                synthFile(idx).delete()
                 if (idx == awaitingPlayIndex && isPlaying) {
+                    watchdogGeneration++ // disarm
                     awaitingPlayIndex = -1
-                    currentIndex = idx
-                    advanceAndSpeak()
+                    failEngineAndRetry("The voice engine reported an error")
                 }
             }
         }
+
+        override fun onError(utteranceId: String?, errorCode: Int) = synthFailed(utteranceId)
+
+        @Deprecated("Deprecated in Java")
+        override fun onError(utteranceId: String?) = synthFailed(utteranceId)
     }
 
     private fun advanceAndSpeak() {
@@ -667,8 +680,49 @@ class TtsService : Service() {
         val text = blocks.getOrNull(idx)?.let { speakableText(it) } ?: return
         synthesizing.add(idx)
         engine.setSpeechRate(app.settings.ttsSpeechRate)
-        engine.synthesizeToFile(text, Bundle(), synthFile(idx), "synth-$idx")
+        val queued = engine.synthesizeToFile(text, Bundle(), synthFile(idx), "synth-$idx")
+        if (queued != TextToSpeech.SUCCESS) {
+            synthesizing.remove(idx)
+            if (idx == awaitingPlayIndex) failEngineAndRetry("The voice engine rejected the request")
+        } else if (idx == awaitingPlayIndex) {
+            armSynthWatchdog(idx)
+        }
     }
+
+    // If the engine never delivers audio (crashed, stuck loading its model),
+    // fall back to the system default voice instead of sitting silent forever.
+    private var watchdogGeneration = 0
+
+    private fun armSynthWatchdog(idx: Int) {
+        val generation = ++watchdogGeneration
+        mainHandler.postDelayed({
+            if (generation == watchdogGeneration && isPlaying &&
+                awaitingPlayIndex == idx && !readyFiles.contains(idx)
+            ) {
+                failEngineAndRetry("The selected voice isn't responding")
+            }
+        }, 30_000)
+    }
+
+    private fun failEngineAndRetry(reason: String) {
+        if (initializedEngine == null) {
+            // already on the system default — skip this paragraph instead
+            Toast.makeText(this, "$reason — skipping paragraph", Toast.LENGTH_LONG).show()
+            advanceAndSpeak()
+            return
+        }
+        Toast.makeText(this, "$reason — falling back to the system voice", Toast.LENGTH_LONG).show()
+        engineBlockedThisSession = initializedEngine
+        tts?.stop()
+        tts?.shutdown()
+        tts = null
+        ttsReady = false
+        synthesizing.clear()
+        initTts()
+    }
+
+    /** Engine that failed this session; skipped until the service restarts. */
+    private var engineBlockedThisSession: String? = null
 
     private fun startPlayback(idx: Int) {
         player?.release()
@@ -825,9 +879,11 @@ class TtsService : Service() {
             )
         }
         val pct = if (totalDurationMs > 0) (positionMs(currentIndex) * 100 / totalDurationMs).toInt() else 0
-        val progressText = if (blocks.isNotEmpty()) {
-            "$pct% · ${articleSite.ifBlank { "Reading aloud" }}"
-        } else articleSite.ifBlank { "Reading aloud" }
+        val progressText = when {
+            isPlaying && awaitingPlayIndex >= 0 -> "Preparing voice…"
+            blocks.isNotEmpty() -> "$pct% · ${articleSite.ifBlank { "Reading aloud" }}"
+            else -> articleSite.ifBlank { "Reading aloud" }
+        }
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setSmallIcon(R.drawable.ic_launcher_foreground)
             .setContentTitle(articleTitle.ifBlank { "ReadLater" })
