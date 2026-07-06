@@ -52,6 +52,7 @@ CREATE TABLE IF NOT EXISTS articles (
   excerpt TEXT,
   html TEXT,
   textContent TEXT,
+  wordCount INTEGER NOT NULL DEFAULT 0,
   updatedAt INTEGER NOT NULL
 );
 CREATE UNIQUE INDEX IF NOT EXISTS articles_user_url ON articles(userId, url);
@@ -70,6 +71,15 @@ CREATE TABLE IF NOT EXISTS highlights (
 );
 CREATE INDEX IF NOT EXISTS hl_article ON highlights(articleId);
 CREATE INDEX IF NOT EXISTS hl_user_client ON highlights(userId, clientId);
+
+CREATE TABLE IF NOT EXISTS views (
+  id TEXT PRIMARY KEY,
+  userId TEXT NOT NULL,
+  name TEXT NOT NULL,
+  filters TEXT NOT NULL,
+  createdAt INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS views_user ON views(userId);
 
 CREATE VIRTUAL TABLE IF NOT EXISTS articles_fts USING fts5(
   title, byline, siteName, excerpt, textContent,
@@ -94,6 +104,13 @@ END;
 const rowUser = (r) => r || null;
 const rowArticle = (r) => r && { ...r, archived: !!r.archived, favorite: !!r.favorite };
 
+const stripTags = (html) => String(html || '').replace(/<[^>]+>/g, ' ');
+const countWords = (s) => {
+  const t = String(s || '').trim();
+  return t ? t.split(/\s+/).length : 0;
+};
+const articleWordCount = (a) => countWords(a.textContent || stripTags(a.html));
+
 /** Turn a user query into an FTS5 MATCH expression: each term quoted, prefix-matched, ANDed. */
 function ftsQuery(q) {
   const terms = String(q).split(/\s+/).filter(Boolean);
@@ -108,6 +125,18 @@ function open(dataDir) {
   sqlite.pragma('busy_timeout = 5000');
   sqlite.pragma('foreign_keys = ON');
   sqlite.exec(SCHEMA);
+
+  // databases created before wordCount existed: add the column and backfill
+  const articleCols = sqlite.prepare('PRAGMA table_info(articles)').all().map((c) => c.name);
+  if (!articleCols.includes('wordCount')) {
+    sqlite.exec("ALTER TABLE articles ADD COLUMN wordCount INTEGER NOT NULL DEFAULT 0");
+    const rows = sqlite.prepare('SELECT id, textContent, html FROM articles').all();
+    const upd = sqlite.prepare('UPDATE articles SET wordCount = ? WHERE id = ?');
+    sqlite.transaction(() => {
+      for (const r of rows) upd.run(articleWordCount(r), r.id);
+    })();
+  }
+
   migrateLegacyJson(sqlite, dataDir);
 
   const S = {}; // prepared statements
@@ -147,12 +176,13 @@ function open(dataDir) {
     articleByUrl: (userId, url) =>
       rowArticle(prep('abu', 'SELECT * FROM articles WHERE userId = ? AND url = ?').get(userId, url)),
     insertArticle: (a) => prep('ai', `INSERT INTO articles
-      (id, userId, url, domain, savedAt, archived, favorite, readParagraph, title, byline, siteName, excerpt, html, textContent, updatedAt)
-      VALUES (@id, @userId, @url, @domain, @savedAt, @archived, @favorite, @readParagraph, @title, @byline, @siteName, @excerpt, @html, @textContent, @updatedAt)`)
-      .run({ ...a, domain: hostOf(a.url), archived: a.archived ? 1 : 0, favorite: a.favorite ? 1 : 0 }),
+      (id, userId, url, domain, savedAt, archived, favorite, readParagraph, title, byline, siteName, excerpt, html, textContent, wordCount, updatedAt)
+      VALUES (@id, @userId, @url, @domain, @savedAt, @archived, @favorite, @readParagraph, @title, @byline, @siteName, @excerpt, @html, @textContent, @wordCount, @updatedAt)`)
+      .run({ ...a, domain: hostOf(a.url), archived: a.archived ? 1 : 0, favorite: a.favorite ? 1 : 0, wordCount: articleWordCount(a) }),
     updateArticleContent: (id, f) => prep('auc', `UPDATE articles SET
       title = @title, byline = @byline, siteName = @siteName, excerpt = @excerpt,
-      html = @html, textContent = @textContent, updatedAt = @updatedAt WHERE id = @id`).run({ ...f, id }),
+      html = @html, textContent = @textContent, wordCount = @wordCount, updatedAt = @updatedAt WHERE id = @id`)
+      .run({ ...f, id, wordCount: articleWordCount(f) }),
     patchArticle: (id, { archived, favorite, readParagraph, updatedAt }) =>
       prep('ap', `UPDATE articles SET
         archived = COALESCE(@archived, archived),
@@ -174,7 +204,7 @@ function open(dataDir) {
      * Search/filter a user's articles (metadata only — html/textContent never
      * leave the database here). All filters optional; newest first.
      */
-    searchArticles: (userId, { q = '', domain = '', highlighted = false, includeArchived = false, since = 0, favoriteOnly = false, archivedOnly = false } = {}) => {
+    searchArticles: (userId, { q = '', domain = '', highlighted = false, includeArchived = false, since = 0, favoriteOnly = false, archivedOnly = false, minWords = 0, maxWords = 0, minHighlights = 0 } = {}) => {
       const where = ['a.userId = @userId'];
       const args = { userId };
       if (archivedOnly) where.push('a.archived = 1');
@@ -186,14 +216,21 @@ function open(dataDir) {
         where.push("(a.domain = @domain OR a.domain LIKE '%.' || @domain)");
         args.domain = d;
       }
-      if (highlighted) where.push('EXISTS (SELECT 1 FROM highlights h WHERE h.articleId = a.id)');
+      if (minWords > 0) { where.push('a.wordCount >= @minWords'); args.minWords = minWords; }
+      if (maxWords > 0) { where.push('a.wordCount <= @maxWords'); args.maxWords = maxWords; }
+      if (minHighlights > 0) {
+        where.push('(SELECT COUNT(*) FROM highlights h WHERE h.articleId = a.id) >= @minHighlights');
+        args.minHighlights = minHighlights;
+      } else if (highlighted) {
+        where.push('EXISTS (SELECT 1 FROM highlights h WHERE h.articleId = a.id)');
+      }
       const match = ftsQuery(q);
       if (match) {
         where.push('a.rowid IN (SELECT rowid FROM articles_fts WHERE articles_fts MATCH @match)');
         args.match = match;
       }
       const sql = `SELECT a.id, a.userId, a.url, a.savedAt, a.archived, a.favorite, a.readParagraph,
-          a.title, a.byline, a.siteName, a.excerpt, a.updatedAt
+          a.title, a.byline, a.siteName, a.excerpt, a.wordCount, a.updatedAt
         FROM articles a WHERE ${where.join(' AND ')} ORDER BY a.savedAt DESC`;
       return sqlite.prepare(sql).all(args).map(rowArticle);
     },
@@ -218,6 +255,28 @@ function open(dataDir) {
     },
     highlightByClientId: (userId, clientId) =>
       prep('hbc', 'SELECT * FROM highlights WHERE userId = ? AND clientId = ?').get(userId, clientId) || null,
+
+    // ---------------- saved views
+    listViews: (userId) =>
+      prep('vl', 'SELECT * FROM views WHERE userId = ? ORDER BY createdAt').all(userId)
+        .map((v) => ({ ...v, filters: JSON.parse(v.filters) })),
+    getView: (id, userId) => {
+      const v = prep('vg', 'SELECT * FROM views WHERE id = ? AND userId = ?').get(id, userId);
+      return v ? { ...v, filters: JSON.parse(v.filters) } : null;
+    },
+    insertView: (v) => prep('vi', `INSERT INTO views (id, userId, name, filters, createdAt)
+      VALUES (@id, @userId, @name, @filters, @createdAt)`).run({ ...v, filters: JSON.stringify(v.filters) }),
+    deleteView: (id, userId) =>
+      prep('vd', 'DELETE FROM views WHERE id = ? AND userId = ?').run(id, userId),
+
+    /** Everything the user owns, for backup/export. */
+    exportUser: (userId) => ({
+      articles: prep('exa', 'SELECT * FROM articles WHERE userId = ? ORDER BY savedAt').all(userId)
+        .map(rowArticle)
+        .map(({ userId: _u, domain: _d, ...a }) => a),
+      highlights: prep('exh', 'SELECT * FROM highlights WHERE userId = ? ORDER BY createdAt').all(userId)
+        .map(({ userId: _u, ...h }) => h),
+    }),
     insertHighlight: (h) => prep('hi', `INSERT INTO highlights
       (id, userId, clientId, articleId, text, note, paragraphIndex, createdAt)
       VALUES (@id, @userId, @clientId, @articleId, @text, @note, @paragraphIndex, @createdAt)`).run(h),
@@ -241,8 +300,8 @@ function migrateLegacyJson(sqlite, dataDir) {
     VALUES (@id, @username, @passwordHash, @token, @emailAlias, @createdAt)`);
   const insSession = sqlite.prepare('INSERT OR REPLACE INTO sessions (sid, userId, expiresAt) VALUES (?, ?, ?)');
   const insArticle = sqlite.prepare(`INSERT OR IGNORE INTO articles
-    (id, userId, url, domain, savedAt, archived, favorite, readParagraph, title, byline, siteName, excerpt, html, textContent, updatedAt)
-    VALUES (@id, @userId, @url, @domain, @savedAt, @archived, @favorite, @readParagraph, @title, @byline, @siteName, @excerpt, @html, @textContent, @updatedAt)`);
+    (id, userId, url, domain, savedAt, archived, favorite, readParagraph, title, byline, siteName, excerpt, html, textContent, wordCount, updatedAt)
+    VALUES (@id, @userId, @url, @domain, @savedAt, @archived, @favorite, @readParagraph, @title, @byline, @siteName, @excerpt, @html, @textContent, @wordCount, @updatedAt)`);
   const insHighlight = sqlite.prepare(`INSERT OR IGNORE INTO highlights
     (id, userId, clientId, articleId, text, note, paragraphIndex, createdAt)
     VALUES (@id, @userId, @clientId, @articleId, @text, @note, @paragraphIndex, @createdAt)`);
@@ -263,6 +322,7 @@ function migrateLegacyJson(sqlite, dataDir) {
         archived: a.archived ? 1 : 0,
         favorite: a.favorite ? 1 : 0,
         readParagraph: a.readParagraph || 0,
+        wordCount: articleWordCount(a),
         updatedAt: a.updatedAt || a.savedAt || Date.now(),
       });
     }

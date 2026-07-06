@@ -11,6 +11,7 @@
 'use strict';
 
 const crypto = require('crypto');
+const fs = require('fs');
 
 function escapeHtml(s) {
   return String(s ?? '')
@@ -72,6 +73,14 @@ form.search { display:flex; gap:.5rem; align-items:center; flex-wrap:wrap; font-
 form.search input[type=search] { flex:1; min-width:12rem; padding:.4rem .6rem; border:1px solid var(--line); border-radius:6px; background:var(--card); color:var(--fg); }
 form.search select { padding:.35rem .4rem; border:1px solid var(--line); border-radius:6px; background:var(--card); color:var(--fg); max-width:14rem; }
 form.search label { color:var(--muted); display:flex; gap:.3rem; align-items:center; }
+.views { display:flex; gap:.5rem; flex-wrap:wrap; margin-bottom:.8rem; font-family:system-ui,sans-serif; }
+.view-chip { display:inline-flex; align-items:center; gap:.15rem; border:1px solid var(--line); border-radius:999px; padding:.15rem .3rem .15rem .7rem; font-size:.85rem; background:var(--card); }
+.view-chip.active { border-color:var(--accent); background:var(--accent); }
+.view-chip.active a { color:var(--accent-fg); }
+.view-chip a { text-decoration:none; color:var(--fg); }
+.view-chip .del-view { border:none; font-size:.9rem; padding:0 .3rem; }
+form.saveview { display:flex; gap:.5rem; margin:.6rem 0 0; font-family:system-ui,sans-serif; }
+form.saveview input[name=name] { padding:.3rem .5rem; border:1px solid var(--line); border-radius:6px; background:var(--card); color:var(--fg); font-size:.85rem; }
 #hl-tip { position:absolute; z-index:10; }
 #hl-tip button { background:var(--accent); color:var(--accent-fg); border:none; border-radius:6px; padding:.35rem .8rem; cursor:pointer; font:.85rem system-ui,sans-serif; box-shadow:0 2px 8px rgba(0,0,0,.25); }
 .settings dt { font-family:system-ui,sans-serif; font-size:.8rem; color:var(--muted); margin-top:1.2rem; }
@@ -145,16 +154,43 @@ function authCard({ title, action, error, allowSignup, notice }) {
   ${other}</div>`;
 }
 
+/** Map the web form's length buckets to word-count bounds (225 wpm). */
+const LEN_BUCKETS = {
+  short: { maxWords: 1124 },
+  medium: { minWords: 1125, maxWords: 4500 },
+  long: { minWords: 4501 },
+};
+
+/** Build searchArticles filters from web form params (q/domain/hl/len). */
+function filtersFromParams(get) {
+  const hl = get('hl') || (get('highlighted') === '1' ? '1' : '');
+  return {
+    q: (get('q') || '').trim(),
+    domain: (get('domain') || '').trim(),
+    highlighted: hl === '1',
+    minHighlights: hl && hl !== '1' ? (parseInt(hl, 10) || 0) : 0,
+    ...(LEN_BUCKETS[get('len') || ''] || {}),
+  };
+}
+
 function listPage(ctx, user, view, url) {
-  const q = (url.searchParams.get('q') || '').trim();
-  const domain = (url.searchParams.get('domain') || '').trim();
-  const highlighted = url.searchParams.get('highlighted') === '1';
-  const searching = q || domain || highlighted;
+  const get = (k) => url.searchParams.get(k) || '';
+  const savedViews = ctx.store.listViews(user.id);
+  const savedView = view.startsWith('v:') ? ctx.store.getView(view.slice(2), user.id) : null;
+
+  const q = get('q').trim();
+  const domain = get('domain').trim();
+  const hl = get('hl') || (get('highlighted') === '1' ? '1' : '');
+  const len = get('len');
+  const searching = Boolean(q || domain || hl || len);
 
   let list, empty;
-  if (searching) {
+  if (savedView) {
+    list = ctx.searchArticles(user, { ...savedView.filters, includeArchived: !!savedView.filters.includeArchived });
+    empty = 'No articles match this view.';
+  } else if (searching) {
     // search spans all views (archived included)
-    list = ctx.searchArticles(user, { q, domain, highlighted, includeArchived: true });
+    list = ctx.searchArticles(user, { ...filtersFromParams(get), includeArchived: true });
     empty = 'No articles match this search.';
   } else if (view === 'favorites') { list = ctx.searchArticles(user, { favoriteOnly: true, includeArchived: true }); empty = 'No favorites yet — star an article to keep it here.'; }
   else if (view === 'archive') { list = ctx.searchArticles(user, { archivedOnly: true }); empty = 'Nothing archived yet.'; }
@@ -164,21 +200,53 @@ function listPage(ctx, user, view, url) {
   const domainOptions = ctx.store.domainCounts(user.id)
     .map(({ domain: h, n }) => `<option value="${escapeHtml(h)}" ${h === domain ? 'selected' : ''}>${escapeHtml(h)} (${n})</option>`).join('');
 
+  // saved views as chips; × deletes (via the page script)
+  const viewChips = savedViews.length ? `
+<div class="views">${savedViews.map((v) => `
+  <span class="view-chip ${savedView && savedView.id === v.id ? 'active' : ''}">
+    <a href="/?view=v:${v.id}">${escapeHtml(v.name)}</a><button class="act del-view" data-view-id="${v.id}" title="Delete view">×</button>
+  </span>`).join('')}
+</div>` : '';
+
+  // while searching (and not inside a saved view), offer to save the filters
+  const saveViewForm = searching && !savedView ? `
+<form class="saveview" method="post" action="/views/save">
+  <input type="hidden" name="q" value="${escapeHtml(q)}">
+  <input type="hidden" name="domain" value="${escapeHtml(domain)}">
+  <input type="hidden" name="hl" value="${escapeHtml(hl)}">
+  <input type="hidden" name="len" value="${escapeHtml(len)}">
+  <input name="name" placeholder="Name this view…" required maxlength="64">
+  <button class="act" type="submit">Save as view</button>
+</form>` : '';
+
   const searchForm = `
+${viewChips}
 <form class="search" method="get" action="/">
   <input type="search" name="q" value="${escapeHtml(q)}" placeholder="Search title, author, text…">
   <select name="domain"><option value="">All domains</option>${domainOptions}</select>
-  <label><input type="checkbox" name="highlighted" value="1" ${highlighted ? 'checked' : ''}> has highlights</label>
+  <select name="len">
+    <option value="">Any length</option>
+    <option value="short" ${len === 'short' ? 'selected' : ''}>&lt; 5 min</option>
+    <option value="medium" ${len === 'medium' ? 'selected' : ''}>5–20 min</option>
+    <option value="long" ${len === 'long' ? 'selected' : ''}>&gt; 20 min</option>
+  </select>
+  <select name="hl">
+    <option value="">Highlights: any</option>
+    <option value="1" ${hl === '1' ? 'selected' : ''}>has highlights</option>
+    <option value="3" ${hl === '3' ? 'selected' : ''}>3+ highlights</option>
+  </select>
   <button class="act" type="submit">Search</button>
-  ${searching ? '<a class="back" href="/">Clear</a>' : ''}
+  ${searching || savedView ? '<a class="back" href="/">Clear</a>' : ''}
 </form>
-${searching ? `<div class="meta">${list.length} result${list.length === 1 ? '' : 's'}${q ? ` for “${escapeHtml(q)}”` : ''}${domain ? ` from ${escapeHtml(domain)}` : ''}${highlighted ? ', highlighted only' : ''}</div>` : ''}`;
+${savedView ? `<div class="meta">${list.length} article${list.length === 1 ? '' : 's'} in “${escapeHtml(savedView.name)}”</div>` : ''}
+${searching && !savedView ? `<div class="meta">${list.length} result${list.length === 1 ? '' : 's'}${q ? ` for “${escapeHtml(q)}”` : ''}${domain ? ` from ${escapeHtml(domain)}` : ''}</div>${saveViewForm}` : ''}`;
 
   const hlCounts = ctx.store.highlightCountsByArticle(user.id);
   const items = list.map((a) => {
     const hlCount = hlCounts.get(a.id) || 0;
     const meta = [
       a.siteName, a.byline, fmtDate(a.savedAt),
+      a.wordCount > 0 ? `~${Math.max(1, Math.round(a.wordCount / 225))} min` : null,
       a.readParagraph > 0 ? `¶${a.readParagraph} in progress` : null,
       hlCount ? `${hlCount} highlight${hlCount > 1 ? 's' : ''}` : null,
     ].filter(Boolean).map(escapeHtml).join(' · ');
@@ -192,12 +260,26 @@ ${searching ? `<div class="meta">${list.length} result${list.length === 1 ? '' :
       </div></li>`;
   }).join('\n');
 
-  const body = searchForm + (list.length
+  const importBar = `
+<div class="importbar meta">
+  <button id="import-pdf" class="act">Import PDF…</button>
+  <span id="import-status"></span>
+  <input type="file" id="pdf-file" accept=".pdf,application/pdf" style="display:none">
+</div>`;
+
+  const body = searchForm + importBar + (list.length
     ? `<ul class="articles">${items}</ul>`
     : `<div class="empty">${empty}</div>`);
 
   const script = `
 document.addEventListener('click', async (e) => {
+  const dv = e.target.closest('button.del-view');
+  if (dv) {
+    if (!confirm('Delete this view?')) return;
+    await fetch('/api/views/' + dv.dataset.viewId, { method: 'DELETE' });
+    location.href = '/';
+    return;
+  }
   const btn = e.target.closest('button[data-act]'); if (!btn) return;
   const li = btn.closest('li[data-id]'); const id = li.dataset.id;
   const act = btn.dataset.act;
@@ -212,6 +294,26 @@ document.addEventListener('click', async (e) => {
     });
   }
   location.reload();
+});
+
+// PDF import: pick a file, POST it raw, reload to show the new article.
+const pdfBtn = document.getElementById('import-pdf');
+const pdfFile = document.getElementById('pdf-file');
+const pdfStatus = document.getElementById('import-status');
+if (pdfBtn) pdfBtn.addEventListener('click', () => pdfFile.click());
+if (pdfFile) pdfFile.addEventListener('change', async () => {
+  const f = pdfFile.files[0]; if (!f) return;
+  pdfStatus.textContent = 'Importing ' + f.name + '…';
+  const res = await fetch('/api/import/pdf?filename=' + encodeURIComponent(f.name), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/pdf' },
+    body: f,
+  });
+  if (res.ok) { location.reload(); }
+  else {
+    const err = await res.json().catch(() => ({}));
+    pdfStatus.textContent = 'Import failed: ' + (err.error || res.status);
+  }
 });`;
   return { body, script };
 }
@@ -343,6 +445,15 @@ ${msg === 'alias' ? '<div class="notice">Email address regenerated — update yo
   <dt>Regenerate token</dt>
   <dd class="meta">Invalidates the old token; you'll need to re-enter it on every device.<br><br>
   <form method="post" action="/settings/token"><button class="act" type="submit">Regenerate API token</button></form></dd>
+  ${fs.existsSync(ctx.APK_FILE) ? `
+  <dt>Android app</dt>
+  <dd class="meta"><a href="/app.apk">Download the Android app (APK)</a> — open this page on your phone,
+  download, and tap the file to install or update.</dd>` : ''}
+  <dt>Export your data</dt>
+  <dd class="meta">
+    <a href="/api/export.json">Everything as JSON</a> (articles with full text + highlights) ·
+    <a href="/api/highlights/export.md">Highlights as Markdown</a>
+  </dd>
 </dl>`;
   return { body, script: '' };
 }
@@ -413,6 +524,37 @@ async function handle(ctx, req, res, url) {
   if (route === 'POST /settings/email-alias') {
     ctx.store.setUserAlias(user.id, ctx.newEmailAlias(user.username));
     return redirect(res, '/settings?msg=alias');
+  }
+
+  if (route === 'POST /views/save') {
+    let b;
+    try { b = ctx.parseBody(await ctx.readBody(req), req.headers['content-type']); }
+    catch { b = {}; }
+    const name = String(b.name || '').trim().slice(0, 64);
+    if (!name) return redirect(res, '/');
+    const v = {
+      id: ctx.newId(),
+      userId: user.id,
+      name,
+      filters: filtersFromParams((k) => String(b[k] || '')),
+      createdAt: Date.now(),
+    };
+    ctx.store.insertView(v);
+    return redirect(res, `/?view=v:${v.id}`);
+  }
+
+  // Android app download (uploaded to the server via POST /api/app.apk).
+  if (route === 'GET /app.apk') {
+    if (!fs.existsSync(ctx.APK_FILE)) {
+      return send(res, 404, page({ title: 'Not found', body: '<div class="empty">No app build has been uploaded yet.</div>', user, nonce }), { nonce });
+    }
+    const stat = fs.statSync(ctx.APK_FILE);
+    res.writeHead(200, {
+      'Content-Type': 'application/vnd.android.package-archive',
+      'Content-Length': stat.size,
+      'Content-Disposition': 'attachment; filename="readlater.apk"',
+    });
+    return fs.createReadStream(ctx.APK_FILE).pipe(res);
   }
 
   let made = null, title = 'ReadLater', active = 'inbox';

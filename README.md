@@ -98,8 +98,21 @@ Run the test suite with `node test.js`.
 
 The extension never re-downloads the page. It reads the **DOM currently
 rendered in your tab** — after your login, your metered-access cookie, and all
-client-side rendering have done their work — cleans out navigation/ads/forms,
-and ships that HTML to your server. If you can read it, you can save it.
+client-side rendering have done their work — and ships that HTML to your
+server. If you can read it, you can save it.
+
+### How articles are parsed
+
+1. **Mozilla Readability** (the Firefox Reader View engine, vendored) extracts
+   the article from a clone of the rendered DOM.
+2. If that fails or comes back thin, a **container-scoring heuristic** takes
+   over (text-densest container, discounted by link density, noise stripped).
+3. If the result still looks wrong — tiny, or a small fraction of the page's
+   visible text — the extension attaches a stripped copy of the page and the
+   server **re-extracts it with a cheap LLM** (Claude Haiku) in the background,
+   upgrading the stored article a few seconds later. Enable this by setting
+   `ANTHROPIC_API_KEY` on the server; without it, step 3 is skipped. Rescues
+   cost roughly $0.02–0.05 each.
 
 ## 3. Build & install the Android app
 
@@ -142,7 +155,11 @@ works). Timestamps are epoch milliseconds.
 | `POST /api/inbound-email?secret=…` | Inbound-email webhook (Postmark JSON; not bearer-authed) |
 | `POST /api/articles` | Save/update an article (`{url, title, html, ...}`, deduped by URL) |
 | `GET /api/articles?includeArchived=1` | List article metadata (no HTML) |
-| `GET /api/articles?q=…&domain=…&highlighted=1` | Search (all terms AND-matched vs title/author/site/text; domain matches subdomains; `email` = emailed-in) |
+| `GET /api/articles?q=…&domain=…&highlighted=1&minWords=…&maxWords=…&minHighlights=…` | Search + filters (terms AND-matched vs title/author/site/text; domain matches subdomains; `email` = emailed-in) |
+| `GET/POST /api/views`, `DELETE /api/views/{id}` | Saved filter views (shown as tabs in web + Android) |
+| `POST /api/import/pdf?filename=…` | Import a PDF (raw body); text extracted into an article |
+| `GET /api/export.json` | Full backup: all articles (with HTML) + highlights |
+| `POST /api/app.apk`, `GET /app.apk` | Upload / download the Android app build |
 | `GET /api/articles/{id}` | Full article incl. HTML |
 | `PATCH /api/articles/{id}` | Update `archived` / `favorite` / `readParagraph` |
 | `DELETE /api/articles/{id}` | Delete article + its highlights |

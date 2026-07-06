@@ -27,10 +27,13 @@ const path = require('path');
 const crypto = require('crypto');
 const web = require('./web');
 const { open, hostOf } = require('./db');
+const llm = require('./llm');
+const pdf = require('./pdf');
 
 const PORT = parseInt(process.env.PORT || '8090', 10);
 const DATA_DIR = process.env.READLATER_DATA_DIR || path.join(__dirname, 'data');
 const TOKEN_FILE = path.join(DATA_DIR, 'token.txt');
+const APK_FILE = path.join(DATA_DIR, 'app.apk');
 const MAX_BODY = 10 * 1024 * 1024; // 10 MB per request
 const ALLOW_SIGNUP = process.env.READLATER_ALLOW_SIGNUP !== '0';
 const SESSION_TTL = 30 * 24 * 60 * 60 * 1000; // 30 days
@@ -182,15 +185,19 @@ function json(res, status, obj) {
 }
 
 function readBody(req) {
+  return readBodyBuffer(req, MAX_BODY).then((b) => b.toString('utf8'));
+}
+
+function readBodyBuffer(req, limit) {
   return new Promise((resolve, reject) => {
     let size = 0;
     const chunks = [];
     req.on('data', (c) => {
       size += c.length;
-      if (size > MAX_BODY) { reject(new Error('body too large')); req.destroy(); return; }
+      if (size > limit) { reject(new Error('body too large')); req.destroy(); return; }
       chunks.push(c);
     });
-    req.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
+    req.on('end', () => resolve(Buffer.concat(chunks)));
     req.on('error', reject);
   });
 }
@@ -231,7 +238,7 @@ const ctx = {
   createUser, verifyPassword, findUserByName, newEmailAlias,
   createSession, sessionCookie, getSessionUser, destroySession,
   searchArticles, hostOf,
-  ALLOW_SIGNUP, INBOUND_DOMAIN,
+  ALLOW_SIGNUP, INBOUND_DOMAIN, APK_FILE,
 };
 
 const server = http.createServer(async (req, res) => {
@@ -312,6 +319,27 @@ const server = http.createServer(async (req, res) => {
     }
   }
 
+  // ---- login: exchange username/password for the account's API token, so
+  // devices can sign in without the user hand-copying the token.
+  if (req.method === 'POST' && parts[1] === 'login' && parts.length === 2) {
+    try {
+      const b = parseBody(await readBody(req), req.headers['content-type']);
+      const u = findUserByName(String(b.username || '').trim());
+      if (!u || !verifyPassword(u.passwordHash, String(b.password || ''))) {
+        await new Promise((r) => setTimeout(r, 300));
+        return json(res, 401, { error: 'wrong username or password' });
+      }
+      return json(res, 200, {
+        token: u.token,
+        username: u.username,
+        emailAddress: INBOUND_DOMAIN ? `${u.emailAlias}@${INBOUND_DOMAIN}` : null,
+      });
+    } catch (e) {
+      if (e instanceof SyntaxError) return json(res, 400, { error: 'invalid JSON body' });
+      throw e;
+    }
+  }
+
   // auth: bearer token (devices) or session cookie (web UI)
   const auth = req.headers.authorization || '';
   const presented = auth.startsWith('Bearer ') ? auth.slice(7).trim() : '';
@@ -328,6 +356,41 @@ const server = http.createServer(async (req, res) => {
       });
     }
 
+    // ---- full-account export (articles incl. HTML + all highlights)
+    if (req.method === 'GET' && parts[1] === 'export.json' && parts.length === 2) {
+      const body = JSON.stringify({
+        exportedAt: Date.now(),
+        username: user.username,
+        ...store.exportUser(user.id),
+      });
+      res.writeHead(200, {
+        'Content-Type': 'application/json; charset=utf-8',
+        'Content-Length': Buffer.byteLength(body),
+        'Content-Disposition': 'attachment; filename="readlater-export.json"',
+      });
+      return res.end(body);
+    }
+
+    // ---- Android APK hosting: POST uploads a build (streamed to the data
+    // dir, so it survives deploys); the web UI serves it at GET /app.apk.
+    if (req.method === 'POST' && parts[1] === 'app.apk' && parts.length === 2) {
+      const tmp = APK_FILE + '.tmp';
+      const out = fs.createWriteStream(tmp);
+      let size = 0;
+      await new Promise((resolve, reject) => {
+        req.on('data', (c) => {
+          size += c.length;
+          if (size > 200 * 1024 * 1024) { reject(new Error('apk too large')); req.destroy(); }
+        });
+        req.on('error', reject);
+        out.on('error', reject);
+        out.on('finish', resolve);
+        req.pipe(out);
+      });
+      fs.renameSync(tmp, APK_FILE);
+      return json(res, 201, { ok: true, size });
+    }
+
     // ---- current account
     if (req.method === 'GET' && parts[1] === 'me' && parts.length === 2) {
       return json(res, 200, {
@@ -341,12 +404,16 @@ const server = http.createServer(async (req, res) => {
     // ---- articles collection
     if (parts[1] === 'articles' && parts.length === 2) {
       if (req.method === 'GET') {
+        const num = (k) => parseInt(url.searchParams.get(k) || '0', 10) || 0;
         const list = searchArticles(user, {
           includeArchived: url.searchParams.get('includeArchived') === '1',
-          since: parseInt(url.searchParams.get('since') || '0', 10) || 0,
+          since: num('since'),
           q: url.searchParams.get('q') || '',
           domain: url.searchParams.get('domain') || '',
           highlighted: url.searchParams.get('highlighted') === '1',
+          minWords: num('minWords'),
+          maxWords: num('maxWords'),
+          minHighlights: num('minHighlights'),
         });
         return json(res, 200, { articles: list.map(pubArticleMeta) });
       }
@@ -376,6 +443,35 @@ const server = http.createServer(async (req, res) => {
           };
           store.insertArticle(a);
         }
+
+        // LLM rescue: the extension flags saves it thinks it parsed badly by
+        // attaching the stripped page HTML. Respond fast with what we have,
+        // upgrade the stored article in the background (bumping updatedAt so
+        // clients re-sync it).
+        if (typeof b.fallbackHtml === 'string' && b.fallbackHtml.length > 0 && llm.enabled()) {
+          const articleId = a.id;
+          llm.extractArticle({ url: artUrl, title: fields.title, pageHtml: b.fallbackHtml })
+            .then((better) => {
+              if (!better) return;
+              const current = store.getArticle(articleId, user.id);
+              if (!current) return; // deleted in the meantime
+              // Only upgrade if the LLM actually found more than we had.
+              const currentLen = (current.textContent || '').length;
+              if (better.textContent.length <= currentLen * 1.5 && currentLen > 800) return;
+              store.updateArticleContent(articleId, {
+                title: current.title,
+                byline: current.byline,
+                siteName: current.siteName,
+                excerpt: current.excerpt || better.textContent.slice(0, 300),
+                html: better.html,
+                textContent: better.textContent,
+                updatedAt: Date.now(),
+              });
+              console.log(`LLM rescue upgraded article ${articleId} (${currentLen} → ${better.textContent.length} chars)`);
+            })
+            .catch((e) => console.error(`LLM rescue failed for ${articleId}: ${e.message}`));
+        }
+
         return json(res, 201, pubArticle(store.getArticle(a.id, user.id)));
       }
     }
@@ -428,6 +524,78 @@ const server = http.createServer(async (req, res) => {
         };
         store.insertHighlight(h);
         return json(res, 201, pubHighlight(h));
+      }
+    }
+
+    // ---- PDF import: raw application/pdf body, parsed into an article
+    if (req.method === 'POST' && parts[1] === 'import' && parts[2] === 'pdf' && parts.length === 3) {
+      const buf = await readBodyBuffer(req, 50 * 1024 * 1024);
+      if (buf.length < 5 || buf.subarray(0, 5).toString() !== '%PDF-') {
+        return json(res, 400, { error: 'not a PDF file' });
+      }
+      const filename = sanitizeString(url.searchParams.get('filename'), 200) || 'document.pdf';
+      let parsed;
+      try {
+        parsed = await pdf.pdfToArticle(buf, filename);
+      } catch (e) {
+        return json(res, 400, { error: `could not parse PDF: ${e.message}` });
+      }
+      if (!parsed.textContent.trim()) {
+        return json(res, 400, { error: 'no extractable text (scanned/image-only PDF?)' });
+      }
+      // dedupe on content hash so re-importing the same file updates in place
+      const artUrl = 'pdf:' + crypto.createHash('sha256').update(buf).digest('hex').slice(0, 24);
+      const now = Date.now();
+      let a = store.articleByUrl(user.id, artUrl);
+      const fields = {
+        title: sanitizeString(parsed.title) || filename,
+        byline: null,
+        siteName: 'PDF',
+        excerpt: sanitizeString(parsed.textContent.replace(/\s+/g, ' ').trim(), 300),
+        html: parsed.html,
+        textContent: parsed.textContent.slice(0, 500000),
+        updatedAt: now,
+      };
+      if (a) {
+        store.updateArticleContent(a.id, fields);
+      } else {
+        a = {
+          id: newId(), userId: user.id, url: artUrl,
+          savedAt: now, archived: false, favorite: false, readParagraph: 0,
+          ...fields,
+        };
+        store.insertArticle(a);
+      }
+      return json(res, 201, pubArticle(store.getArticle(a.id, user.id)));
+    }
+
+    // ---- saved views (named filter sets shown as tabs in the clients)
+    if (parts[1] === 'views') {
+      if (req.method === 'GET' && parts.length === 2) {
+        return json(res, 200, { views: store.listViews(user.id).map(({ userId, ...v }) => v) });
+      }
+      if (req.method === 'POST' && parts.length === 2) {
+        const b = parseBody(await readBody(req), req.headers['content-type']);
+        const name = sanitizeString(b.name, 64);
+        if (!name || !name.trim()) return json(res, 400, { error: 'name is required' });
+        const f = b.filters && typeof b.filters === 'object' ? b.filters : {};
+        const filters = {
+          q: sanitizeString(f.q, 200) || '',
+          domain: sanitizeString(f.domain, 200) || '',
+          highlighted: f.highlighted === true,
+          minWords: Number.isInteger(f.minWords) && f.minWords > 0 ? f.minWords : 0,
+          maxWords: Number.isInteger(f.maxWords) && f.maxWords > 0 ? f.maxWords : 0,
+          minHighlights: Number.isInteger(f.minHighlights) && f.minHighlights > 0 ? f.minHighlights : 0,
+          includeArchived: f.includeArchived === true,
+        };
+        const v = { id: newId(), userId: user.id, name: name.trim(), filters, createdAt: Date.now() };
+        store.insertView(v);
+        return json(res, 201, { id: v.id, name: v.name, filters: v.filters, createdAt: v.createdAt });
+      }
+      if (req.method === 'DELETE' && parts.length === 3) {
+        const { changes } = store.deleteView(parts[2], user.id);
+        if (!changes) return json(res, 404, { error: 'view not found' });
+        return json(res, 200, { ok: true });
       }
     }
 

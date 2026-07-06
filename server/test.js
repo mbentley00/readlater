@@ -6,6 +6,7 @@
 
 const { spawn } = require('child_process');
 const fs = require('fs');
+const http = require('http');
 const path = require('path');
 const os = require('os');
 const assert = require('assert');
@@ -44,7 +45,49 @@ async function form(p, fields, cookie) {
 
 const cookieOf = (res) => (res.headers.get('set-cookie') || '').split(';')[0];
 
+/** A minimal but structurally valid one-page PDF containing `text`. */
+function makeTestPdf(text) {
+  const stream = `BT /F1 12 Tf 72 720 Td (${text}) Tj ET`;
+  const bodies = [
+    '1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n',
+    '2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n',
+    '3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>\nendobj\n',
+    `4 0 obj\n<< /Length ${stream.length} >>\nstream\n${stream}\nendstream\nendobj\n`,
+    '5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n',
+  ];
+  let out = '%PDF-1.4\n';
+  const offsets = [];
+  for (const b of bodies) { offsets.push(out.length); out += b; }
+  const xrefPos = out.length;
+  out += 'xref\n0 6\n0000000000 65535 f \n' +
+    offsets.map((o) => String(o).padStart(10, '0') + ' 00000 n \n').join('');
+  out += `trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n${xrefPos}\n%%EOF`;
+  return Buffer.from(out, 'latin1');
+}
+
+/** Fake Anthropic Messages API: always "finds" a long article in the page. */
+const LLM_HTML = '<p>' + 'This is the rescued article body, recovered by the language model from the raw page. '.repeat(12).trim() + '</p>';
+function startMockAnthropic(port) {
+  const server = http.createServer((req, res) => {
+    let body = '';
+    req.on('data', (c) => { body += c; });
+    req.on('end', () => {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        id: 'msg_mock', type: 'message', role: 'assistant', model: 'claude-haiku-4-5',
+        content: [{ type: 'text', text: LLM_HTML }],
+        stop_reason: 'end_turn', stop_sequence: null,
+        usage: { input_tokens: 100, output_tokens: 100 },
+      }));
+    });
+  });
+  return new Promise((resolve) => server.listen(port, '127.0.0.1', () => resolve(server)));
+}
+
 async function main() {
+  const MOCK_LLM_PORT = PORT + 1;
+  const mockLlm = await startMockAnthropic(MOCK_LLM_PORT);
+
   // pre-seed an old-format db (no users) to test legacy migration
   fs.writeFileSync(path.join(DATA_DIR, 'db.json'), JSON.stringify({
     articles: [{ id: 'orphan01', url: 'https://example.com/orphan', savedAt: 1000, archived: false, favorite: false, readParagraph: 0, title: 'Orphan Article', html: '<p>pre-account content</p>', updatedAt: 1000 }],
@@ -55,6 +98,8 @@ async function main() {
     env: {
       ...process.env, PORT: String(PORT), READLATER_DATA_DIR: DATA_DIR, READLATER_TOKEN: TOKEN,
       READLATER_INBOUND_SECRET: 'whsec-test', READLATER_INBOUND_DOMAIN: 'in.test',
+      ANTHROPIC_API_KEY: 'sk-ant-test-not-real',
+      ANTHROPIC_BASE_URL: `http://127.0.0.1:${MOCK_LLM_PORT}`,
     },
     stdio: ['ignore', 'pipe', 'inherit'],
   });
@@ -237,6 +282,16 @@ async function main() {
     res = await fetch(BASE + '/', { headers: { Cookie: aliceCookie }, redirect: 'manual' });
     assert.strictEqual(res.status, 303, 'session destroyed after logout');
 
+    // ---- token exchange (device login) -----------------------------------
+    r = await api('POST', '/api/login', { username: 'alice', password: 'correct-horse' }, { 'Content-Type': 'application/json' });
+    assert.strictEqual(r.status, 200);
+    assert.strictEqual(r.body.token, TOKEN, 'login returns the API token');
+    assert.strictEqual(r.body.username, 'alice');
+    r = await api('POST', '/api/login', { username: 'alice', password: 'nope-nope-nope' }, { 'Content-Type': 'application/json' });
+    assert.strictEqual(r.status, 401, 'wrong password rejected');
+    r = await api('POST', '/api/login', { username: 'ghost', password: 'whatever123' }, { 'Content-Type': 'application/json' });
+    assert.strictEqual(r.status, 401, 'unknown user rejected');
+
     // ---- search & filters -----------------------------------------------
     const aliceCookie2 = cookieOf(await form('/login', { username: 'alice', password: 'correct-horse' }));
     await api('PATCH', `/api/articles/${articleId}`, { archived: true }); // was unarchived by the web UI test
@@ -250,6 +305,7 @@ async function main() {
     r = await api('GET', '/api/articles?q=borrow+checker');
     assert.strictEqual(r.body.articles.length, 1, 'search matches textContent');
     assert.strictEqual(r.body.articles[0].title, 'Ownership Explained');
+    assert.strictEqual(r.body.articles[0].wordCount, 6, 'list metadata carries wordCount');
     r = await api('GET', '/api/articles?q=borrow+zebra');
     assert.strictEqual(r.body.articles.length, 0, 'all terms must match');
     // q matches archived only with includeArchived
@@ -275,12 +331,111 @@ async function main() {
     assert.ok(html.includes('Ownership Explained'), 'web search finds article');
     assert.ok(html.includes('1 result'), 'web search shows count');
 
+    // ---- length/highlight filters + saved views ---------------------------
+    r = await api('GET', '/api/articles?minWords=5&includeArchived=1');
+    assert.strictEqual(r.body.articles.length, 1, 'minWords filter');
+    assert.strictEqual(r.body.articles[0].title, 'Ownership Explained');
+    r = await api('GET', '/api/articles?maxWords=4&includeArchived=1');
+    assert.strictEqual(r.body.articles.length, 2, 'maxWords filter');
+    r = await api('GET', '/api/articles?minHighlights=1&includeArchived=1');
+    assert.strictEqual(r.body.articles.length, 1, 'minHighlights filter');
+    assert.strictEqual(r.body.articles[0].id, articleId);
+
+    r = await api('POST', '/api/views', { name: 'Long reads', filters: { minWords: 5 } });
+    assert.strictEqual(r.status, 201);
+    const viewId = r.body.id;
+    r = await api('GET', '/api/views');
+    assert.strictEqual(r.body.views.length, 1);
+    assert.strictEqual(r.body.views[0].name, 'Long reads');
+    assert.strictEqual(r.body.views[0].filters.minWords, 5);
+
+    res = await fetch(BASE + `/?view=v:${viewId}`, { headers: { Cookie: aliceCookie2 } });
+    html = await res.text();
+    assert.ok(html.includes('Ownership Explained'), 'saved view filters the web list');
+    assert.ok(html.includes('Long reads'), 'view chip rendered');
+
+    res = await form('/views/save', { name: 'From example', domain: 'example.com', q: '', hl: '', len: '' }, aliceCookie2);
+    assert.strictEqual(res.status, 303, 'save-as-view form works');
+    r = await api('GET', '/api/views');
+    assert.strictEqual(r.body.views.length, 2);
+
+    r = await api('DELETE', `/api/views/${viewId}`);
+    assert.strictEqual(r.body.ok, true);
+    r = await api('GET', '/api/views');
+    assert.strictEqual(r.body.views.length, 1);
+
+    // ---- PDF import -------------------------------------------------------
+    const pdfBuf = makeTestPdf('The PDF import pipeline extracted this sentence.');
+    res = await fetch(BASE + '/api/import/pdf?filename=my-test-doc.pdf', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${TOKEN}`, 'Content-Type': 'application/pdf' },
+      body: pdfBuf,
+    });
+    assert.strictEqual(res.status, 201, 'pdf import accepted');
+    const pdfArticle = await res.json();
+    assert.ok(pdfArticle.textContent.includes('extracted this sentence'), 'pdf text extracted');
+    assert.strictEqual(pdfArticle.siteName, 'PDF');
+    assert.ok(pdfArticle.title.includes('my test doc'), 'title from filename');
+
+    // re-importing the same file dedupes by content hash
+    res = await fetch(BASE + '/api/import/pdf?filename=my-test-doc.pdf', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${TOKEN}`, 'Content-Type': 'application/pdf' },
+      body: pdfBuf,
+    });
+    assert.strictEqual((await res.json()).id, pdfArticle.id, 'pdf re-import dedupes');
+
+    res = await fetch(BASE + '/api/import/pdf?filename=nope.pdf', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${TOKEN}`, 'Content-Type': 'application/pdf' },
+      body: Buffer.from('this is not a pdf'),
+    });
+    assert.strictEqual(res.status, 400, 'non-pdf rejected');
+    await api('DELETE', `/api/articles/${pdfArticle.id}`);
+
     // web highlight creation (what the reader's selection button does)
     r = await api('POST', `/api/articles/${articleId}/highlights`,
       { text: 'Then it got worse.', clientId: 'web-test-1' },
       { Cookie: aliceCookie2, 'Content-Type': 'application/json' });
     assert.strictEqual(r.status, 201, 'session cookie can create highlights');
     await api('DELETE', `/api/highlights/${r.body.id}`);
+
+    // ---- LLM parse rescue -------------------------------------------------
+    // A save flagged with fallbackHtml gets asynchronously re-extracted.
+    r = await api('POST', '/api/articles', {
+      url: 'https://paywalled.example.com/thin-article',
+      title: 'Badly Parsed Article',
+      html: '<p>You are reading a teaser.</p>',
+      textContent: 'You are reading a teaser.',
+      fallbackHtml: '<div class="page"><nav>menu</nav><div class="body">the real article text lives here</div></div>',
+    });
+    assert.strictEqual(r.status, 201);
+    const rescueId = r.body.id;
+    assert.ok(r.body.html.includes('teaser'), 'save responds immediately with the thin version');
+
+    let rescued = null;
+    for (let i = 0; i < 50; i++) {
+      r = await api('GET', `/api/articles/${rescueId}`);
+      if (r.body.html && r.body.html.includes('rescued article body')) { rescued = r.body; break; }
+      await new Promise((res2) => setTimeout(res2, 100));
+    }
+    assert.ok(rescued, 'article upgraded by the LLM rescue in the background');
+    assert.ok(rescued.textContent.includes('rescued article body'), 'textContent replaced too');
+    assert.strictEqual(rescued.title, 'Badly Parsed Article', 'title preserved through rescue');
+
+    // a save without fallbackHtml is never sent to the LLM
+    r = await api('POST', '/api/articles', {
+      url: 'https://example.com/fine-article',
+      title: 'Fine Article',
+      html: '<p>Parsed fine.</p>',
+      textContent: 'Parsed fine.',
+    });
+    const fineId = r.body.id;
+    await new Promise((res2) => setTimeout(res2, 400));
+    r = await api('GET', `/api/articles/${fineId}`);
+    assert.strictEqual(r.body.html, '<p>Parsed fine.</p>', 'unflagged save untouched');
+    await api('DELETE', `/api/articles/${rescueId}`);
+    await api('DELETE', `/api/articles/${fineId}`);
 
     // ---- email-to-save webhook ------------------------------------------
     r = await api('GET', '/api/me');
@@ -332,6 +487,30 @@ async function main() {
 
     await api('DELETE', `/api/articles/${emailArt}`);
 
+    // ---- export + apk hosting --------------------------------------------
+    res = await fetch(BASE + '/api/export.json', { headers: HEADERS });
+    assert.strictEqual(res.status, 200);
+    assert.ok((res.headers.get('content-disposition') || '').includes('readlater-export.json'));
+    const exported = await res.json();
+    assert.strictEqual(exported.username, 'alice');
+    assert.ok(exported.articles.length >= 3, 'export contains all articles');
+    assert.ok(exported.articles.some((a) => typeof a.html === 'string' && a.html.length > 0), 'export includes article html');
+    assert.ok(Array.isArray(exported.highlights) && exported.highlights.length >= 1, 'export includes highlights');
+
+    const fakeApk = Buffer.from('PK-not-really-an-apk-' + 'x'.repeat(100));
+    res = await fetch(BASE + '/api/app.apk', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${TOKEN}` },
+      body: fakeApk,
+    });
+    assert.strictEqual(res.status, 201, 'apk upload accepted');
+    res = await fetch(BASE + '/app.apk', { headers: { Cookie: aliceCookie2 } });
+    assert.strictEqual(res.status, 200);
+    assert.strictEqual(res.headers.get('content-type'), 'application/vnd.android.package-archive');
+    assert.strictEqual(Buffer.from(await res.arrayBuffer()).toString(), fakeApk.toString(), 'apk round-trips');
+    res = await fetch(BASE + '/app.apk', { redirect: 'manual' });
+    assert.strictEqual(res.status, 303, 'apk download requires login');
+
     // ---- deletes (as alice, token auth still fine) ----------------------
     r = await api('DELETE', `/api/highlights/${hlId}`);
     assert.strictEqual(r.body.ok, true);
@@ -345,6 +524,7 @@ async function main() {
 
     console.log('All server tests passed ✔');
   } finally {
+    mockLlm.close();
     const exited = new Promise((resolve) => proc.on('exit', resolve));
     proc.kill('SIGTERM');
     await exited;
