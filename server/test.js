@@ -191,10 +191,13 @@ async function main() {
     r = await api('GET', `/api/articles/${articleId}`);
     assert.strictEqual(r.body.html, '<p>Updated content.</p>');
 
-    // patch state (as the app does)
+    // patch state (as the app does) — scroll and TTS positions are separate
     r = await api('PATCH', `/api/articles/${articleId}`, { favorite: true, readParagraph: 3 });
     assert.strictEqual(r.body.favorite, true);
     assert.strictEqual(r.body.readParagraph, 3);
+    r = await api('PATCH', `/api/articles/${articleId}`, { ttsParagraph: 7 });
+    assert.strictEqual(r.body.ttsParagraph, 7);
+    assert.strictEqual(r.body.readParagraph, 3, 'ttsParagraph patch leaves readParagraph alone');
 
     // archive filtering
     await api('PATCH', `/api/articles/${articleId}`, { archived: true });
@@ -267,6 +270,12 @@ async function main() {
 
     res = await fetch(BASE + `/read/${articleId}`, { headers: { Cookie: bobCookie } });
     assert.strictEqual(res.status, 404, "bob can't read alice's article in the web UI");
+
+    // highlights page groups by article with counts
+    res = await fetch(BASE + '/highlights', { headers: { Cookie: aliceCookie } });
+    html = await res.text();
+    assert.ok(html.includes('1 highlight'), 'highlights page shows per-article count');
+    assert.ok(html.includes(`/read/${articleId}`), 'highlights page links to the article');
 
     res = await fetch(BASE + '/settings', { headers: { Cookie: aliceCookie } });
     html = await res.text();
@@ -498,18 +507,38 @@ async function main() {
     assert.ok(Array.isArray(exported.highlights) && exported.highlights.length >= 1, 'export includes highlights');
 
     const fakeApk = Buffer.from('PK-not-really-an-apk-' + 'x'.repeat(100));
-    res = await fetch(BASE + '/api/app.apk', {
+    res = await fetch(BASE + '/api/app.apk?versionName=9.9&versionCode=99', {
       method: 'POST',
       headers: { Authorization: `Bearer ${TOKEN}` },
       body: fakeApk,
     });
     assert.strictEqual(res.status, 201, 'apk upload accepted');
+    r = await api('GET', '/api/app-version');
+    assert.strictEqual(r.body.versionName, '9.9');
+    assert.strictEqual(r.body.versionCode, 99, 'app-version reports uploaded metadata');
     res = await fetch(BASE + '/app.apk', { headers: { Cookie: aliceCookie2 } });
     assert.strictEqual(res.status, 200);
     assert.strictEqual(res.headers.get('content-type'), 'application/vnd.android.package-archive');
     assert.strictEqual(Buffer.from(await res.arrayBuffer()).toString(), fakeApk.toString(), 'apk round-trips');
     res = await fetch(BASE + '/app.apk', { redirect: 'manual' });
     assert.strictEqual(res.status, 303, 'apk download requires login');
+
+    // named side-APKs (e.g. TTS engines)
+    res = await fetch(BASE + '/api/apk/test-engine', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${TOKEN}` },
+      body: Buffer.from('PK-side-apk'),
+    });
+    assert.strictEqual(res.status, 201, 'named apk upload accepted');
+    res = await fetch(BASE + '/apk/test-engine', { headers: { Cookie: aliceCookie2 } });
+    assert.strictEqual(res.status, 200);
+    assert.strictEqual(Buffer.from(await res.arrayBuffer()).toString(), 'PK-side-apk', 'named apk round-trips');
+    res = await fetch(BASE + '/api/apk/Bad Name!', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${TOKEN}` },
+      body: Buffer.from('x'),
+    });
+    assert.strictEqual(res.status, 400, 'invalid apk name rejected');
 
     // ---- deletes (as alice, token auth still fine) ----------------------
     r = await api('DELETE', `/api/highlights/${hlId}`);

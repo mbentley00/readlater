@@ -34,6 +34,7 @@ const PORT = parseInt(process.env.PORT || '8090', 10);
 const DATA_DIR = process.env.READLATER_DATA_DIR || path.join(__dirname, 'data');
 const TOKEN_FILE = path.join(DATA_DIR, 'token.txt');
 const APK_FILE = path.join(DATA_DIR, 'app.apk');
+const APK_META_FILE = path.join(DATA_DIR, 'app-apk.json');
 const MAX_BODY = 10 * 1024 * 1024; // 10 MB per request
 const ALLOW_SIGNUP = process.env.READLATER_ALLOW_SIGNUP !== '0';
 const SESSION_TTL = 30 * 24 * 60 * 60 * 1000; // 30 days
@@ -373,8 +374,16 @@ const server = http.createServer(async (req, res) => {
 
     // ---- Android APK hosting: POST uploads a build (streamed to the data
     // dir, so it survives deploys); the web UI serves it at GET /app.apk.
-    if (req.method === 'POST' && parts[1] === 'app.apk' && parts.length === 2) {
-      const tmp = APK_FILE + '.tmp';
+    // Additional named APKs (e.g. a TTS engine) live at /apk/<name>.
+    if (req.method === 'POST' && (
+      (parts[1] === 'app.apk' && parts.length === 2) ||
+      (parts[1] === 'apk' && parts.length === 3)
+    )) {
+      const target = parts[1] === 'app.apk'
+        ? APK_FILE
+        : (/^[a-z0-9-]{1,64}$/.test(parts[2]) ? path.join(DATA_DIR, `apk-${parts[2]}.apk`) : null);
+      if (!target) return json(res, 400, { error: 'bad apk name (use a-z, 0-9, -)' });
+      const tmp = target + '.tmp';
       const out = fs.createWriteStream(tmp);
       let size = 0;
       await new Promise((resolve, reject) => {
@@ -387,8 +396,24 @@ const server = http.createServer(async (req, res) => {
         out.on('finish', resolve);
         req.pipe(out);
       });
-      fs.renameSync(tmp, APK_FILE);
+      fs.renameSync(tmp, target);
+      // main app uploads carry version metadata so clients can offer updates
+      if (target === APK_FILE) {
+        const meta = {
+          versionName: sanitizeString(url.searchParams.get('versionName'), 32) || null,
+          versionCode: parseInt(url.searchParams.get('versionCode') || '0', 10) || 0,
+          size,
+          uploadedAt: Date.now(),
+        };
+        fs.writeFileSync(APK_META_FILE, JSON.stringify(meta));
+      }
       return json(res, 201, { ok: true, size });
+    }
+
+    // ---- latest app version (for the in-app update check)
+    if (req.method === 'GET' && parts[1] === 'app-version' && parts.length === 2) {
+      if (!fs.existsSync(APK_META_FILE)) return json(res, 404, { error: 'no app uploaded' });
+      return json(res, 200, JSON.parse(fs.readFileSync(APK_META_FILE, 'utf8')));
     }
 
     // ---- current account
@@ -438,7 +463,9 @@ const server = http.createServer(async (req, res) => {
         } else {
           a = {
             id: newId(), userId: user.id, url: artUrl,
-            savedAt: b.savedAt || now, archived: false, favorite: false, readParagraph: 0,
+            savedAt: b.savedAt || now,
+            archived: b.archived === true, // importers can create straight into the archive
+            favorite: false, readParagraph: 0,
             ...fields,
           };
           store.insertArticle(a);
@@ -487,6 +514,7 @@ const server = http.createServer(async (req, res) => {
           archived: typeof b.archived === 'boolean' ? b.archived : undefined,
           favorite: typeof b.favorite === 'boolean' ? b.favorite : undefined,
           readParagraph: b.readParagraph,
+          ttsParagraph: b.ttsParagraph,
           updatedAt: Date.now(),
         });
         return json(res, 200, pubArticleMeta(store.getArticle(a.id, user.id)));

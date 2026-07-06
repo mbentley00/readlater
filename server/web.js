@@ -67,6 +67,7 @@ mark[data-hl] { background:var(--mark); color:inherit; padding:0 .1em; border-ra
 .hl-block { border-left:3px solid var(--accent); padding:.2rem 0 .2rem 1rem; margin:1rem 0; }
 .hl-block .note { color:var(--muted); font-size:.9rem; }
 .hl-block .from { font-size:.8rem; font-family:system-ui,sans-serif; margin-top:.2rem; }
+.hl-count { font-size:.8rem; font-family:system-ui,sans-serif; color:var(--accent); white-space:nowrap; }
 code.token { background:var(--card); border:1px solid var(--line); border-radius:6px; padding:.25rem .5rem; font-size:.85rem; user-select:all; overflow-wrap:anywhere; }
 .reader-actions { margin-top:.6rem; }
 form.search { display:flex; gap:.5rem; align-items:center; flex-wrap:wrap; font-family:system-ui,sans-serif; font-size:.85rem; margin-bottom:1rem; }
@@ -239,13 +240,15 @@ ${viewChips}
   ${searching || savedView ? '<a class="back" href="/">Clear</a>' : ''}
 </form>
 ${savedView ? `<div class="meta">${list.length} article${list.length === 1 ? '' : 's'} in “${escapeHtml(savedView.name)}”</div>` : ''}
-${searching && !savedView ? `<div class="meta">${list.length} result${list.length === 1 ? '' : 's'}${q ? ` for “${escapeHtml(q)}”` : ''}${domain ? ` from ${escapeHtml(domain)}` : ''}</div>${saveViewForm}` : ''}`;
+${searching && !savedView ? `<div class="meta">${list.length} result${list.length === 1 ? '' : 's'}${q ? ` for “${escapeHtml(q)}”` : ''}${domain ? ` from ${escapeHtml(domain)}` : ''}</div>${saveViewForm}` : ''}
+${!searching && !savedView ? `<div class="meta">${list.length.toLocaleString('en-US')} article${list.length === 1 ? '' : 's'}</div>` : ''}`;
 
   const hlCounts = ctx.store.highlightCountsByArticle(user.id);
   const items = list.map((a) => {
     const hlCount = hlCounts.get(a.id) || 0;
     const meta = [
-      a.siteName, a.byline, fmtDate(a.savedAt),
+      a.siteName || a.domain || null, // imported articles often lack a site name
+      a.byline, fmtDate(a.savedAt),
       a.wordCount > 0 ? `~${Math.max(1, Math.round(a.wordCount / 225))} min` : null,
       a.readParagraph > 0 ? `¶${a.readParagraph} in progress` : null,
       hlCount ? `${hlCount} highlight${hlCount > 1 ? 's' : ''}` : null,
@@ -407,24 +410,27 @@ document.getElementById('hl-save').addEventListener('mousedown', async (e) => {
 }
 
 function highlightsPage(ctx, user) {
-  const hls = ctx.store.highlightsForUser(user.id);
-  const blocks = hls.map((h) => {
-    return `<div class="hl-block">
-      <div>${escapeHtml(h.text)}</div>
-      ${h.note ? `<div class="note">${escapeHtml(h.note)}</div>` : ''}
-      <div class="from meta">${h.articleTitle ? `<a href="/read/${h.articleId}">${escapeHtml(h.articleTitle)}</a>` : 'Deleted article'} · ${fmtDate(h.createdAt)} · <button class="act" data-act="del-hl" data-id="${h.id}">Delete</button></div>
-    </div>`;
+  // Grouped by article: which articles have highlights and how many. The
+  // highlights themselves live on each article's reader page.
+  const arts = ctx.store.highlightedArticles(user.id);
+  const items = arts.map((a) => {
+    const meta = [
+      a.siteName,
+      a.wordCount > 0 ? `~${Math.max(1, Math.round(a.wordCount / 225))} min` : null,
+      `highlighted ${fmtDate(a.lastHighlightAt)}`,
+    ].filter(Boolean).map(escapeHtml).join(' · ');
+    return `<li>
+      <div class="main"><a class="title" href="/read/${a.id}">${escapeHtml(a.title)}</a>
+      <div class="meta">${meta}</div></div>
+      <div class="actions"><span class="hl-count">${a.n} highlight${a.n > 1 ? 's' : ''}</span></div>
+    </li>`;
   }).join('\n');
   const body = `<h1>Highlights</h1>
-${hls.length ? blocks : '<div class="empty">No highlights yet — long-press a paragraph in the Android app, or select text in the reader.</div>'}
+${arts.length ? `<div class="meta">${arts.length} article${arts.length === 1 ? '' : 's'} with highlights — open one to read them in place.</div>
+<ul class="articles">${items}</ul>`
+    : '<div class="empty">No highlights yet — long-press a paragraph in the Android app, or select text in the reader.</div>'}
 <p class="meta"><a href="/api/highlights/export.md">Export all as Markdown</a></p>`;
-  const script = `
-document.addEventListener('click', async (e) => {
-  const btn = e.target.closest('button[data-act="del-hl"]'); if (!btn) return;
-  await fetch('/api/highlights/' + btn.dataset.id, { method: 'DELETE' });
-  location.reload();
-});`;
-  return { body, script };
+  return { body, script: '' };
 }
 
 function settingsPage(ctx, user, url, req) {
@@ -544,17 +550,23 @@ async function handle(ctx, req, res, url) {
   }
 
   // Android app download (uploaded to the server via POST /api/app.apk).
-  if (route === 'GET /app.apk') {
-    if (!fs.existsSync(ctx.APK_FILE)) {
-      return send(res, 404, page({ title: 'Not found', body: '<div class="empty">No app build has been uploaded yet.</div>', user, nonce }), { nonce });
+  // Extra named APKs (POST /api/apk/<name>) download at /apk/<name>.
+  const apkTarget =
+    route === 'GET /app.apk' ? { file: ctx.APK_FILE, name: 'readlater.apk' } :
+    (parts[0] === 'apk' && parts.length === 2 && req.method === 'GET' && /^[a-z0-9-]{1,64}$/.test(parts[1]))
+      ? { file: `${ctx.APK_FILE.replace(/app\.apk$/, '')}apk-${parts[1]}.apk`, name: `${parts[1]}.apk` }
+      : null;
+  if (apkTarget) {
+    if (!fs.existsSync(apkTarget.file)) {
+      return send(res, 404, page({ title: 'Not found', body: '<div class="empty">No such app build has been uploaded.</div>', user, nonce }), { nonce });
     }
-    const stat = fs.statSync(ctx.APK_FILE);
+    const stat = fs.statSync(apkTarget.file);
     res.writeHead(200, {
       'Content-Type': 'application/vnd.android.package-archive',
       'Content-Length': stat.size,
-      'Content-Disposition': 'attachment; filename="readlater.apk"',
+      'Content-Disposition': `attachment; filename="${apkTarget.name}"`,
     });
-    return fs.createReadStream(ctx.APK_FILE).pipe(res);
+    return fs.createReadStream(apkTarget.file).pipe(res);
   }
 
   let made = null, title = 'ReadLater', active = 'inbox';

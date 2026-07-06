@@ -46,6 +46,7 @@ CREATE TABLE IF NOT EXISTS articles (
   archived INTEGER NOT NULL DEFAULT 0,
   favorite INTEGER NOT NULL DEFAULT 0,
   readParagraph INTEGER NOT NULL DEFAULT 0,
+  ttsParagraph INTEGER NOT NULL DEFAULT 0,
   title TEXT,
   byline TEXT,
   siteName TEXT,
@@ -136,6 +137,10 @@ function open(dataDir) {
       for (const r of rows) upd.run(articleWordCount(r), r.id);
     })();
   }
+  // separate listening position (TTS) from the manual scroll position
+  if (!articleCols.includes('ttsParagraph')) {
+    sqlite.exec("ALTER TABLE articles ADD COLUMN ttsParagraph INTEGER NOT NULL DEFAULT 0");
+  }
 
   migrateLegacyJson(sqlite, dataDir);
 
@@ -183,17 +188,19 @@ function open(dataDir) {
       title = @title, byline = @byline, siteName = @siteName, excerpt = @excerpt,
       html = @html, textContent = @textContent, wordCount = @wordCount, updatedAt = @updatedAt WHERE id = @id`)
       .run({ ...f, id, wordCount: articleWordCount(f) }),
-    patchArticle: (id, { archived, favorite, readParagraph, updatedAt }) =>
+    patchArticle: (id, { archived, favorite, readParagraph, ttsParagraph, updatedAt }) =>
       prep('ap', `UPDATE articles SET
         archived = COALESCE(@archived, archived),
         favorite = COALESCE(@favorite, favorite),
         readParagraph = COALESCE(@readParagraph, readParagraph),
+        ttsParagraph = COALESCE(@ttsParagraph, ttsParagraph),
         updatedAt = @updatedAt WHERE id = @id`)
         .run({
           id, updatedAt,
           archived: typeof archived === 'boolean' ? (archived ? 1 : 0) : null,
           favorite: typeof favorite === 'boolean' ? (favorite ? 1 : 0) : null,
           readParagraph: Number.isInteger(readParagraph) && readParagraph >= 0 ? readParagraph : null,
+          ttsParagraph: Number.isInteger(ttsParagraph) && ttsParagraph >= 0 ? ttsParagraph : null,
         }),
     deleteArticle: (id) => {
       prep('adh', 'DELETE FROM highlights WHERE articleId = ?').run(id);
@@ -229,8 +236,8 @@ function open(dataDir) {
         where.push('a.rowid IN (SELECT rowid FROM articles_fts WHERE articles_fts MATCH @match)');
         args.match = match;
       }
-      const sql = `SELECT a.id, a.userId, a.url, a.savedAt, a.archived, a.favorite, a.readParagraph,
-          a.title, a.byline, a.siteName, a.excerpt, a.wordCount, a.updatedAt
+      const sql = `SELECT a.id, a.userId, a.url, a.domain, a.savedAt, a.archived, a.favorite, a.readParagraph,
+          a.ttsParagraph, a.title, a.byline, a.siteName, a.excerpt, a.wordCount, a.updatedAt
         FROM articles a WHERE ${where.join(' AND ')} ORDER BY a.savedAt DESC`;
       return sqlite.prepare(sql).all(args).map(rowArticle);
     },
@@ -246,6 +253,13 @@ function open(dataDir) {
     highlightsForUser: (userId) => prep('hfu', `SELECT h.*, a.title articleTitle, a.url articleUrl
       FROM highlights h LEFT JOIN articles a ON a.id = h.articleId
       WHERE h.userId = ? ORDER BY h.createdAt DESC`).all(userId),
+    /** Articles that have highlights, with counts — for the highlights page. */
+    highlightedArticles: (userId) =>
+      prep('hla', `SELECT a.id, a.title, a.siteName, a.savedAt, a.wordCount,
+          COUNT(h.id) AS n, MAX(h.createdAt) AS lastHighlightAt
+        FROM highlights h JOIN articles a ON a.id = h.articleId
+        WHERE h.userId = ? GROUP BY a.id ORDER BY lastHighlightAt DESC`).all(userId),
+
     highlightCountsByArticle: (userId) => {
       const out = new Map();
       for (const r of prep('hcba', 'SELECT articleId, COUNT(*) n FROM highlights WHERE userId = ? GROUP BY articleId').all(userId)) {
