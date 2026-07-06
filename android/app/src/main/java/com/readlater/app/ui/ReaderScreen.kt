@@ -41,6 +41,7 @@ import androidx.compose.material.icons.filled.SkipPrevious
 import androidx.compose.material.icons.filled.Star
 import androidx.compose.material.icons.filled.StarBorder
 import androidx.compose.material.icons.filled.Unarchive
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.BottomAppBar
 import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
@@ -109,9 +110,11 @@ private fun sendTtsCommand(
     startParagraph: Int? = null
 ) {
     val intent = Intent(context, TtsService::class.java).setAction(action)
-    if (action == TtsService.ACTION_PLAY) {
+    if (action == TtsService.ACTION_PLAY || action == TtsService.ACTION_SET_POSITION) {
         intent.putExtra(TtsService.EXTRA_ARTICLE_ID, articleId)
         intent.putExtra(TtsService.EXTRA_START_PARAGRAPH, startParagraph ?: -1)
+    }
+    if (action == TtsService.ACTION_PLAY) {
         // PLAY must go through startForegroundService so the service may promote itself.
         ContextCompat.startForegroundService(context, intent)
     } else {
@@ -143,6 +146,14 @@ fun ReaderScreen(articleId: String, onBack: () -> Unit) {
     val listState = rememberLazyListState()
     var didInitialScroll by remember { mutableStateOf(false) }
 
+    // Bodies of archived articles aren't synced eagerly — fetch on open.
+    LaunchedEffect(article?.id, article?.html == null) {
+        val a = article
+        if (a != null && a.html == null) {
+            repo.fetchArticleBody(a.id)
+        }
+    }
+
     // Whether the view auto-follows the spoken paragraph. On by default;
     // switched off as soon as the user scrolls by hand, back on via the
     // follow button or by (re)starting playback.
@@ -153,11 +164,20 @@ fun ReaderScreen(articleId: String, onBack: () -> Unit) {
         }
     }
 
-    // Restore the saved read position once the body is available.
+    // Restore the saved position once the body is available. When the manual
+    // scroll position and the listening (TTS) position have meaningfully
+    // diverged, ask which one to resume instead of guessing.
+    var resumeChoice by remember { mutableStateOf<Pair<Int, Int>?>(null) } // (read, tts)
     LaunchedEffect(blocks) {
         if (!didInitialScroll && blocks.isNotEmpty()) {
-            val target = (article?.readParagraph ?: 0).coerceIn(0, blocks.size - 1)
-            listState.scrollToItem(target)
+            val read = (article?.readParagraph ?: 0).coerceIn(0, blocks.size - 1)
+            val tts = (article?.ttsParagraph ?: 0).coerceIn(0, blocks.size - 1)
+            if (read > 0 && tts > 0 && kotlin.math.abs(read - tts) > 2) {
+                listState.scrollToItem(minOf(read, tts))
+                resumeChoice = read to tts
+            } else {
+                listState.scrollToItem(maxOf(read, tts))
+            }
             didInitialScroll = true
         }
     }
@@ -171,11 +191,12 @@ fun ReaderScreen(articleId: String, onBack: () -> Unit) {
         }
     }
 
-    // Continuously persist the scroll position while reading (debounced, local-only;
-    // the dirty flag gets it pushed on the next sync). Survives the app being killed
-    // mid-read. Suspended while TTS is reading this article — the spoken position wins.
-    LaunchedEffect(didInitialScroll, isTtsThisArticle, ttsState.isPlaying) {
-        if (!didInitialScroll || (isTtsThisArticle && ttsState.isPlaying)) return@LaunchedEffect
+    // Continuously persist the manual scroll position (debounced, local-only;
+    // the dirty flag gets it pushed on the next sync). Survives the app being
+    // killed mid-read. Suspended only while auto-follow is driving the scroll —
+    // TTS keeps its own separate position.
+    LaunchedEffect(didInitialScroll, isTtsThisArticle, ttsState.isPlaying, followTts) {
+        if (!didInitialScroll || (isTtsThisArticle && ttsState.isPlaying && followTts)) return@LaunchedEffect
         snapshotFlow { listState.firstVisibleItemIndex }
             .distinctUntilChanged()
             .debounce(800)
@@ -365,15 +386,18 @@ fun ReaderScreen(articleId: String, onBack: () -> Unit) {
                         else LocalContentColor.current
                     )
                 }
-                // Make the current view the reading position (moves TTS if playing).
+                // Make the current view the position — both the scroll position
+                // and the listening position, whatever the playback state.
                 IconButton(onClick = {
                     val idx = listState.firstVisibleItemIndex
                         .coerceIn(0, (blocks.size - 1).coerceAtLeast(0))
                     followTts = true
-                    if (isTtsThisArticle && ttsState.isPlaying) {
-                        sendTtsCommand(context, TtsService.ACTION_PLAY, articleId, idx)
+                    repo.saveReadPosition(articleId, idx)
+                    if (isTtsThisArticle) {
+                        // live service: move its in-memory position too
+                        sendTtsCommand(context, TtsService.ACTION_SET_POSITION, articleId, idx)
                     } else {
-                        repo.saveReadPosition(articleId, idx)
+                        repo.saveTtsPosition(articleId, idx)
                     }
                     scope.launch { snackbarHostState.showSnackbar("Reading position set to here") }
                 }) {
@@ -466,6 +490,31 @@ fun ReaderScreen(articleId: String, onBack: () -> Unit) {
                 }
             }
         }
+    }
+
+    // Resume chooser: manual scroll position vs listening position.
+    resumeChoice?.let { (read, tts) ->
+        val total = blocks.size.coerceAtLeast(1)
+        val readPct = ((read + 1) * 100 / total).coerceIn(1, 100)
+        val ttsPct = ((tts + 1) * 100 / total).coerceIn(1, 100)
+        AlertDialog(
+            onDismissRequest = { resumeChoice = null },
+            title = { Text("Resume where?") },
+            text = { Text("Your reading and listening positions differ.") },
+            confirmButton = {
+                TextButton(onClick = {
+                    resumeChoice = null
+                    scope.launch { listState.scrollToItem(read) }
+                }) { Text("Reading · $readPct%") }
+            },
+            dismissButton = {
+                TextButton(onClick = {
+                    resumeChoice = null
+                    followTts = true
+                    scope.launch { listState.scrollToItem(tts) }
+                }) { Text("Listening · $ttsPct%") }
+            }
+        )
     }
 
     val target = sheetTarget

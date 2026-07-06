@@ -17,6 +17,13 @@ private val MIGRATION_1_2 = object : Migration(1, 2) {
     }
 }
 
+/** v2 → v3: listening position tracked separately from the scroll position. */
+private val MIGRATION_2_3 = object : Migration(2, 3) {
+    override fun migrate(db: SupportSQLiteDatabase) {
+        db.execSQL("ALTER TABLE articles ADD COLUMN ttsParagraph INTEGER NOT NULL DEFAULT 0")
+    }
+}
+
 /**
  * Application class doubling as a tiny manual DI container.
  * All singletons are created lazily on first use.
@@ -25,7 +32,7 @@ class ReadLaterApp : Application() {
 
     val database: AppDatabase by lazy {
         Room.databaseBuilder(this, AppDatabase::class.java, "readlater.db")
-            .addMigrations(MIGRATION_1_2)
+            .addMigrations(MIGRATION_1_2, MIGRATION_2_3)
             .fallbackToDestructiveMigration()
             .build()
     }
@@ -34,5 +41,5 @@ class ReadLaterApp : Application() {
 
     val apiClient: ApiClient by lazy { ApiClient(settings) }
 
-    val repository: Repository by lazy { Repository(database, apiClient) }
+    val repository: Repository by lazy { Repository(database, apiClient, settings) }
 }

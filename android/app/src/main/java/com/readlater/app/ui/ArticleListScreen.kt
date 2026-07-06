@@ -56,15 +56,27 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import android.content.Context
+import android.content.Intent
+import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.Pause
+import androidx.compose.material.icons.filled.PlayArrow
+import androidx.compose.material3.Surface
 import com.readlater.app.ReadLaterApp
 import com.readlater.app.data.ArticleEntity
 import com.readlater.app.data.RemoteView
+import com.readlater.app.tts.TtsService
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.ui.platform.LocalContext
+import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.launch
 import kotlin.math.max
 import kotlin.math.roundToInt
+
+private fun sendTts(context: Context, action: String) {
+    context.startService(Intent(context, TtsService::class.java).setAction(action))
+}
 
 enum class SortMode(val label: String) {
     NEWEST("Newest first"),
@@ -144,11 +156,17 @@ fun ArticleListScreen(
         runCatching { views = repo.fetchViews() }
     }
 
-    fun sync(showErrors: Boolean) {
+    // Playback bar: visible whenever TTS is active, whichever article it's for.
+    val ttsState by TtsService.stateFlow.collectAsState()
+    val playingArticle by remember(ttsState.articleId) {
+        ttsState.articleId?.let { repo.article(it) } ?: flowOf(null)
+    }.collectAsState(initial = null)
+
+    fun sync(showErrors: Boolean, full: Boolean = false) {
         if (syncing) return
         scope.launch {
             syncing = true
-            val result = repo.syncNow()
+            val result = repo.syncNow(full)
             syncing = false
             if (showErrors) {
                 result.onFailure {
@@ -210,12 +228,53 @@ fun ArticleListScreen(
                             )
                         }
                     } else {
-                        IconButton(onClick = { sync(showErrors = true) }) {
+                        // Manual refresh does the full reconciliation (incl.
+                        // deletions); the automatic on-open sync is a delta.
+                        IconButton(onClick = { sync(showErrors = true, full = true) }) {
                             Icon(Icons.Filled.Refresh, contentDescription = "Sync")
                         }
                     }
                 }
             )
+        },
+        bottomBar = {
+            val playingId = ttsState.articleId
+            if (playingId != null) {
+                Surface(tonalElevation = 6.dp) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable { onOpenArticle(playingId) }
+                            .padding(start = 16.dp, end = 4.dp, top = 4.dp, bottom = 4.dp)
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = playingArticle?.title ?: "Playing…",
+                                style = MaterialTheme.typography.titleSmall,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                            Text(
+                                text = if (ttsState.isPlaying) "Listening — tap to open" else "Paused — tap to open",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                        IconButton(onClick = {
+                            sendTts(context, if (ttsState.isPlaying) TtsService.ACTION_PAUSE else TtsService.ACTION_RESUME)
+                        }) {
+                            Icon(
+                                if (ttsState.isPlaying) Icons.Filled.Pause else Icons.Filled.PlayArrow,
+                                contentDescription = "Play or pause"
+                            )
+                        }
+                        IconButton(onClick = { sendTts(context, TtsService.ACTION_STOP) }) {
+                            Icon(Icons.Filled.Close, contentDescription = "Stop playback")
+                        }
+                    }
+                }
+            }
         }
     ) { padding ->
         Column(modifier = Modifier.fillMaxSize().padding(padding)) {

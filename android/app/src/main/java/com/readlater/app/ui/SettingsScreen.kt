@@ -1,6 +1,7 @@
 package com.readlater.app.ui
 
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
@@ -16,6 +17,8 @@ import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Remove
 import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
@@ -36,16 +39,22 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import android.speech.tts.TextToSpeech
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
+import com.readlater.app.BuildConfig
 import com.readlater.app.ReadLaterApp
 import kotlinx.coroutines.launch
 import java.util.Locale
 
 /** Pre-filled default so a fresh install only needs username + password. */
 private const val DEFAULT_SERVER_URL = "https://readlater-mbent.fly.dev"
+
+private const val SHERPA_ENGINE = "com.k2fsa.sherpa.onnx.tts.engine"
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -200,6 +209,109 @@ fun SettingsScreen(onBack: () -> Unit) {
             HorizontalDivider()
 
             Text("Text to speech", style = MaterialTheme.typography.titleMedium)
+
+            // Engine + voice pickers. A probe TextToSpeech instance (recreated
+            // when the engine changes) enumerates voices and plays previews.
+            var enginePref by remember { mutableStateOf(settings.ttsEngine) }
+            var voicePref by remember { mutableStateOf(settings.ttsVoice) }
+            var engines by remember { mutableStateOf<List<TextToSpeech.EngineInfo>>(emptyList()) }
+            var voiceNames by remember { mutableStateOf<List<String>>(emptyList()) }
+            var probe by remember { mutableStateOf<TextToSpeech?>(null) }
+
+            val resolvedEngine = enginePref.ifBlank {
+                if (runCatching { context.packageManager.getPackageInfo(SHERPA_ENGINE, 0) }.isSuccess) SHERPA_ENGINE else ""
+            }
+            DisposableEffect(resolvedEngine) {
+                var instance: TextToSpeech? = null
+                val listener = TextToSpeech.OnInitListener { status ->
+                    if (status == TextToSpeech.SUCCESS) {
+                        probe = instance
+                        engines = instance?.engines ?: emptyList()
+                        voiceNames = runCatching {
+                            instance?.voices
+                                ?.filter { it.locale.language == Locale.getDefault().language }
+                                ?.map { it.name }?.sorted()
+                        }.getOrNull() ?: emptyList()
+                    }
+                }
+                instance = if (resolvedEngine.isBlank()) TextToSpeech(context, listener)
+                else TextToSpeech(context, listener, resolvedEngine)
+                onDispose {
+                    probe = null
+                    instance?.shutdown()
+                }
+            }
+
+            var engineMenuOpen by remember { mutableStateOf(false) }
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text("Engine", style = MaterialTheme.typography.bodyLarge, modifier = Modifier.weight(1f))
+                Box {
+                    OutlinedButton(onClick = { engineMenuOpen = true }) {
+                        Text(
+                            engines.firstOrNull { it.name == resolvedEngine }?.label
+                                ?: if (enginePref.isBlank()) "Auto" else enginePref
+                        )
+                    }
+                    DropdownMenu(expanded = engineMenuOpen, onDismissRequest = { engineMenuOpen = false }) {
+                        DropdownMenuItem(text = { Text("Auto (prefer neural)") }, onClick = {
+                            enginePref = ""; voicePref = ""
+                            settings.ttsEngine = ""; settings.ttsVoice = ""
+                            engineMenuOpen = false
+                        })
+                        engines.forEach { e ->
+                            DropdownMenuItem(text = { Text(e.label) }, onClick = {
+                                enginePref = e.name; voicePref = ""
+                                settings.ttsEngine = e.name; settings.ttsVoice = ""
+                                engineMenuOpen = false
+                            })
+                        }
+                    }
+                }
+            }
+
+            var voiceMenuOpen by remember { mutableStateOf(false) }
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text("Voice", style = MaterialTheme.typography.bodyLarge, modifier = Modifier.weight(1f))
+                Box {
+                    OutlinedButton(onClick = { voiceMenuOpen = true }) {
+                        Text(if (voicePref.isBlank()) "Auto (best quality)" else voicePref, maxLines = 1)
+                    }
+                    DropdownMenu(expanded = voiceMenuOpen, onDismissRequest = { voiceMenuOpen = false }) {
+                        DropdownMenuItem(text = { Text("Auto (best quality)") }, onClick = {
+                            voicePref = ""; settings.ttsVoice = ""
+                            voiceMenuOpen = false
+                        })
+                        voiceNames.forEach { v ->
+                            DropdownMenuItem(text = { Text(v) }, onClick = {
+                                voicePref = v; settings.ttsVoice = v
+                                voiceMenuOpen = false
+                            })
+                        }
+                    }
+                }
+            }
+
+            OutlinedButton(onClick = {
+                val p = probe ?: return@OutlinedButton
+                if (voicePref.isNotBlank()) {
+                    runCatching { p.voices?.firstOrNull { it.name == voicePref } }.getOrNull()
+                        ?.let { p.voice = it }
+                }
+                p.setSpeechRate(rate)
+                p.speak(
+                    "This is how your articles will sound in ReadLater.",
+                    TextToSpeech.QUEUE_FLUSH, null, "preview"
+                )
+            }) {
+                Text("Preview voice")
+            }
+            Text(
+                text = "Voice changes apply when playback next starts. Install the sherpa " +
+                    "neural engine from Settings on the web app for the best offline voice.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Text(
                     text = "Speech rate",
@@ -230,6 +342,31 @@ fun SettingsScreen(onBack: () -> Unit) {
             HorizontalDivider()
 
             Text("About", style = MaterialTheme.typography.titleMedium)
+            var latest by remember { mutableStateOf<Pair<String, Int>?>(null) }
+            LaunchedEffect(Unit) { latest = app.apiClient.latestAppVersion() }
+            val updateAvailable = (latest?.second ?: 0) > BuildConfig.VERSION_CODE
+            Text(
+                text = "Version ${BuildConfig.VERSION_NAME} (build ${BuildConfig.VERSION_CODE})" + when {
+                    latest == null -> ""
+                    updateAvailable -> " — update available: ${latest?.first} (build ${latest?.second})"
+                    else -> " — up to date"
+                },
+                style = MaterialTheme.typography.bodyMedium,
+                color = if (updateAvailable) MaterialTheme.colorScheme.primary
+                else MaterialTheme.colorScheme.onSurface
+            )
+            OutlinedButton(onClick = {
+                runCatching {
+                    context.startActivity(
+                        android.content.Intent(
+                            android.content.Intent.ACTION_VIEW,
+                            android.net.Uri.parse("${settings.serverUrl.ifBlank { DEFAULT_SERVER_URL }}/app.apk")
+                        )
+                    )
+                }
+            }) {
+                Text(if (updateAvailable) "Download update" else "Download latest APK")
+            }
             Text(
                 text = "ReadLater is a self-hosted read-it-later client. Save articles with " +
                     "the ReadLater Firefox extension (or email them in) and they sync here " +

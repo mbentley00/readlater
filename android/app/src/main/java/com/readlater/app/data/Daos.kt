@@ -29,6 +29,10 @@ interface ArticleDao {
     @Upsert
     suspend fun upsert(article: ArticleEntity)
 
+    /** One transaction for the whole batch — vastly faster than row-by-row. */
+    @Upsert
+    suspend fun upsertAll(articles: List<ArticleEntity>)
+
     @Query("UPDATE articles SET dirty = 0 WHERE id = :id")
     suspend fun clearDirty(id: String)
 
@@ -43,6 +47,9 @@ interface ArticleDao {
 
     @Query("UPDATE articles SET readParagraph = :paragraph, dirty = 1 WHERE id = :id")
     suspend fun setReadParagraph(id: String, paragraph: Int)
+
+    @Query("UPDATE articles SET ttsParagraph = :paragraph, dirty = 1 WHERE id = :id")
+    suspend fun setTtsParagraph(id: String, paragraph: Int)
 
     @Query("DELETE FROM articles WHERE id = :id")
     suspend fun deleteById(id: String)

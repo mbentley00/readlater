@@ -24,7 +24,9 @@ data class ArticleEntity(
     /** Server-computed word count of the article text (0 = unknown). */
     @ColumnInfo(defaultValue = "0") val wordCount: Int = 0,
     /** Block count from HtmlParser, set when the body is cached (0 = unknown). */
-    @ColumnInfo(defaultValue = "0") val paragraphCount: Int = 0
+    @ColumnInfo(defaultValue = "0") val paragraphCount: Int = 0,
+    /** Listening position (TTS), tracked separately from the manual scroll position. */
+    @ColumnInfo(defaultValue = "0") val ttsParagraph: Int = 0
 )
 
 @Entity(tableName = "highlights")

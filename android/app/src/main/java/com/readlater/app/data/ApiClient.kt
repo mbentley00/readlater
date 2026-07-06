@@ -23,6 +23,7 @@ data class RemoteArticle(
     val archived: Boolean,
     val favorite: Boolean,
     val readParagraph: Int,
+    val ttsParagraph: Int,
     val wordCount: Int,
     val html: String?
 )
@@ -115,11 +116,22 @@ class ApiClient(private val settings: Settings) {
         return JSONObject(body).getString("token")
     }
 
-    /** GET /api/articles?includeArchived=1 — metadata only, no html. */
-    suspend fun listArticles(): List<RemoteArticle> {
-        val body = execute(builder("/api/articles?includeArchived=1").get().build())
+    /** GET /api/articles?includeArchived=1 — metadata only, no html.
+     *  Pass [since] (updatedAt watermark) to fetch only changed articles. */
+    suspend fun listArticles(since: Long = 0): List<RemoteArticle> {
+        val qs = if (since > 0) "&since=$since" else ""
+        val body = execute(builder("/api/articles?includeArchived=1$qs").get().build())
         val arr = JSONObject(body).getJSONArray("articles")
         return (0 until arr.length()).map { parseArticle(arr.getJSONObject(it)) }
+    }
+
+    /** GET /api/app-version — metadata of the newest APK uploaded to the server. */
+    suspend fun latestAppVersion(): Pair<String, Int>? = try {
+        val body = execute(builder("/api/app-version").get().build())
+        val o = JSONObject(body)
+        (o.stringOrNull("versionName") ?: "?") to o.optInt("versionCode", 0)
+    } catch (_: Exception) {
+        null
     }
 
     /** GET /api/views — the user's saved filter views. */
@@ -154,12 +166,14 @@ class ApiClient(private val settings: Settings) {
         id: String,
         archived: Boolean? = null,
         favorite: Boolean? = null,
-        readParagraph: Int? = null
+        readParagraph: Int? = null,
+        ttsParagraph: Int? = null
     ): RemoteArticle {
         val json = JSONObject()
         archived?.let { json.put("archived", it) }
         favorite?.let { json.put("favorite", it) }
         readParagraph?.let { json.put("readParagraph", it) }
+        ttsParagraph?.let { json.put("ttsParagraph", it) }
         val body = execute(
             builder("/api/articles/$id")
                 .method("PATCH", json.toString().toRequestBody(jsonMediaType))
@@ -214,6 +228,7 @@ class ApiClient(private val settings: Settings) {
         archived = o.optBoolean("archived", false),
         favorite = o.optBoolean("favorite", false),
         readParagraph = o.optInt("readParagraph", 0),
+        ttsParagraph = o.optInt("ttsParagraph", 0),
         wordCount = o.optInt("wordCount", 0),
         html = o.stringOrNull("html")
     )

@@ -39,6 +39,27 @@ class Settings(context: Context) {
             prefs.edit().putString(KEY_LIST_SORT, value).apply()
         }
 
+    /** TTS engine package; "" = auto (prefer the sherpa neural engine when installed). */
+    var ttsEngine: String
+        get() = prefs.getString(KEY_TTS_ENGINE, "").orEmpty()
+        set(value) {
+            prefs.edit().putString(KEY_TTS_ENGINE, value).apply()
+        }
+
+    /** TTS voice name within the engine; "" = auto (highest quality). */
+    var ttsVoice: String
+        get() = prefs.getString(KEY_TTS_VOICE, "").orEmpty()
+        set(value) {
+            prefs.edit().putString(KEY_TTS_VOICE, value).apply()
+        }
+
+    /** updatedAt watermark of the last successful sync (for delta pulls). */
+    var lastSyncAt: Long
+        get() = prefs.getLong(KEY_LAST_SYNC, 0L)
+        set(value) {
+            prefs.edit().putLong(KEY_LAST_SYNC, value).apply()
+        }
+
     /** Article open when the app was last killed; "" = none. Used to resume on cold start. */
     var lastArticleId: String
         get() = prefs.getString(KEY_LAST_ARTICLE, "").orEmpty()
@@ -52,5 +73,8 @@ class Settings(context: Context) {
         const val KEY_TTS_RATE = "tts_speech_rate"
         const val KEY_LIST_SORT = "list_sort"
         const val KEY_LAST_ARTICLE = "last_article_id"
+        const val KEY_TTS_ENGINE = "tts_engine"
+        const val KEY_TTS_VOICE = "tts_voice"
+        const val KEY_LAST_SYNC = "last_sync_at"
     }
 }

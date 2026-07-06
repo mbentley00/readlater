@@ -14,7 +14,11 @@ import java.util.UUID
  * The app must remain fully usable offline — network failures are swallowed for
  * opportunistic pushes and surfaced as a [Result] failure only from explicit sync.
  */
-class Repository(db: AppDatabase, private val api: ApiClient) {
+class Repository(
+    db: AppDatabase,
+    private val api: ApiClient,
+    private val settings: Settings
+) {
 
     private val articleDao = db.articleDao()
     private val highlightDao = db.highlightDao()
@@ -37,22 +41,27 @@ class Repository(db: AppDatabase, private val api: ApiClient) {
     fun allHighlights(): Flow<List<HighlightWithArticle>> = highlightDao.allWithArticle()
 
     /**
-     * Full two-way sync:
+     * Two-way sync:
      * 1. push dirty article metadata (PATCH) and clear dirty flags;
      * 2. push unsynced highlights (POST, idempotent via clientId);
-     * 3. pull the article list, upserting metadata while preserving locally cached html,
-     *    and deleting local articles that no longer exist on the server;
-     * 4. fetch bodies for articles whose html is missing or stale.
+     * 3. pull article metadata — a DELTA (updatedAt > last sync) by default,
+     *    the full list when [full] is set — batching the upserts and skipping
+     *    unchanged rows so a 20k-article library syncs in moments;
+     * 4. on full syncs only, delete local articles gone from the server;
+     * 5. fetch bodies for inbox articles whose html is missing or stale.
      */
-    suspend fun syncNow(): Result<Unit> = withContext(Dispatchers.IO) {
+    suspend fun syncNow(full: Boolean = false): Result<Unit> = withContext(Dispatchers.IO) {
         runCatching {
+            val syncStartedAt = System.currentTimeMillis()
+
             // 1. Push local metadata changes.
             for (a in articleDao.getDirty()) {
                 api.patchArticle(
                     a.id,
                     archived = a.archived,
                     favorite = a.favorite,
-                    readParagraph = a.readParagraph
+                    readParagraph = a.readParagraph,
+                    ttsParagraph = a.ttsParagraph
                 )
                 articleDao.clearDirty(a.id)
             }
@@ -63,51 +72,67 @@ class Repository(db: AppDatabase, private val api: ApiClient) {
                 highlightDao.markSynced(h.clientId, remote.id)
             }
 
-            // 3. Pull article metadata.
-            val remoteArticles = api.listArticles()
+            // 3. Pull article metadata (delta unless a full sync was asked for,
+            //    with a safety overlap so clock skew can't drop updates).
+            val since = if (full) 0L else (settings.lastSyncAt - 10 * 60 * 1000L).coerceAtLeast(0L)
+            val remoteArticles = api.listArticles(since)
             val localById = articleDao.getAll().associateBy { it.id }
-            val remoteIds = remoteArticles.map { it.id }.toSet()
             val needsBody = mutableListOf<String>()
+            val changed = mutableListOf<ArticleEntity>()
 
             for (r in remoteArticles) {
                 val local = localById[r.id]
-                articleDao.upsert(
-                    ArticleEntity(
-                        id = r.id,
-                        url = r.url,
-                        title = r.title,
-                        byline = r.byline,
-                        siteName = r.siteName,
-                        excerpt = r.excerpt,
-                        // Preserve the cached body; step 4 refreshes it when stale.
-                        html = local?.html,
-                        savedAt = r.savedAt,
-                        updatedAt = r.updatedAt,
-                        archived = r.archived,
-                        favorite = r.favorite,
-                        readParagraph = r.readParagraph,
-                        dirty = false,
-                        wordCount = r.wordCount,
-                        paragraphCount = local?.paragraphCount ?: 0
-                    )
+                val merged = ArticleEntity(
+                    id = r.id,
+                    url = r.url,
+                    title = r.title,
+                    byline = r.byline,
+                    siteName = r.siteName,
+                    excerpt = r.excerpt,
+                    // Preserve the cached body; step 5 refreshes it when stale.
+                    html = local?.html,
+                    savedAt = r.savedAt,
+                    updatedAt = r.updatedAt,
+                    archived = r.archived,
+                    favorite = r.favorite,
+                    readParagraph = r.readParagraph,
+                    ttsParagraph = r.ttsParagraph,
+                    dirty = false,
+                    wordCount = r.wordCount,
+                    paragraphCount = local?.paragraphCount ?: 0
                 )
-                if (local?.html == null || r.updatedAt > local.updatedAt) {
+                if (local == null || local.copy(html = null, paragraphCount = 0) !=
+                    merged.copy(html = null, paragraphCount = 0)
+                ) {
+                    changed.add(merged)
+                }
+                // Only inbox articles get their bodies eagerly; archived ones
+                // load on demand in the reader (keeps a large imported library
+                // from downloading hundreds of MB to the phone).
+                if (!r.archived && (local?.html == null || r.updatedAt > local.updatedAt)) {
                     needsBody.add(r.id)
                 }
             }
+            if (changed.isNotEmpty()) articleDao.upsertAll(changed)
 
-            for (local in localById.values) {
-                if (local.id !in remoteIds) {
-                    articleDao.deleteById(local.id)
-                    highlightDao.deleteByArticle(local.id)
+            // 4. Deletions can only be detected against the complete list.
+            if (full) {
+                val remoteIds = remoteArticles.map { it.id }.toSet()
+                for (local in localById.values) {
+                    if (local.id !in remoteIds) {
+                        articleDao.deleteById(local.id)
+                        highlightDao.deleteByArticle(local.id)
+                    }
                 }
             }
 
-            // 4. Fetch missing/stale bodies.
+            // 5. Fetch missing/stale bodies.
             for (id in needsBody) {
-                val full = api.getArticle(id)
-                articleDao.setHtml(id, full.html, paragraphCountOf(full.html))
+                val fullArticle = api.getArticle(id)
+                articleDao.setHtml(id, fullArticle.html, paragraphCountOf(fullArticle.html))
             }
+
+            settings.lastSyncAt = syncStartedAt
         }
     }
 
@@ -151,6 +176,20 @@ class Repository(db: AppDatabase, private val api: ApiClient) {
     fun saveReadPositionLocal(articleId: String, paragraphIndex: Int) {
         bgScope.launch {
             articleDao.setReadParagraph(articleId, paragraphIndex)
+        }
+    }
+
+    /** Listening position — tracked separately from the manual scroll position. */
+    fun saveTtsPosition(articleId: String, paragraphIndex: Int) {
+        bgScope.launch {
+            articleDao.setTtsParagraph(articleId, paragraphIndex)
+            pushMetadata(articleId)
+        }
+    }
+
+    fun saveTtsPositionLocal(articleId: String, paragraphIndex: Int) {
+        bgScope.launch {
+            articleDao.setTtsParagraph(articleId, paragraphIndex)
         }
     }
 
@@ -209,7 +248,8 @@ class Repository(db: AppDatabase, private val api: ApiClient) {
                 a.id,
                 archived = a.archived,
                 favorite = a.favorite,
-                readParagraph = a.readParagraph
+                readParagraph = a.readParagraph,
+                ttsParagraph = a.ttsParagraph
             )
             articleDao.clearDirty(a.id)
         } catch (_: Exception) {
