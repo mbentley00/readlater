@@ -74,7 +74,7 @@ browser.contextMenus.onClicked.addListener((info, tab) => {
   if (info.menuItemId === 'readlater-save' && tab) savePage(tab.id);
 });
 
-// Keyboard shortcut (Alt+Shift+S by default).
+// Keyboard shortcut (Alt+T by default).
 browser.commands.onCommand.addListener(async (command) => {
   if (command !== 'save-page') return;
   const [tab] = await browser.tabs.query({ active: true, currentWindow: true });

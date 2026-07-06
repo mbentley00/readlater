@@ -1,7 +1,7 @@
 {
   "manifest_version": 2,
   "name": "ReadLater — Save to your reader",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Save the current page — exactly as rendered in your browser — to your self-hosted ReadLater server for reading in the Android app.",
   "icons": {
     "48": "icons/icon.svg",
@@ -27,14 +27,17 @@
   },
   "commands": {
     "save-page": {
-      "suggested_key": { "default": "Alt+Shift+S" },
+      "suggested_key": { "default": "Alt+T" },
       "description": "Save the current page to ReadLater"
     }
   },
   "browser_specific_settings": {
     "gecko": {
       "id": "readlater@selfhosted.local",
-      "strict_min_version": "102.0"
+      "strict_min_version": "102.0",
+      "data_collection_permissions": {
+        "required": ["none"]
+      }
     }
   }
 }

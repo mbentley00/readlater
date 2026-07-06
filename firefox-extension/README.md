@@ -13,7 +13,7 @@ cookies / client-side rendering) — rather than re-fetching the URL.
 
 - Toolbar button → **Save this page**
 - Right-click → **Save page to ReadLater**
-- Keyboard: **Alt+Shift+S**
+- Keyboard: **Alt+T**
 
 A notification confirms the save; the article then appears in the Android app
 on next sync.
