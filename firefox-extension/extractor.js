@@ -5,7 +5,16 @@
  * if you can see the article (logged in, past a metered paywall, after
  * client-side rendering), this captures it. It never re-fetches the URL.
  *
- * The file's completion value (the object below) is returned to the
+ * Extraction strategy:
+ *   1. Mozilla Readability (vendored, injected before this script) on a
+ *      clone of the document — the same engine as Firefox Reader View.
+ *   2. If Readability fails or returns something thin, fall back to the
+ *      original container-scoring heuristic.
+ *   3. If the best result still looks wrong (tiny compared to the page),
+ *      attach a stripped copy of the whole page as `fallbackHtml` so the
+ *      server can re-extract it with an LLM.
+ *
+ * The file's completion value (the object at the end) is returned to the
  * background script by browser.tabs.executeScript().
  */
 (() => {
@@ -51,9 +60,52 @@
     return linked / total;
   }
 
-  /** Pick the element most likely to contain the article body. */
+  /** Resolve lazy-loaded image URLs in a cloned tree using the live DOM's state. */
+  function fixImagesInClone(cloneRoot, liveRoot) {
+    const liveImgs = liveRoot.querySelectorAll('img');
+    const cloneImgs = cloneRoot.querySelectorAll('img');
+    for (let i = 0; i < cloneImgs.length && i < liveImgs.length; i++) {
+      const live = liveImgs[i];
+      const src =
+        live.currentSrc ||
+        live.src ||
+        live.getAttribute('data-src') ||
+        live.getAttribute('data-lazy-src') ||
+        '';
+      if (src) {
+        try { cloneImgs[i].setAttribute('src', new URL(src, location.href).href); } catch (e) {}
+      }
+      cloneImgs[i].removeAttribute('srcset');
+    }
+  }
+
+  // ---------------------------------------------------------------- primary:
+  // Mozilla Readability on a document clone (Readability mutates its input).
+  function readabilityExtract() {
+    if (typeof Readability !== 'function') return null;
+    try {
+      const docClone = document.cloneNode(true);
+      fixImagesInClone(docClone, document);
+      const result = new Readability(docClone).parse();
+      if (!result || !result.content) return null;
+      const text = (result.textContent || '').trim();
+      if (text.length < 500) return null; // too thin — let the heuristic try
+      return {
+        html: result.content,
+        textContent: text.replace(/\s+/g, ' '),
+        title: result.title || null,
+        byline: result.byline || null,
+        siteName: result.siteName || null,
+        excerpt: result.excerpt || null,
+      };
+    } catch (e) {
+      return null;
+    }
+  }
+
+  // ---------------------------------------------------------------- fallback:
+  // original container-scoring heuristic.
   function findContentRoot() {
-    // 1. Semantic candidates, best first.
     const semantic = [
       ...document.querySelectorAll(
         'article, [itemprop="articleBody"], [role="main"], main, ' +
@@ -68,7 +120,6 @@
     }
     if (best && bestScore >= 250) return best;
 
-    // 2. Heuristic scan: any container whose <p> children carry the most text.
     for (const el of document.querySelectorAll('div, section, td')) {
       const score = textLen(el) * (1 - Math.min(linkDensity(el), 0.9));
       if (score > bestScore) { best = el; bestScore = score; }
@@ -83,60 +134,72 @@
 
   function cleanup(root) {
     for (const el of root.querySelectorAll(NOISE_SELECTORS)) el.remove();
-    // Class/id based noise (only when it doesn't hold substantial article text).
     for (const el of [...root.querySelectorAll('div, section, ul, ol, span, p, a')]) {
-      // root is a detached clone, so isConnected is useless here — use contains
-      // to skip elements already dropped with a removed ancestor.
       if (root.contains(el) && isNoise(el)) el.remove();
     }
-    // Strip attributes down to a whitelist; drop inline handlers/styles/trackers.
     for (const el of root.querySelectorAll('*')) {
       for (const attr of [...el.attributes]) {
         if (!KEEP_ATTRS.has(attr.name)) el.removeAttribute(attr.name);
       }
     }
-    // Drop empty wrappers left behind.
     for (const el of [...root.querySelectorAll('div, span, section, p')]) {
       if (!el.textContent.trim() && !el.querySelector('img')) el.remove();
     }
     return root;
   }
 
-  /** Resolve relative + lazy-loaded URLs on the ORIGINAL elements before cloning. */
   function absolutizeInto(clone, original) {
     const origLinks = original.querySelectorAll('a[href]');
     const cloneLinks = clone.querySelectorAll('a[href]');
     for (let i = 0; i < cloneLinks.length && i < origLinks.length; i++) {
-      cloneLinks[i].setAttribute('href', origLinks[i].href); // .href is absolute
+      cloneLinks[i].setAttribute('href', origLinks[i].href);
     }
-    const origImgs = original.querySelectorAll('img');
-    const cloneImgs = clone.querySelectorAll('img');
-    for (let i = 0; i < cloneImgs.length && i < origImgs.length; i++) {
-      const o = origImgs[i];
-      const src =
-        o.currentSrc ||
-        o.src ||
-        o.getAttribute('data-src') ||
-        o.getAttribute('data-lazy-src') ||
-        '';
-      if (src) cloneImgs[i].setAttribute('src', new URL(src, location.href).href);
-      cloneImgs[i].removeAttribute('srcset');
-    }
+    fixImagesInClone(clone, original);
   }
 
-  const contentRoot = findContentRoot();
-  const clone = contentRoot.cloneNode(true);
-  absolutizeInto(clone, contentRoot);
-  cleanup(clone);
+  function heuristicExtract() {
+    const contentRoot = findContentRoot();
+    const clone = contentRoot.cloneNode(true);
+    absolutizeInto(clone, contentRoot);
+    cleanup(clone);
+    return {
+      html: clone.innerHTML,
+      textContent: clone.textContent.replace(/\s+/g, ' ').trim(),
+      title: null, byline: null, siteName: null, excerpt: null,
+    };
+  }
 
-  const textContent = clone.textContent.replace(/\s+/g, ' ').trim();
+  // ---------------------------------------------------------------- rescue:
+  // stripped copy of the whole page for the server's LLM re-parse.
+  function pageForLlm() {
+    const html = document.body ? document.body.innerHTML : '';
+    return html
+      .replace(/<!--[\s\S]*?-->/g, '')
+      .replace(/<(script|style|noscript|template|svg)\b[\s\S]*?<\/\1\s*>/gi, '')
+      .replace(/<(iframe|object|embed|link|meta)\b[^>]*>/gi, '')
+      .replace(/\s{2,}/g, ' ')
+      .slice(0, 400000);
+  }
+
+  // ---------------------------------------------------------------- run
+  const best = readabilityExtract() || heuristicExtract();
+  const textContent = best.textContent;
+
+  // "Doesn't look like we parsed correctly": tiny result, or a small
+  // fraction of what's visibly on the page.
+  const pageTextLen = (document.body ? document.body.innerText : '').replace(/\s+/g, ' ').trim().length;
+  const suspect =
+    textContent.length < 800 ||
+    (pageTextLen > 3000 && textContent.length < pageTextLen * 0.25);
 
   const title =
+    best.title ||
     meta('og:title') ||
     (document.querySelector('h1') && document.querySelector('h1').textContent.trim()) ||
     document.title;
 
   const byline =
+    best.byline ||
     meta('author') ||
     meta('article:author') ||
     (document.querySelector('[rel="author"], .byline, .author-name') || {}).textContent ||
@@ -148,10 +211,11 @@
     url: (meta('og:url') || location.href).split('#')[0],
     title: (title || location.href).trim().slice(0, 500),
     byline: byline ? byline.trim().replace(/\s+/g, ' ').slice(0, 200) : null,
-    siteName: (meta('og:site_name') || location.hostname).trim().slice(0, 200),
-    excerpt: (meta('og:description') || meta('description') || textContent.slice(0, 300)).trim().slice(0, 500),
-    html: clone.innerHTML,
+    siteName: (best.siteName || meta('og:site_name') || location.hostname).trim().slice(0, 200),
+    excerpt: (best.excerpt || meta('og:description') || meta('description') || textContent.slice(0, 300)).trim().slice(0, 500),
+    html: best.html,
     textContent: textContent.slice(0, 200000),
     savedAt: Date.now(),
+    fallbackHtml: suspect ? pageForLlm() : undefined,
   };
 })();

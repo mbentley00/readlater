@@ -29,6 +29,11 @@ async function savePage(tabId) {
 
   let article;
   try {
+    // Readability first (same sandbox); extractor.js uses it when present.
+    await browser.tabs.executeScript(tabId, {
+      file: 'Readability.js',
+      runAt: 'document_idle',
+    });
     const results = await browser.tabs.executeScript(tabId, {
       file: 'extractor.js',
       runAt: 'document_idle',
@@ -68,7 +73,7 @@ async function savePage(tabId) {
 browser.contextMenus.create({
   id: 'readlater-save',
   title: 'Save page to ReadLater',
-  contexts: ['page', 'selection', 'link'],
+  contexts: ['page', 'selection', 'link', 'image', 'video', 'audio', 'frame', 'editable'],
 });
 browser.contextMenus.onClicked.addListener((info, tab) => {
   if (info.menuItemId === 'readlater-save' && tab) savePage(tab.id);

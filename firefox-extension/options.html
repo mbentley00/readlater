@@ -8,33 +8,46 @@
     input { width: 100%; box-sizing: border-box; padding: 7px; border: 1px solid #ccc; border-radius: 5px; }
     .row { display: flex; gap: 8px; margin-top: 14px; }
     button { flex: 1; padding: 8px; border: 0; border-radius: 6px; cursor: pointer; }
-    #save { background: #b45309; color: #fff; }
-    #test { background: #e5e7eb; }
+    #signin { background: #b45309; color: #fff; }
+    #test, #saveToken { background: #e5e7eb; }
     #status { margin-top: 10px; min-height: 1.2em; }
     #status.ok { color: #15803d; }
     #status.err { color: #b91c1c; }
     .hint { color: #666; font-size: 12px; margin-top: 4px; }
+    details { margin-top: 16px; }
+    summary { cursor: pointer; color: #666; font-size: 12px; }
     @media (prefers-color-scheme: dark) {
       body { background: #1f1f1f; color: #eee; }
       input { background: #2b2b2b; color: #eee; border-color: #444; }
-      #test { background: #3a3a3a; color: #eee; }
-      .hint { color: #999; }
+      #test, #saveToken { background: #3a3a3a; color: #eee; }
+      .hint, summary { color: #999; }
     }
   </style>
 </head>
 <body>
   <label for="serverUrl">Server URL</label>
-  <input id="serverUrl" type="url" placeholder="http://192.168.1.10:8090">
-  <div class="hint">The address of your ReadLater sync server (see the server/ directory of the ReadLater repo).</div>
+  <input id="serverUrl" type="url" placeholder="https://readlater-mbent.fly.dev">
 
-  <label for="token">API token</label>
-  <input id="token" type="password" placeholder="printed by the server on startup">
+  <label for="username">Username</label>
+  <input id="username" autocomplete="username">
+
+  <label for="password">Password</label>
+  <input id="password" type="password" autocomplete="current-password">
+  <div class="hint">Signing in fetches your account's API token and stores it — your password is not saved.</div>
 
   <div class="row">
+    <button id="signin">Sign in</button>
     <button id="test">Test connection</button>
-    <button id="save">Save</button>
   </div>
   <div id="status"></div>
+
+  <details>
+    <summary>Advanced: use an API token directly</summary>
+    <label for="token">API token</label>
+    <input id="token" type="password" placeholder="from the web app's Settings page">
+    <div class="row"><button id="saveToken">Save token</button></div>
+  </details>
+
   <script src="options.js"></script>
 </body>
 </html>
