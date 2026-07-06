@@ -18,6 +18,8 @@ import android.speech.tts.UtteranceProgressListener
 import android.support.v4.media.MediaMetadataCompat
 import android.support.v4.media.session.MediaSessionCompat
 import android.support.v4.media.session.PlaybackStateCompat
+import android.view.KeyEvent
+import android.widget.Toast
 import androidx.core.app.NotificationCompat
 import com.readlater.app.MainActivity
 import com.readlater.app.R
@@ -80,6 +82,10 @@ class TtsService : Service() {
     private var currentIndex = 0
     private var isPlaying = false
 
+    /** Estimated speech duration of each block at the current rate (ms). */
+    private var blockDurationsMs: LongArray = LongArray(0)
+    private var totalDurationMs = 0L
+
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onCreate() {
@@ -92,6 +98,59 @@ class TtsService : Service() {
                 override fun onSkipToNext() = handleNext()
                 override fun onSkipToPrevious() = handlePrev()
                 override fun onStop() = handleStop()
+
+                // Lock-screen seekbar drag → jump to the matching paragraph.
+                override fun onSeekTo(pos: Long) {
+                    if (blocks.isEmpty()) return
+                    var acc = 0L
+                    var idx = 0
+                    for (i in blockDurationsMs.indices) {
+                        if (acc + blockDurationsMs[i] > pos) { idx = i; break }
+                        acc += blockDurationsMs[i]
+                        idx = i
+                    }
+                    currentIndex = nextSpeakable(idx) ?: return
+                    articleId?.let { app.repository.saveReadPositionLocal(it, currentIndex) }
+                    if (isPlaying) speakCurrent() else {
+                        publishState()
+                        updatePlaybackState()
+                        updateNotification()
+                    }
+                }
+
+                // Headset buttons: 1 click play/pause, 2 clicks forward ~30s,
+                // 3 clicks highlight the paragraph being read. Wired headsets
+                // send HEADSETHOOK/PLAY_PAUSE clicks we count ourselves; most
+                // Bluetooth earbuds translate multi-taps into NEXT/PREVIOUS,
+                // so those are mapped to the same actions.
+                override fun onMediaButtonEvent(mediaButtonEvent: Intent): Boolean {
+                    @Suppress("DEPRECATION")
+                    val event: KeyEvent? = if (Build.VERSION.SDK_INT >= 33) {
+                        mediaButtonEvent.getParcelableExtra(Intent.EXTRA_KEY_EVENT, KeyEvent::class.java)
+                    } else {
+                        mediaButtonEvent.getParcelableExtra(Intent.EXTRA_KEY_EVENT)
+                    }
+                    if (event != null) {
+                        when (event.keyCode) {
+                            KeyEvent.KEYCODE_HEADSETHOOK,
+                            KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE -> {
+                                if (event.action == KeyEvent.ACTION_DOWN && event.repeatCount == 0) {
+                                    registerHeadsetClick()
+                                }
+                                return true
+                            }
+                            KeyEvent.KEYCODE_MEDIA_NEXT -> {
+                                if (event.action == KeyEvent.ACTION_DOWN) handleForward30()
+                                return true
+                            }
+                            KeyEvent.KEYCODE_MEDIA_PREVIOUS -> {
+                                if (event.action == KeyEvent.ACTION_DOWN) handleHighlightCurrent()
+                                return true
+                            }
+                        }
+                    }
+                    return super.onMediaButtonEvent(mediaButtonEvent)
+                }
             })
             isActive = true
         }
@@ -154,6 +213,7 @@ class TtsService : Service() {
             currentIndex = (if (startParagraph >= 0) startParagraph else article.readParagraph)
                 .coerceIn(0, blocks.size - 1)
             isPlaying = true
+            recomputeDurations()
             updateMetadata()
             acquireWakeLock()
             if (ttsReady) speakCurrent() else initTts()
@@ -217,6 +277,75 @@ class TtsService : Service() {
         }
     }
 
+    // -------------------------------------------------------- progress timeline
+
+    /** Estimate per-block speech durations so the media session can expose a
+     *  seekable timeline (lock-screen progress bar). */
+    private fun recomputeDurations() {
+        val rate = app.settings.ttsSpeechRate
+        blockDurationsMs = LongArray(blocks.size) { i ->
+            val len = speakableText(blocks[i])?.length ?: 0
+            (len / (baseCharsPerSecond * rate) * 1000).toLong()
+        }
+        totalDurationMs = blockDurationsMs.sum()
+    }
+
+    private fun positionMs(index: Int): Long {
+        var acc = 0L
+        for (i in 0 until index.coerceIn(0, blockDurationsMs.size)) acc += blockDurationsMs[i]
+        return acc
+    }
+
+    // -------------------------------------------------------- headset clicks
+
+    /** Estimated characters spoken per second at 1.0× rate (≈180 wpm). */
+    private val baseCharsPerSecond = 15f
+    private var headsetClickCount = 0
+    private val headsetClickRunnable = Runnable {
+        when (headsetClickCount) {
+            1 -> if (isPlaying) handlePause() else handleResume()
+            2 -> handleForward30()
+            else -> if (headsetClickCount >= 3) handleHighlightCurrent()
+        }
+        headsetClickCount = 0
+    }
+
+    private fun registerHeadsetClick() {
+        headsetClickCount++
+        mainHandler.removeCallbacks(headsetClickRunnable)
+        if (headsetClickCount >= 3) headsetClickRunnable.run()
+        else mainHandler.postDelayed(headsetClickRunnable, 600)
+    }
+
+    /** Skip forward by roughly 30 seconds of estimated speech, paragraph-granular. */
+    private fun handleForward30() {
+        if (articleId == null || blocks.isEmpty()) return
+        var remaining = 30f * baseCharsPerSecond * app.settings.ttsSpeechRate
+        var idx = currentIndex
+        while (true) {
+            remaining -= (blocks.getOrNull(idx)?.let { speakableText(it) }?.length ?: 0)
+            val next = nextSpeakable(idx + 1) ?: break
+            idx = next
+            if (remaining <= 0) break
+        }
+        if (idx != currentIndex) {
+            currentIndex = idx
+            articleId?.let { app.repository.saveReadPositionLocal(it, idx) }
+            if (isPlaying) speakCurrent() else {
+                publishState()
+                updateNotification()
+            }
+        }
+    }
+
+    /** Save the currently spoken paragraph as a highlight (triple headset click). */
+    private fun handleHighlightCurrent() {
+        val id = articleId ?: return
+        val text = blocks.getOrNull(currentIndex)?.let { speakableText(it) } ?: return
+        app.repository.addHighlight(id, text, null, currentIndex)
+        Toast.makeText(this, "Paragraph highlighted", Toast.LENGTH_SHORT).show()
+    }
+
     private fun handleStop() {
         isPlaying = false
         tts?.stop()
@@ -238,11 +367,34 @@ class TtsService : Service() {
                 if (status == TextToSpeech.SUCCESS) {
                     ttsReady = true
                     tts?.setOnUtteranceProgressListener(utteranceListener)
+                    tts?.let(::pickBestVoice)
                     if (isPlaying) speakCurrent()
                 } else {
                     handleStop()
                 }
             }
+        }
+    }
+
+    /**
+     * Upgrade to the highest-quality installed voice for the current language
+     * (ties broken in favor of offline voices, so playback survives dead spots).
+     */
+    private fun pickBestVoice(engine: TextToSpeech) {
+        try {
+            val current = engine.voice ?: return
+            val language = current.locale?.language ?: return
+            val best = engine.voices
+                ?.filter {
+                    it.locale.language == language &&
+                        !it.features.contains(TextToSpeech.Engine.KEY_FEATURE_NOT_INSTALLED)
+                }
+                ?.maxWithOrNull(
+                    compareBy({ it.quality }, { if (it.isNetworkConnectionRequired) 0 else 1 })
+                ) ?: return
+            if (best.quality > current.quality) engine.voice = best
+        } catch (_: Exception) {
+            // Some engines throw from getVoices(); keep the default voice.
         }
     }
 
@@ -339,12 +491,15 @@ class TtsService : Service() {
             PlaybackStateCompat.ACTION_PLAY_PAUSE or
             PlaybackStateCompat.ACTION_SKIP_TO_NEXT or
             PlaybackStateCompat.ACTION_SKIP_TO_PREVIOUS or
+            PlaybackStateCompat.ACTION_SEEK_TO or
             PlaybackStateCompat.ACTION_STOP
         val state = if (isPlaying) PlaybackStateCompat.STATE_PLAYING else PlaybackStateCompat.STATE_PAUSED
+        // Estimated position drives the lock-screen progress bar; speed 1.0
+        // lets the system advance it smoothly between paragraph updates.
         mediaSession?.setPlaybackState(
             PlaybackStateCompat.Builder()
                 .setActions(actions)
-                .setState(state, PlaybackStateCompat.PLAYBACK_POSITION_UNKNOWN, 1.0f)
+                .setState(state, positionMs(currentIndex), if (isPlaying) 1.0f else 0f)
                 .build()
         )
     }
@@ -354,6 +509,7 @@ class TtsService : Service() {
             MediaMetadataCompat.Builder()
                 .putString(MediaMetadataCompat.METADATA_KEY_TITLE, articleTitle)
                 .putString(MediaMetadataCompat.METADATA_KEY_ARTIST, articleSite)
+                .putLong(MediaMetadataCompat.METADATA_KEY_DURATION, totalDurationMs)
                 .build()
         )
     }
@@ -427,10 +583,14 @@ class TtsService : Service() {
                 android.R.drawable.ic_media_play, "Play", servicePendingIntent(ACTION_RESUME)
             )
         }
+        val pct = if (totalDurationMs > 0) (positionMs(currentIndex) * 100 / totalDurationMs).toInt() else 0
+        val progressText = if (blocks.isNotEmpty()) {
+            "$pct% · ${articleSite.ifBlank { "Reading aloud" }}"
+        } else articleSite.ifBlank { "Reading aloud" }
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setSmallIcon(R.drawable.ic_launcher_foreground)
             .setContentTitle(articleTitle.ifBlank { "ReadLater" })
-            .setContentText(articleSite.ifBlank { "Reading aloud" })
+            .setContentText(progressText)
             .setContentIntent(contentIntent)
             .setOnlyAlertOnce(true)
             .setOngoing(isPlaying)

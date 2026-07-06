@@ -38,10 +38,14 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import com.readlater.app.ReadLaterApp
 import kotlinx.coroutines.launch
 import java.util.Locale
+
+/** Pre-filled default so a fresh install only needs username + password. */
+private const val DEFAULT_SERVER_URL = "https://readlater-mbent.fly.dev"
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -52,10 +56,12 @@ fun SettingsScreen(onBack: () -> Unit) {
     val scope = rememberCoroutineScope()
     val snackbarHostState = remember { SnackbarHostState() }
 
-    var url by remember { mutableStateOf(settings.serverUrl) }
+    var url by remember { mutableStateOf(settings.serverUrl.ifBlank { DEFAULT_SERVER_URL }) }
+    var username by remember { mutableStateOf("") }
+    var password by remember { mutableStateOf("") }
     var token by remember { mutableStateOf(settings.token) }
     var rate by remember { mutableStateOf(settings.ttsSpeechRate) }
-    var testing by remember { mutableStateOf(false) }
+    var busy by remember { mutableStateOf(false) }
     var testResult by remember { mutableStateOf<String?>(null) }
 
     fun save() {
@@ -90,31 +96,68 @@ fun SettingsScreen(onBack: () -> Unit) {
                 value = url,
                 onValueChange = { url = it },
                 label = { Text("Server URL") },
-                placeholder = { Text("http://192.168.1.10:8090") },
                 singleLine = true,
                 keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri),
                 modifier = Modifier.fillMaxWidth()
             )
             OutlinedTextField(
-                value = token,
-                onValueChange = { token = it },
-                label = { Text("Access token") },
+                value = username,
+                onValueChange = { username = it },
+                label = { Text("Username") },
                 singleLine = true,
                 modifier = Modifier.fillMaxWidth()
             )
+            OutlinedTextField(
+                value = password,
+                onValueChange = { password = it },
+                label = { Text("Password") },
+                singleLine = true,
+                visualTransformation = PasswordVisualTransformation(),
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
+                modifier = Modifier.fillMaxWidth()
+            )
+            Text(
+                text = "Signing in fetches your account's API token and stores it — " +
+                    "your password is not saved on this device.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                Button(onClick = {
-                    save()
-                    scope.launch { snackbarHostState.showSnackbar("Settings saved") }
-                }) {
-                    Text("Save")
+                Button(
+                    enabled = !busy && username.isNotBlank() && password.isNotBlank(),
+                    onClick = {
+                        scope.launch {
+                            busy = true
+                            testResult = try {
+                                val newToken = app.apiClient.login(url, username.trim(), password)
+                                settings.serverUrl = url
+                                settings.token = newToken
+                                token = newToken
+                                password = ""
+                                url = settings.serverUrl
+                                "Signed in as ${username.trim()} — connected."
+                            } catch (e: Exception) {
+                                "Sign-in failed: ${e.message ?: "unknown error"}"
+                            }
+                            busy = false
+                        }
+                    }
+                ) {
+                    if (busy) {
+                        CircularProgressIndicator(
+                            modifier = Modifier.size(16.dp),
+                            strokeWidth = 2.dp
+                        )
+                    } else {
+                        Text("Sign in")
+                    }
                 }
                 OutlinedButton(
-                    enabled = !testing,
+                    enabled = !busy,
                     onClick = {
                         save()
                         scope.launch {
-                            testing = true
+                            busy = true
                             testResult = try {
                                 if (app.apiClient.health()) {
                                     "Connected — server is healthy."
@@ -124,31 +167,35 @@ fun SettingsScreen(onBack: () -> Unit) {
                             } catch (e: Exception) {
                                 "Connection failed: ${e.message ?: "unknown error"}"
                             }
-                            testing = false
+                            busy = false
                         }
                     }
                 ) {
-                    if (testing) {
-                        CircularProgressIndicator(
-                            modifier = Modifier.size(16.dp),
-                            strokeWidth = 2.dp
-                        )
-                    } else {
-                        Text("Test connection")
-                    }
+                    Text("Test connection")
                 }
             }
             testResult?.let { result ->
                 Text(
                     text = result,
                     style = MaterialTheme.typography.bodyMedium,
-                    color = if (result.startsWith("Connected")) {
+                    color = if (result.startsWith("Connected") || result.startsWith("Signed in")) {
                         MaterialTheme.colorScheme.primary
                     } else {
                         MaterialTheme.colorScheme.error
                     }
                 )
             }
+
+            OutlinedTextField(
+                value = token,
+                onValueChange = {
+                    token = it
+                    settings.token = it
+                },
+                label = { Text("Access token (advanced — set by Sign in)") },
+                singleLine = true,
+                modifier = Modifier.fillMaxWidth()
+            )
 
             HorizontalDivider()
 
@@ -184,11 +231,10 @@ fun SettingsScreen(onBack: () -> Unit) {
 
             Text("About", style = MaterialTheme.typography.titleMedium)
             Text(
-                text = "ReadLater is a self-hosted read-it-later client. Run the companion " +
-                    "server on your own machine or LAN, save articles with the ReadLater " +
-                    "Firefox extension, and they will sync here for offline reading, " +
-                    "highlighting and listening. Enter the server's base URL and access " +
-                    "token above, then tap Test connection.",
+                text = "ReadLater is a self-hosted read-it-later client. Save articles with " +
+                    "the ReadLater Firefox extension (or email them in) and they sync here " +
+                    "for offline reading, highlighting and listening. Sign in with your " +
+                    "account above; create accounts on the server's /signup page.",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )

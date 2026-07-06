@@ -32,9 +32,25 @@ class Settings(context: Context) {
             prefs.edit().putFloat(KEY_TTS_RATE, value.coerceIn(0.5f, 2.0f)).apply()
         }
 
+    /** Article list sort order (name of a SortMode enum value). */
+    var listSort: String
+        get() = prefs.getString(KEY_LIST_SORT, "NEWEST").orEmpty()
+        set(value) {
+            prefs.edit().putString(KEY_LIST_SORT, value).apply()
+        }
+
+    /** Article open when the app was last killed; "" = none. Used to resume on cold start. */
+    var lastArticleId: String
+        get() = prefs.getString(KEY_LAST_ARTICLE, "").orEmpty()
+        set(value) {
+            prefs.edit().putString(KEY_LAST_ARTICLE, value).apply()
+        }
+
     private companion object {
         const val KEY_SERVER_URL = "server_url"
         const val KEY_TOKEN = "token"
         const val KEY_TTS_RATE = "tts_speech_rate"
+        const val KEY_LIST_SORT = "list_sort"
+        const val KEY_LAST_ARTICLE = "last_article_id"
     }
 }

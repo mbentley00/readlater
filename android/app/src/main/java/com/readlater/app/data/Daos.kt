@@ -11,6 +11,9 @@ interface ArticleDao {
     @Query("SELECT * FROM articles WHERE archived = :archived ORDER BY savedAt DESC")
     fun articlesByArchived(archived: Boolean): Flow<List<ArticleEntity>>
 
+    @Query("SELECT * FROM articles ORDER BY savedAt DESC")
+    fun allArticlesFlow(): Flow<List<ArticleEntity>>
+
     @Query("SELECT * FROM articles WHERE id = :id")
     fun articleFlow(id: String): Flow<ArticleEntity?>
 
@@ -29,8 +32,8 @@ interface ArticleDao {
     @Query("UPDATE articles SET dirty = 0 WHERE id = :id")
     suspend fun clearDirty(id: String)
 
-    @Query("UPDATE articles SET html = :html WHERE id = :id")
-    suspend fun setHtml(id: String, html: String?)
+    @Query("UPDATE articles SET html = :html, paragraphCount = :paragraphCount WHERE id = :id")
+    suspend fun setHtml(id: String, html: String?, paragraphCount: Int)
 
     @Query("UPDATE articles SET archived = :archived, dirty = 1 WHERE id = :id")
     suspend fun setArchived(id: String, archived: Boolean)
@@ -45,11 +48,16 @@ interface ArticleDao {
     suspend fun deleteById(id: String)
 }
 
+data class HighlightCount(val articleId: String, val n: Int)
+
 @Dao
 interface HighlightDao {
 
     @Query("SELECT * FROM highlights WHERE articleId = :articleId ORDER BY createdAt ASC")
     fun byArticle(articleId: String): Flow<List<HighlightEntity>>
+
+    @Query("SELECT articleId, COUNT(*) AS n FROM highlights GROUP BY articleId")
+    fun countsByArticle(): Flow<List<HighlightCount>>
 
     @Query(
         "SELECT h.clientId, h.serverId, h.articleId, h.text, h.note, h.paragraphIndex, " +

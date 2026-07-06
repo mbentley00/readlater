@@ -23,7 +23,21 @@ data class RemoteArticle(
     val archived: Boolean,
     val favorite: Boolean,
     val readParagraph: Int,
+    val wordCount: Int,
     val html: String?
+)
+
+/** Saved filter view as returned by the server. */
+data class RemoteView(
+    val id: String,
+    val name: String,
+    val q: String,
+    val domain: String,
+    val highlighted: Boolean,
+    val minWords: Int,
+    val maxWords: Int,
+    val minHighlights: Int,
+    val includeArchived: Boolean
 )
 
 /** Highlight as returned by the server. */
@@ -82,11 +96,51 @@ class ApiClient(private val settings: Settings) {
         return JSONObject(body).optBoolean("ok", false)
     }
 
+    /**
+     * POST /api/login — exchanges username/password for the account's API token.
+     * Standalone (doesn't use stored settings) so it can run before anything is saved.
+     */
+    suspend fun login(baseUrl: String, username: String, password: String): String {
+        val json = JSONObject().put("username", username).put("password", password)
+        val request = Request.Builder()
+            .url(baseUrl.trim().trimEnd('/') + "/api/login")
+            .post(json.toString().toRequestBody(jsonMediaType))
+            .build()
+        val body = try {
+            execute(request)
+        } catch (e: IOException) {
+            if (e.message?.contains("401") == true) throw IOException("Wrong username or password.")
+            throw e
+        }
+        return JSONObject(body).getString("token")
+    }
+
     /** GET /api/articles?includeArchived=1 — metadata only, no html. */
     suspend fun listArticles(): List<RemoteArticle> {
         val body = execute(builder("/api/articles?includeArchived=1").get().build())
         val arr = JSONObject(body).getJSONArray("articles")
         return (0 until arr.length()).map { parseArticle(arr.getJSONObject(it)) }
+    }
+
+    /** GET /api/views — the user's saved filter views. */
+    suspend fun listViews(): List<RemoteView> {
+        val body = execute(builder("/api/views").get().build())
+        val arr = JSONObject(body).getJSONArray("views")
+        return (0 until arr.length()).map { i ->
+            val o = arr.getJSONObject(i)
+            val f = o.optJSONObject("filters") ?: JSONObject()
+            RemoteView(
+                id = o.getString("id"),
+                name = o.optString("name"),
+                q = f.optString("q"),
+                domain = f.optString("domain"),
+                highlighted = f.optBoolean("highlighted", false),
+                minWords = f.optInt("minWords", 0),
+                maxWords = f.optInt("maxWords", 0),
+                minHighlights = f.optInt("minHighlights", 0),
+                includeArchived = f.optBoolean("includeArchived", false)
+            )
+        }
     }
 
     /** GET /api/articles/{id} — full article including html. */
@@ -160,6 +214,7 @@ class ApiClient(private val settings: Settings) {
         archived = o.optBoolean("archived", false),
         favorite = o.optBoolean("favorite", false),
         readParagraph = o.optInt("readParagraph", 0),
+        wordCount = o.optInt("wordCount", 0),
         html = o.stringOrNull("html")
     )
 

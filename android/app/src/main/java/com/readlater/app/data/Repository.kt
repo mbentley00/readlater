@@ -23,6 +23,12 @@ class Repository(db: AppDatabase, private val api: ApiClient) {
     fun articles(archived: Boolean): Flow<List<ArticleEntity>> =
         articleDao.articlesByArchived(archived)
 
+    fun allArticles(): Flow<List<ArticleEntity>> = articleDao.allArticlesFlow()
+
+    fun highlightCounts(): Flow<List<HighlightCount>> = highlightDao.countsByArticle()
+
+    suspend fun fetchViews(): List<RemoteView> = api.listViews()
+
     fun article(id: String): Flow<ArticleEntity?> = articleDao.articleFlow(id)
 
     fun highlightsFor(articleId: String): Flow<List<HighlightEntity>> =
@@ -80,7 +86,9 @@ class Repository(db: AppDatabase, private val api: ApiClient) {
                         archived = r.archived,
                         favorite = r.favorite,
                         readParagraph = r.readParagraph,
-                        dirty = false
+                        dirty = false,
+                        wordCount = r.wordCount,
+                        paragraphCount = local?.paragraphCount ?: 0
                     )
                 )
                 if (local?.html == null || r.updatedAt > local.updatedAt) {
@@ -98,7 +106,7 @@ class Repository(db: AppDatabase, private val api: ApiClient) {
             // 4. Fetch missing/stale bodies.
             for (id in needsBody) {
                 val full = api.getArticle(id)
-                articleDao.setHtml(id, full.html)
+                articleDao.setHtml(id, full.html, paragraphCountOf(full.html))
             }
         }
     }
@@ -107,9 +115,12 @@ class Repository(db: AppDatabase, private val api: ApiClient) {
     suspend fun fetchArticleBody(id: String): Result<Unit> = withContext(Dispatchers.IO) {
         runCatching {
             val full = api.getArticle(id)
-            articleDao.setHtml(id, full.html)
+            articleDao.setHtml(id, full.html, paragraphCountOf(full.html))
         }
     }
+
+    private fun paragraphCountOf(html: String?): Int =
+        html?.let { HtmlParser.parse(it).size } ?: 0
 
     fun toggleArchive(article: ArticleEntity) {
         bgScope.launch {

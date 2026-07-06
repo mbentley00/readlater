@@ -17,7 +17,9 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.Sort
 import androidx.compose.material.icons.filled.Archive
+import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.FormatQuote
 import androidx.compose.material.icons.filled.MoreVert
@@ -34,6 +36,7 @@ import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SnackbarHost
@@ -55,8 +58,45 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.readlater.app.ReadLaterApp
 import com.readlater.app.data.ArticleEntity
+import com.readlater.app.data.RemoteView
+import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.ui.platform.LocalContext
 import kotlinx.coroutines.launch
+import kotlin.math.max
+import kotlin.math.roundToInt
+
+enum class SortMode(val label: String) {
+    NEWEST("Newest first"),
+    OLDEST("Oldest first"),
+    LONGEST("Longest first"),
+    SHORTEST("Shortest first"),
+}
+
+/** ~225 words per minute; 0 when the word count is unknown. */
+fun readingMinutes(wordCount: Int): Int =
+    if (wordCount <= 0) 0 else max(1, (wordCount / 225.0).roundToInt())
+
+/** Local evaluation of a server-defined saved view. `q` matches title/excerpt only. */
+private fun matchesView(a: ArticleEntity, v: RemoteView, highlightCount: Int): Boolean {
+    if (!v.includeArchived && a.archived) return false
+    if (v.domain.isNotBlank()) {
+        val host = runCatching { Uri.parse(a.url).host }.getOrNull()
+            ?.lowercase()?.removePrefix("www.")
+            ?: if (a.url.startsWith("email:")) "email" else if (a.url.startsWith("pdf:")) "" else ""
+        val d = v.domain.lowercase().removePrefix("www.")
+        if (host != d && !host.orEmpty().endsWith(".$d")) return false
+    }
+    if (v.minWords > 0 && a.wordCount < v.minWords) return false
+    if (v.maxWords > 0 && a.wordCount > v.maxWords) return false
+    if (v.minHighlights > 0 && highlightCount < v.minHighlights) return false
+    if (v.highlighted && highlightCount == 0) return false
+    if (v.q.isNotBlank()) {
+        val hay = "${a.title} ${a.excerpt.orEmpty()}".lowercase()
+        if (v.q.lowercase().split(Regex("\\s+")).any { it.isNotBlank() && it !in hay }) return false
+    }
+    return true
+}
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -72,9 +112,37 @@ fun ArticleListScreen(
     val snackbarHostState = remember { SnackbarHostState() }
 
     var showArchived by remember { mutableStateOf(false) }
-    val articles by remember(showArchived) { repo.articles(showArchived) }
-        .collectAsState(initial = emptyList())
+    var selectedView by remember { mutableStateOf<RemoteView?>(null) }
+    var views by remember { mutableStateOf<List<RemoteView>>(emptyList()) }
+
+    val unsorted by remember(showArchived, selectedView) {
+        if (selectedView != null) repo.allArticles() else repo.articles(showArchived)
+    }.collectAsState(initial = emptyList())
+    val hlCounts by repo.highlightCounts().collectAsState(initial = emptyList())
     var syncing by remember { mutableStateOf(false) }
+
+    var sortMode by remember {
+        mutableStateOf(runCatching { SortMode.valueOf(app.settings.listSort) }.getOrDefault(SortMode.NEWEST))
+    }
+    var sortMenuOpen by remember { mutableStateOf(false) }
+    val articles = remember(unsorted, sortMode, selectedView, hlCounts) {
+        val counts = hlCounts.associate { it.articleId to it.n }
+        val view = selectedView
+        val filtered = if (view != null) {
+            unsorted.filter { matchesView(it, view, counts[it.id] ?: 0) }
+        } else unsorted
+        when (sortMode) {
+            SortMode.NEWEST -> filtered.sortedByDescending { it.savedAt }
+            SortMode.OLDEST -> filtered.sortedBy { it.savedAt }
+            SortMode.LONGEST -> filtered.sortedByDescending { it.wordCount }
+            SortMode.SHORTEST -> filtered.sortedBy { it.wordCount }
+        }
+    }
+
+    // Saved views come from the server; offline we just don't show new ones.
+    LaunchedEffect(Unit) {
+        runCatching { views = repo.fetchViews() }
+    }
 
     fun sync(showErrors: Boolean) {
         if (syncing) return
@@ -103,6 +171,28 @@ fun ArticleListScreen(
             TopAppBar(
                 title = { Text("ReadLater") },
                 actions = {
+                    Box {
+                        IconButton(onClick = { sortMenuOpen = true }) {
+                            Icon(Icons.AutoMirrored.Filled.Sort, contentDescription = "Sort")
+                        }
+                        DropdownMenu(expanded = sortMenuOpen, onDismissRequest = { sortMenuOpen = false }) {
+                            SortMode.entries.forEach { mode ->
+                                DropdownMenuItem(
+                                    text = { Text(mode.label) },
+                                    leadingIcon = {
+                                        if (mode == sortMode) {
+                                            Icon(Icons.Filled.Check, contentDescription = null)
+                                        }
+                                    },
+                                    onClick = {
+                                        sortMode = mode
+                                        app.settings.listSort = mode.name
+                                        sortMenuOpen = false
+                                    }
+                                )
+                            }
+                        }
+                    }
                     IconButton(onClick = onOpenHighlights) {
                         Icon(Icons.Filled.FormatQuote, contentDescription = "Highlights")
                     }
@@ -130,19 +220,30 @@ fun ArticleListScreen(
     ) { padding ->
         Column(modifier = Modifier.fillMaxSize().padding(padding)) {
             Row(
-                modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp),
+                modifier = Modifier
+                    .padding(horizontal = 16.dp, vertical = 4.dp)
+                    .horizontalScroll(rememberScrollState()),
                 horizontalArrangement = Arrangement.spacedBy(8.dp)
             ) {
                 FilterChip(
-                    selected = !showArchived,
-                    onClick = { showArchived = false },
+                    selected = !showArchived && selectedView == null,
+                    onClick = { showArchived = false; selectedView = null },
                     label = { Text("Inbox") }
                 )
                 FilterChip(
-                    selected = showArchived,
-                    onClick = { showArchived = true },
+                    selected = showArchived && selectedView == null,
+                    onClick = { showArchived = true; selectedView = null },
                     label = { Text("Archive") }
                 )
+                views.forEach { v ->
+                    FilterChip(
+                        selected = selectedView?.id == v.id,
+                        onClick = {
+                            selectedView = if (selectedView?.id == v.id) null else v
+                        },
+                        label = { Text(v.name) }
+                    )
+                }
             }
 
             if (articles.isEmpty()) {
@@ -219,8 +320,11 @@ private fun ArticleCard(
                     val site = article.siteName
                         ?: runCatching { Uri.parse(article.url).host }.getOrNull().orEmpty()
                     val time = DateUtils.getRelativeTimeSpanString(article.savedAt).toString()
+                    val minutes = readingMinutes(article.wordCount)
                     Text(
-                        text = listOf(site, time).filter { it.isNotBlank() }.joinToString(" • "),
+                        text = listOf(site, time, if (minutes > 0) "$minutes min read" else "")
+                            .filter { it.isNotBlank() }
+                            .joinToString(" • "),
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
@@ -279,12 +383,30 @@ private fun ArticleCard(
             }
 
             if (article.readParagraph > 0) {
+                val fraction = if (article.paragraphCount > 0) {
+                    ((article.readParagraph + 1).toFloat() / article.paragraphCount).coerceIn(0.01f, 1f)
+                } else null
+                val label = if (fraction != null) {
+                    val minutesLeft = readingMinutes((article.wordCount * (1 - fraction)).toInt())
+                    "${(fraction * 100).roundToInt()}% read" +
+                        if (minutesLeft > 0 && fraction < 1f) " — $minutesLeft min left" else ""
+                } else {
+                    "In progress — paragraph ${article.readParagraph + 1}"
+                }
                 Text(
-                    text = "In progress — paragraph ${article.readParagraph + 1}",
+                    text = label,
                     style = MaterialTheme.typography.labelSmall,
                     color = MaterialTheme.colorScheme.primary,
                     modifier = Modifier.padding(top = 6.dp)
                 )
+                if (fraction != null) {
+                    LinearProgressIndicator(
+                        progress = { fraction },
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(top = 4.dp, end = 12.dp)
+                    )
+                }
             }
         }
     }

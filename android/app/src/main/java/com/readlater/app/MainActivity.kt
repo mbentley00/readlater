@@ -7,6 +7,11 @@ import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.setValue
 import androidx.core.content.ContextCompat
 import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
@@ -35,9 +40,24 @@ class MainActivity : ComponentActivity() {
             notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
         }
 
+        val app = application as ReadLaterApp
+
         setContent {
             ReadLaterTheme {
                 val navController = rememberNavController()
+
+                // Resume where the user was if the app was killed in the background.
+                // rememberSaveable keeps this from re-firing on rotation or when the
+                // navigation back stack was restored by the system.
+                var resumeHandled by rememberSaveable { mutableStateOf(false) }
+                LaunchedEffect(Unit) {
+                    if (!resumeHandled) {
+                        resumeHandled = true
+                        val last = app.settings.lastArticleId
+                        if (last.isNotBlank()) navController.navigate("reader/$last")
+                    }
+                }
+
                 NavHost(navController = navController, startDestination = "list") {
                     composable("list") {
                         ArticleListScreen(
@@ -48,9 +68,15 @@ class MainActivity : ComponentActivity() {
                     }
                     composable("reader/{articleId}") { entry ->
                         val articleId = entry.arguments?.getString("articleId").orEmpty()
+                        // Remember the open article so a cold start can resume it;
+                        // an intentional Back clears it.
+                        LaunchedEffect(articleId) { app.settings.lastArticleId = articleId }
                         ReaderScreen(
                             articleId = articleId,
-                            onBack = { navController.popBackStack() }
+                            onBack = {
+                                app.settings.lastArticleId = ""
+                                navController.popBackStack()
+                            }
                         )
                     }
                     composable("highlights") {

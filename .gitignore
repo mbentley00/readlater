@@ -15,3 +15,7 @@ firefox-extension/*.xpi
 
 # server dependencies
 server/node_modules/
+
+# Android release signing
+android/keystore.properties
+android/*.keystore

@@ -5,7 +5,9 @@ import android.content.Intent
 import android.net.Uri
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.combinedClickable
+import androidx.compose.foundation.interaction.DragInteraction
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -28,9 +30,11 @@ import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Archive
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.MoreVert
+import androidx.compose.material.icons.filled.MyLocation
 import androidx.compose.material.icons.filled.OpenInBrowser
 import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
+import androidx.compose.material.icons.filled.PushPin
 import androidx.compose.material.icons.filled.Remove
 import androidx.compose.material.icons.filled.SkipNext
 import androidx.compose.material.icons.filled.SkipPrevious
@@ -45,6 +49,7 @@ import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.LocalContentColor
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
@@ -60,6 +65,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -137,6 +143,16 @@ fun ReaderScreen(articleId: String, onBack: () -> Unit) {
     val listState = rememberLazyListState()
     var didInitialScroll by remember { mutableStateOf(false) }
 
+    // Whether the view auto-follows the spoken paragraph. On by default;
+    // switched off as soon as the user scrolls by hand, back on via the
+    // follow button or by (re)starting playback.
+    var followTts by remember { mutableStateOf(true) }
+    LaunchedEffect(listState) {
+        listState.interactionSource.interactions.collect { interaction ->
+            if (interaction is DragInteraction.Start) followTts = false
+        }
+    }
+
     // Restore the saved read position once the body is available.
     LaunchedEffect(blocks) {
         if (!didInitialScroll && blocks.isNotEmpty()) {
@@ -146,9 +162,11 @@ fun ReaderScreen(articleId: String, onBack: () -> Unit) {
         }
     }
 
-    // Follow the paragraph currently being spoken.
-    LaunchedEffect(ttsState.paragraphIndex, ttsState.isPlaying, isTtsThisArticle) {
-        if (isTtsThisArticle && ttsState.isPlaying && ttsState.paragraphIndex in blocks.indices) {
+    // Follow the paragraph currently being spoken (unless the user scrolled away).
+    LaunchedEffect(ttsState.paragraphIndex, ttsState.isPlaying, isTtsThisArticle, followTts) {
+        if (followTts && isTtsThisArticle && ttsState.isPlaying &&
+            ttsState.paragraphIndex in blocks.indices
+        ) {
             listState.animateScrollToItem(ttsState.paragraphIndex)
         }
     }
@@ -182,6 +200,18 @@ fun ReaderScreen(articleId: String, onBack: () -> Unit) {
     var sheetTarget by remember { mutableStateOf<SheetTarget?>(null) }
     var menuOpen by remember { mutableStateOf(false) }
 
+    // How far through the article the bottom of the viewport is (0..1).
+    val readProgress by remember {
+        derivedStateOf {
+            val total = currentBlocks.size
+            if (total == 0) 0f
+            else {
+                val last = listState.layoutInfo.visibleItemsInfo.lastOrNull()?.index ?: 0
+                ((last + 1).toFloat() / total).coerceIn(0f, 1f)
+            }
+        }
+    }
+
     fun changeRate(delta: Float) {
         val newRate = (speechRate + delta).coerceIn(0.5f, 2.0f)
         if (newRate == speechRate) return
@@ -198,11 +228,25 @@ fun ReaderScreen(articleId: String, onBack: () -> Unit) {
         topBar = {
             TopAppBar(
                 title = {
-                    Text(
-                        text = article?.title.orEmpty(),
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis
-                    )
+                    Column {
+                        Text(
+                            text = article?.title.orEmpty(),
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                        if (blocks.isNotEmpty()) {
+                            val pct = (readProgress * 100).toInt()
+                            val wordsLeft = ((article?.wordCount ?: 0) * (1 - readProgress)).toInt()
+                            val minutesLeft = if (wordsLeft > 0) (wordsLeft / 225.0).let {
+                                kotlin.math.max(1, kotlin.math.round(it).toInt())
+                            } else 0
+                            Text(
+                                text = if (minutesLeft > 0 && pct < 100) "$pct% · $minutesLeft min left" else "$pct%",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                    }
                 },
                 navigationIcon = {
                     IconButton(onClick = onBack) {
@@ -280,12 +324,17 @@ fun ReaderScreen(articleId: String, onBack: () -> Unit) {
                                 sendTtsCommand(context, TtsService.ACTION_PAUSE)
                             isTtsThisArticle ->
                                 sendTtsCommand(context, TtsService.ACTION_RESUME)
-                            else -> sendTtsCommand(
-                                context,
-                                TtsService.ACTION_PLAY,
-                                articleId,
-                                article?.readParagraph ?: 0
-                            )
+                            else -> {
+                                // Start reading from where the view is, not the top.
+                                followTts = true
+                                sendTtsCommand(
+                                    context,
+                                    TtsService.ACTION_PLAY,
+                                    articleId,
+                                    listState.firstVisibleItemIndex
+                                        .coerceIn(0, (blocks.size - 1).coerceAtLeast(0))
+                                )
+                            }
                         }
                     }
                 ) {
@@ -297,6 +346,38 @@ fun ReaderScreen(articleId: String, onBack: () -> Unit) {
                 }
                 IconButton(onClick = { sendTtsCommand(context, TtsService.ACTION_NEXT) }) {
                     Icon(Icons.Filled.SkipNext, contentDescription = "Next paragraph")
+                }
+                // Jump the view back to the reading position and resume following.
+                IconButton(onClick = {
+                    followTts = true
+                    val target = if (isTtsThisArticle) ttsState.paragraphIndex
+                    else article?.readParagraph ?: 0
+                    scope.launch {
+                        if (blocks.isNotEmpty()) {
+                            listState.animateScrollToItem(target.coerceIn(0, blocks.size - 1))
+                        }
+                    }
+                }) {
+                    Icon(
+                        Icons.Filled.MyLocation,
+                        contentDescription = "Go to reading position",
+                        tint = if (followTts) MaterialTheme.colorScheme.primary
+                        else LocalContentColor.current
+                    )
+                }
+                // Make the current view the reading position (moves TTS if playing).
+                IconButton(onClick = {
+                    val idx = listState.firstVisibleItemIndex
+                        .coerceIn(0, (blocks.size - 1).coerceAtLeast(0))
+                    followTts = true
+                    if (isTtsThisArticle && ttsState.isPlaying) {
+                        sendTtsCommand(context, TtsService.ACTION_PLAY, articleId, idx)
+                    } else {
+                        repo.saveReadPosition(articleId, idx)
+                    }
+                    scope.launch { snackbarHostState.showSnackbar("Reading position set to here") }
+                }) {
+                    Icon(Icons.Filled.PushPin, contentDescription = "Set reading position to here")
                 }
                 Spacer(modifier = Modifier.weight(1f))
                 IconButton(onClick = { changeRate(-0.25f) }, enabled = speechRate > 0.5f) {
@@ -352,9 +433,14 @@ fun ReaderScreen(articleId: String, onBack: () -> Unit) {
             }
 
             else -> {
+                Column(modifier = Modifier.fillMaxSize().padding(padding)) {
+                LinearProgressIndicator(
+                    progress = { readProgress },
+                    modifier = Modifier.fillMaxWidth().height(3.dp)
+                )
                 LazyColumn(
                     state = listState,
-                    modifier = Modifier.fillMaxSize().padding(padding),
+                    modifier = Modifier.weight(1f).fillMaxWidth(),
                     contentPadding = PaddingValues(horizontal = 20.dp, vertical = 16.dp)
                 ) {
                     itemsIndexed(blocks) { index, block ->
@@ -365,6 +451,10 @@ fun ReaderScreen(articleId: String, onBack: () -> Unit) {
                             onLongPress = { text ->
                                 sheetTarget = SheetTarget.Create(index, text)
                             },
+                            onDoubleTap = { text ->
+                                repo.addHighlight(articleId, text, null, index)
+                                scope.launch { snackbarHostState.showSnackbar("Highlighted") }
+                            },
                             onTap = {
                                 if (highlightsByPara.containsKey(index)) {
                                     sheetTarget = SheetTarget.View(index)
@@ -372,6 +462,7 @@ fun ReaderScreen(articleId: String, onBack: () -> Unit) {
                             }
                         )
                     }
+                }
                 }
             }
         }
@@ -409,6 +500,7 @@ private fun BlockItem(
     paraHighlights: List<HighlightEntity>,
     isSpoken: Boolean,
     onLongPress: (String) -> Unit,
+    onDoubleTap: (String) -> Unit,
     onTap: () -> Unit
 ) {
     when (block) {
@@ -425,10 +517,7 @@ private fun BlockItem(
                 modifier = Modifier
                     .fillMaxWidth()
                     .clip(MaterialTheme.shapes.small)
-                    .background(
-                        if (isSpoken) MaterialTheme.colorScheme.secondaryContainer
-                        else Color.Transparent
-                    )
+                    .spokenOutline(isSpoken)
                     .padding(vertical = 12.dp)
             )
         }
@@ -456,6 +545,7 @@ private fun BlockItem(
             paraHighlights = paraHighlights,
             isSpoken = isSpoken,
             onLongPress = onLongPress,
+            onDoubleTap = onDoubleTap,
             onTap = onTap
         )
 
@@ -465,6 +555,7 @@ private fun BlockItem(
             paraHighlights = paraHighlights,
             isSpoken = isSpoken,
             onLongPress = onLongPress,
+            onDoubleTap = onDoubleTap,
             onTap = onTap
         )
     }
@@ -472,6 +563,14 @@ private fun BlockItem(
 
 private val HighlightSpanColor = Color(0x66FFE082)
 private val HighlightTintColor = Color(0x33FFE082)
+
+/** Outline marking the paragraph TTS is reading — deliberately not a fill,
+ *  so it can't be mistaken for the amber highlight tint. */
+@Composable
+private fun Modifier.spokenOutline(isSpoken: Boolean): Modifier =
+    if (isSpoken) {
+        this.border(2.dp, MaterialTheme.colorScheme.primary, MaterialTheme.shapes.small)
+    } else this
 
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
@@ -481,6 +580,7 @@ private fun HighlightableText(
     paraHighlights: List<HighlightEntity>,
     isSpoken: Boolean,
     onLongPress: (String) -> Unit,
+    onDoubleTap: (String) -> Unit,
     onTap: () -> Unit
 ) {
     // Render each highlight whose text is a substring of the paragraph as an inline
@@ -499,8 +599,9 @@ private fun HighlightableText(
     val hasUnmatchedHighlight = remember(text, paraHighlights) {
         paraHighlights.any { text.indexOf(it.text) < 0 }
     }
+    // Highlights are an amber FILL; the paragraph being read aloud gets a
+    // primary-color OUTLINE instead, so the two can't be confused.
     val backgroundColor = when {
-        isSpoken -> MaterialTheme.colorScheme.secondaryContainer
         paraHighlights.isNotEmpty() && hasUnmatchedHighlight -> HighlightTintColor
         else -> Color.Transparent
     }
@@ -511,8 +612,13 @@ private fun HighlightableText(
                 .fillMaxWidth()
                 .padding(vertical = 6.dp)
                 .clip(MaterialTheme.shapes.small)
+                .spokenOutline(isSpoken)
                 .background(backgroundColor)
-                .combinedClickable(onClick = onTap, onLongClick = { onLongPress(text) })
+                .combinedClickable(
+                    onClick = onTap,
+                    onLongClick = { onLongPress(text) },
+                    onDoubleClick = { onDoubleTap(text) }
+                )
                 .height(IntrinsicSize.Min)
         ) {
             Box(
@@ -535,8 +641,13 @@ private fun HighlightableText(
                 .fillMaxWidth()
                 .padding(vertical = 6.dp)
                 .clip(MaterialTheme.shapes.small)
+                .spokenOutline(isSpoken)
                 .background(backgroundColor)
-                .combinedClickable(onClick = onTap, onLongClick = { onLongPress(text) })
+                .combinedClickable(
+                    onClick = onTap,
+                    onLongClick = { onLongPress(text) },
+                    onDoubleClick = { onDoubleTap(text) }
+                )
                 .padding(4.dp)
         )
     }

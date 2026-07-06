@@ -1,5 +1,6 @@
 package com.readlater.app.data
 
+import androidx.room.ColumnInfo
 import androidx.room.Entity
 import androidx.room.PrimaryKey
 
@@ -19,7 +20,11 @@ data class ArticleEntity(
     val favorite: Boolean,
     val readParagraph: Int,
     /** True when local metadata changes have not yet been pushed to the server. */
-    val dirty: Boolean
+    val dirty: Boolean,
+    /** Server-computed word count of the article text (0 = unknown). */
+    @ColumnInfo(defaultValue = "0") val wordCount: Int = 0,
+    /** Block count from HtmlParser, set when the body is cached (0 = unknown). */
+    @ColumnInfo(defaultValue = "0") val paragraphCount: Int = 0
 )
 
 @Entity(tableName = "highlights")

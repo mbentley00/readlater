@@ -2,10 +2,20 @@ package com.readlater.app
 
 import android.app.Application
 import androidx.room.Room
+import androidx.room.migration.Migration
+import androidx.sqlite.db.SupportSQLiteDatabase
 import com.readlater.app.data.ApiClient
 import com.readlater.app.data.AppDatabase
 import com.readlater.app.data.Repository
 import com.readlater.app.data.Settings
+
+/** v1 → v2: reading-time/progress stats columns. */
+private val MIGRATION_1_2 = object : Migration(1, 2) {
+    override fun migrate(db: SupportSQLiteDatabase) {
+        db.execSQL("ALTER TABLE articles ADD COLUMN wordCount INTEGER NOT NULL DEFAULT 0")
+        db.execSQL("ALTER TABLE articles ADD COLUMN paragraphCount INTEGER NOT NULL DEFAULT 0")
+    }
+}
 
 /**
  * Application class doubling as a tiny manual DI container.
@@ -15,6 +25,7 @@ class ReadLaterApp : Application() {
 
     val database: AppDatabase by lazy {
         Room.databaseBuilder(this, AppDatabase::class.java, "readlater.db")
+            .addMigrations(MIGRATION_1_2)
             .fallbackToDestructiveMigration()
             .build()
     }
