@@ -12,3 +12,6 @@ android/*.iml
 # packaged extension
 firefox-extension/*.zip
 firefox-extension/*.xpi
+
+# server dependencies
+server/node_modules/

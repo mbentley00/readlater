@@ -17,25 +17,68 @@ keeps reading with the screen off.
 
 | Directory | What it is |
 |---|---|
-| [`server/`](server/) | Zero-dependency Node.js sync server (articles + highlights, bearer-token auth) |
+| [`server/`](server/) | Node.js sync server on SQLite (accounts, articles + highlights, full-text search, bearer-token auth, built-in web reader) |
 | [`firefox-extension/`](firefox-extension/) | Firefox add-on that extracts the article from the current page render and pushes it to the server |
 | [`android/`](android/) | Kotlin / Jetpack Compose reader app with offline cache, highlights, and screen-off TTS |
 
 ## 1. Run the server
 
-Needs Node.js ≥ 18. No `npm install` required.
+Needs Node.js ≥ 18. One dependency (`better-sqlite3` — storage + full-text
+search); data lives in a single SQLite file, and an existing `db.json` from
+older versions is imported automatically on first start.
 
 ```sh
 cd server
+npm install
 node server.js
 ```
 
-On first start it prints the URL and a generated **API token** (also stored in
-`data/token.txt`). Put the server somewhere both your desktop and phone can
-reach — a home server, a Raspberry Pi, or a VPS. Override defaults with
-`PORT`, `READLATER_TOKEN`, and `READLATER_DATA_DIR` environment variables.
+Then open `http://localhost:8090/signup` in a browser and create an account.
+Every account has its own articles, highlights, and **API token** — find the
+token on the **Settings** page and enter it in the Firefox extension and the
+Android app. Set `READLATER_ALLOW_SIGNUP=0` once everyone you want has an
+account. Other env overrides: `PORT`, `READLATER_DATA_DIR`.
 
-If exposed to the internet, put it behind HTTPS (Caddy/nginx reverse proxy).
+The server doubles as a **web reader**: log in to browse your inbox /
+favorites / archive, read articles (highlights are marked inline; select any
+text to add a new one), archive/favorite from the reader, search everything
+(full text, with domain and has-highlights filters), browse and export
+highlights, and manage your API token.
+
+### Email articles in (newsletters)
+
+Every account also gets a private **email address** (shown in Settings) —
+mail sent there lands in the inbox as an article. Enable it by pointing an
+inbound-email provider (Postmark works well) at the webhook:
+
+1. Set `READLATER_INBOUND_SECRET=<random>` and
+   `READLATER_INBOUND_DOMAIN=in.yourdomain.com` on the server.
+2. Add an MX record: `in.yourdomain.com → inbound.postmarkapp.com` (prio 10).
+3. In Postmark, set the inbound webhook URL to
+   `https://your-server/api/inbound-email?secret=<that secret>` and the
+   inbound domain to `in.yourdomain.com`.
+
+Delivery is idempotent per message, HTML bodies are sanitized, and mail to
+unknown aliases is dropped. Regenerate your address in Settings if it ever
+starts collecting spam.
+
+Upgrading from the old single-token version: the first account created adopts
+the existing token (from `READLATER_TOKEN` or `data/token.txt`) and all
+existing articles, so already-configured devices keep working.
+
+Put the server somewhere both your desktop and phone can reach. If exposed to
+the internet, put it behind HTTPS (Caddy/nginx reverse proxy) — or just use
+fly.io:
+
+```sh
+cd server
+fly launch --no-deploy --copy-config   # first time: creates the app
+fly volumes create readlater_data --region <region> --size 1
+fly deploy --ha=false
+```
+
+(`server/fly.toml` is checked in; article data lives on the persistent volume
+mounted at `/data`.)
 
 Run the test suite with `node test.js`.
 
@@ -49,7 +92,7 @@ Run the test suite with `node test.js`.
 2. Open the extension's **Settings** and enter your server URL + token, then
    **Test connection**.
 3. Save any article via the toolbar button, right-click → *Save page to
-   ReadLater*, or **Alt+Shift+S**.
+   ReadLater*, or **Alt+T**.
 
 ### Why this beats paywalls
 
@@ -88,14 +131,18 @@ connection**, then sync from the article list.
 
 ## API (for your own tooling)
 
-All endpoints under `/api` require `Authorization: Bearer <token>`.
-Timestamps are epoch milliseconds.
+All endpoints under `/api` require `Authorization: Bearer <token>` (each
+account's token is on its Settings page; the web UI's session cookie also
+works). Timestamps are epoch milliseconds.
 
 | Method & path | Purpose |
 |---|---|
-| `GET /api/health` | Connectivity check |
+| `GET /api/health` | Connectivity check (per-account counts) |
+| `GET /api/me` | Current account (username, API token, email-in address) |
+| `POST /api/inbound-email?secret=…` | Inbound-email webhook (Postmark JSON; not bearer-authed) |
 | `POST /api/articles` | Save/update an article (`{url, title, html, ...}`, deduped by URL) |
 | `GET /api/articles?includeArchived=1` | List article metadata (no HTML) |
+| `GET /api/articles?q=…&domain=…&highlighted=1` | Search (all terms AND-matched vs title/author/site/text; domain matches subdomains; `email` = emailed-in) |
 | `GET /api/articles/{id}` | Full article incl. HTML |
 | `PATCH /api/articles/{id}` | Update `archived` / `favorite` / `readParagraph` |
 | `DELETE /api/articles/{id}` | Delete article + its highlights |

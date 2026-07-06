@@ -1,14 +1,21 @@
 #!/usr/bin/env node
 /**
- * ReadLater sync server — zero-dependency Node.js (>=18).
+ * ReadLater sync server — Node.js (>=18) + SQLite (better-sqlite3, FTS5).
  *
  * Stores articles + highlights pushed by the Firefox extension and serves
- * them to the Android app. Data lives in a single JSON file next to this
- * script (override with READLATER_DATA_DIR).
+ * them to the Android app and to a built-in web reader. Data lives in
+ * <data dir>/readlater.db (override the directory with READLATER_DATA_DIR).
+ * A legacy JSON store (db.json) is imported automatically on first start.
  *
- * Auth: every /api request must send  Authorization: Bearer <token>.
- * The token is read from READLATER_TOKEN, or auto-generated on first run
- * and stored in <data dir>/token.txt.
+ * Accounts: users sign up at /signup (disable with READLATER_ALLOW_SIGNUP=0).
+ * Every account has its own API token (shown on /settings) for the Firefox
+ * extension and Android app, its own private email-in alias, and its own
+ * articles/highlights.
+ *
+ * Auth: /api requests send  Authorization: Bearer <token>  (or, from the
+ * web UI, the session cookie). Legacy single-token deployments: the token
+ * from READLATER_TOKEN / <data dir>/token.txt is adopted as the API token
+ * of the FIRST account created, along with any pre-account articles.
  *
  * Run:  node server.js            (listens on 0.0.0.0:8090, override PORT)
  */
@@ -18,65 +25,152 @@ const http = require('http');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+const web = require('./web');
+const { open, hostOf } = require('./db');
 
 const PORT = parseInt(process.env.PORT || '8090', 10);
 const DATA_DIR = process.env.READLATER_DATA_DIR || path.join(__dirname, 'data');
-const DB_FILE = path.join(DATA_DIR, 'db.json');
 const TOKEN_FILE = path.join(DATA_DIR, 'token.txt');
 const MAX_BODY = 10 * 1024 * 1024; // 10 MB per request
+const ALLOW_SIGNUP = process.env.READLATER_ALLOW_SIGNUP !== '0';
+const SESSION_TTL = 30 * 24 * 60 * 60 * 1000; // 30 days
+// Email-to-save (optional): an inbound-email provider (e.g. Postmark) POSTs
+// parsed messages to /api/inbound-email?secret=<READLATER_INBOUND_SECRET>.
+// READLATER_INBOUND_DOMAIN (e.g. in.example.com) is what Settings displays
+// after each account's private alias.
+const INBOUND_SECRET = process.env.READLATER_INBOUND_SECRET || '';
+const INBOUND_DOMAIN = process.env.READLATER_INBOUND_DOMAIN || '';
 
 fs.mkdirSync(DATA_DIR, { recursive: true });
 
-// ---------------------------------------------------------------- token
-let TOKEN = process.env.READLATER_TOKEN || '';
-if (!TOKEN) {
-  if (fs.existsSync(TOKEN_FILE)) {
-    TOKEN = fs.readFileSync(TOKEN_FILE, 'utf8').trim();
-  } else {
-    TOKEN = crypto.randomBytes(24).toString('hex');
-    fs.writeFileSync(TOKEN_FILE, TOKEN + '\n', { mode: 0o600 });
-  }
+// Legacy single-token installs: this token is adopted by the first account.
+let LEGACY_TOKEN = process.env.READLATER_TOKEN || '';
+if (!LEGACY_TOKEN && fs.existsSync(TOKEN_FILE)) {
+  LEGACY_TOKEN = fs.readFileSync(TOKEN_FILE, 'utf8').trim();
 }
 
 // ---------------------------------------------------------------- storage
-let db = { articles: [], highlights: [] };
-if (fs.existsSync(DB_FILE)) {
-  try {
-    db = JSON.parse(fs.readFileSync(DB_FILE, 'utf8'));
-    db.articles = db.articles || [];
-    db.highlights = db.highlights || [];
-  } catch (e) {
-    console.error(`Could not parse ${DB_FILE}: ${e.message} — starting empty (old file backed up)`);
-    fs.copyFileSync(DB_FILE, DB_FILE + '.corrupt.' + Date.now());
-  }
-}
-
-let saveTimer = null;
-function persist() {
-  if (saveTimer) return;
-  saveTimer = setTimeout(() => {
-    saveTimer = null;
-    const tmp = DB_FILE + '.tmp';
-    fs.writeFileSync(tmp, JSON.stringify(db));
-    fs.renameSync(tmp, DB_FILE);
-  }, 250);
-}
-process.on('SIGINT', () => { flushSync(); process.exit(0); });
-process.on('SIGTERM', () => { flushSync(); process.exit(0); });
-function flushSync() {
-  if (saveTimer) { clearTimeout(saveTimer); saveTimer = null; }
-  const tmp = DB_FILE + '.tmp';
-  fs.writeFileSync(tmp, JSON.stringify(db));
-  fs.renameSync(tmp, DB_FILE);
-}
+const store = open(DATA_DIR);
+store.pruneSessions(Date.now());
+process.on('SIGINT', () => { store.close(); process.exit(0); });
+process.on('SIGTERM', () => { store.close(); process.exit(0); });
 
 const newId = () => crypto.randomBytes(8).toString('hex');
 
+const newEmailAlias = (username) =>
+  `${String(username).toLowerCase()}-${crypto.randomBytes(3).toString('hex')}`;
+
+// ---------------------------------------------------------------- accounts
+function hashPassword(password) {
+  const salt = crypto.randomBytes(16).toString('hex');
+  const hash = crypto.scryptSync(password, salt, 64).toString('hex');
+  return `${salt}:${hash}`;
+}
+
+function verifyPassword(stored, password) {
+  const [salt, hash] = String(stored || '').split(':');
+  if (!salt || !hash) return false;
+  const candidate = crypto.scryptSync(password, salt, 64);
+  const expected = Buffer.from(hash, 'hex');
+  return candidate.length === expected.length && crypto.timingSafeEqual(candidate, expected);
+}
+
+const sha256 = (s) => crypto.createHash('sha256').update(String(s)).digest();
+
+function findUserByToken(token) {
+  if (!token) return null;
+  const presented = sha256(token);
+  let found = null;
+  for (const u of store.allUsers()) {
+    if (crypto.timingSafeEqual(presented, sha256(u.token))) found = u;
+  }
+  return found;
+}
+
+const findUserByName = (username) => store.userByName(username);
+
+/** Returns {user} or {error}. The first account adopts the legacy token and any pre-account data. */
+function createUser(username, password) {
+  if (!/^[a-zA-Z0-9_-]{3,32}$/.test(String(username || ''))) {
+    return { error: 'username must be 3-32 characters: letters, digits, - or _' };
+  }
+  if (typeof password !== 'string' || password.length < 8) {
+    return { error: 'password must be at least 8 characters' };
+  }
+  if (store.userByName(username)) return { error: 'that username is taken' };
+  const first = store.userCount() === 0;
+  const user = {
+    id: newId(),
+    username: String(username),
+    passwordHash: hashPassword(password),
+    token: (first && LEGACY_TOKEN) || crypto.randomBytes(24).toString('hex'),
+    emailAlias: newEmailAlias(username),
+    createdAt: Date.now(),
+  };
+  store.insertUser(user);
+  if (first) store.adoptOrphans(user.id);
+  return { user };
+}
+
+// ---------------------------------------------------------------- sessions
+const isHttps = (req) => (req.headers['x-forwarded-proto'] || '').split(',')[0].trim() === 'https';
+
+function parseCookies(req) {
+  const out = {};
+  for (const part of String(req.headers.cookie || '').split(';')) {
+    const i = part.indexOf('=');
+    if (i > 0) out[part.slice(0, i).trim()] = decodeURIComponent(part.slice(i + 1).trim());
+  }
+  return out;
+}
+
+function createSession(userId) {
+  const sid = crypto.randomBytes(32).toString('base64url');
+  store.putSession(sid, userId, Date.now() + SESSION_TTL);
+  return sid;
+}
+
+function sessionCookie(sid, req, { clear = false } = {}) {
+  const attrs = [
+    `rl_sid=${clear ? '' : sid}`,
+    'Path=/',
+    'HttpOnly',
+    'SameSite=Lax',
+    `Max-Age=${clear ? 0 : Math.floor(SESSION_TTL / 1000)}`,
+  ];
+  if (isHttps(req)) attrs.push('Secure');
+  return attrs.join('; ');
+}
+
+function getSessionUser(req) {
+  const sid = parseCookies(req).rl_sid;
+  if (!sid) return null;
+  const s = store.getSession(sid);
+  if (!s) return null;
+  if (s.expiresAt < Date.now()) { store.deleteSession(sid); return null; }
+  return store.userById(s.userId);
+}
+
+function destroySession(req) {
+  const sid = parseCookies(req).rl_sid;
+  if (sid) store.deleteSession(sid);
+}
+
 // ---------------------------------------------------------------- helpers
-function articleMeta(a) {
-  const { html, textContent, ...meta } = a;
+function pubArticleMeta(a) {
+  const { html, textContent, userId, domain, ...meta } = a;
   return meta;
 }
+function pubArticle(a) {
+  const { userId, domain, ...pub } = a;
+  return pub;
+}
+function pubHighlight(h) {
+  const { userId, ...pub } = h;
+  return pub;
+}
+
+const searchArticles = (user, opts) => store.searchArticles(user.id, opts);
 
 function json(res, status, obj) {
   const body = JSON.stringify(obj);
@@ -101,110 +195,230 @@ function readBody(req) {
   });
 }
 
+/** Parses a JSON or application/x-www-form-urlencoded body into a plain object. */
+function parseBody(raw, contentType) {
+  if ((contentType || '').includes('application/x-www-form-urlencoded')) {
+    return Object.fromEntries(new URLSearchParams(raw));
+  }
+  return JSON.parse(raw || '{}');
+}
+
 function sanitizeString(v, max = 2000) {
   if (typeof v !== 'string') return null;
   return v.slice(0, max);
 }
 
+const escapeText = (s) =>
+  String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
+/**
+ * Best-effort cleanup of email HTML (extension-saved articles are cleaned in
+ * the browser; email bodies arrive raw). Defense in depth only — clients
+ * render stored HTML under a strict CSP (web) or via a text parser (Android).
+ */
+function sanitizeEmailHtml(html) {
+  return String(html)
+    .replace(/<(script|style|head|title)\b[\s\S]*?<\/\1\s*>/gi, '')
+    .replace(/<(iframe|object|embed|form|link|meta|base)\b[^>]*>/gi, '')
+    .replace(/<\/(iframe|object|embed|form)\s*>/gi, '')
+    .replace(/\son\w+\s*=\s*("[^"]*"|'[^']*'|[^\s>]+)/gi, '')
+    .replace(/(href|src)\s*=\s*(["']?)\s*javascript:[^"'\s>]*\2/gi, '$1="#"');
+}
+
 // ---------------------------------------------------------------- routing
+const ctx = {
+  store, newId, sanitizeString, readBody, parseBody,
+  createUser, verifyPassword, findUserByName, newEmailAlias,
+  createSession, sessionCookie, getSessionUser, destroySession,
+  searchArticles, hostOf,
+  ALLOW_SIGNUP, INBOUND_DOMAIN,
+};
+
 const server = http.createServer(async (req, res) => {
+  const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
+  const parts = url.pathname.split('/').filter(Boolean); // e.g. ['api','articles','abc']
+
+  try {
+    if (parts[0] !== 'api') return await web.handle(ctx, req, res, url);
+  } catch (e) {
+    console.error(e);
+    res.writeHead(500, { 'Content-Type': 'text/plain' });
+    return res.end('internal error');
+  }
+
   // CORS — the Firefox extension posts from arbitrary page origins.
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PATCH,DELETE,OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
   if (req.method === 'OPTIONS') { res.writeHead(204); res.end(); return; }
 
-  const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
-  const parts = url.pathname.split('/').filter(Boolean); // e.g. ['api','articles','abc']
+  // ---- inbound email webhook (Postmark-style JSON) — shared-secret auth,
+  // routed to an account by the recipient alias. Always 200 for delivered
+  // mail we choose to drop, so the provider doesn't retry or bounce.
+  if (req.method === 'POST' && parts[1] === 'inbound-email' && parts.length === 2) {
+    if (!INBOUND_SECRET) return json(res, 404, { error: 'inbound email not configured' });
+    const given = url.searchParams.get('secret') || '';
+    if (!given || !crypto.timingSafeEqual(sha256(given), sha256(INBOUND_SECRET))) {
+      return json(res, 403, { error: 'bad secret' });
+    }
+    try {
+      const b = JSON.parse(await readBody(req) || '{}');
+      const candidates = [];
+      for (const field of ['ToFull', 'CcFull', 'BccFull']) {
+        for (const t of Array.isArray(b[field]) ? b[field] : []) {
+          if (t && t.Email) candidates.push(String(t.Email));
+        }
+      }
+      if (b.OriginalRecipient) candidates.push(String(b.OriginalRecipient));
+      let target = null;
+      for (const c of candidates) {
+        target = store.userByAlias(c.toLowerCase().split('@')[0]);
+        if (target) break;
+      }
+      if (!target) return json(res, 200, { ok: true, dropped: 'unknown recipient' });
 
-  if (parts[0] !== 'api') return json(res, 404, { error: 'not found' });
+      // idempotent per message: providers may retry delivery
+      const msgId = sanitizeString(b.MessageID) ||
+        crypto.createHash('sha256').update(`${b.From}|${b.Subject}|${b.Date}`).digest('hex').slice(0, 24);
+      const artUrl = `email:${msgId}`;
+      let a = store.articleByUrl(target.id, artUrl);
+      if (!a) {
+        const text = typeof b.TextBody === 'string' ? b.TextBody : '';
+        const html = typeof b.HtmlBody === 'string' && b.HtmlBody.trim()
+          ? sanitizeEmailHtml(b.HtmlBody)
+          : `<pre>${escapeText(text)}</pre>`;
+        const from = (b.FromFull && (b.FromFull.Name || b.FromFull.Email)) || b.From || null;
+        a = {
+          id: newId(),
+          userId: target.id,
+          url: artUrl,
+          savedAt: Date.parse(b.Date) || Date.now(),
+          archived: false, favorite: false, readParagraph: 0,
+          title: sanitizeString(b.Subject) || '(no subject)',
+          byline: sanitizeString(from),
+          siteName: 'Email',
+          excerpt: sanitizeString(text.replace(/\s+/g, ' ').trim(), 300),
+          html,
+          textContent: text ? text.slice(0, 200000) : null,
+          updatedAt: Date.now(),
+        };
+        store.insertArticle(a);
+      }
+      return json(res, 200, { ok: true, id: a.id });
+    } catch (e) {
+      if (e instanceof SyntaxError) return json(res, 400, { error: 'invalid JSON body' });
+      console.error(e);
+      return json(res, 500, { error: 'internal error' });
+    }
+  }
 
-  // auth
+  // auth: bearer token (devices) or session cookie (web UI)
   const auth = req.headers.authorization || '';
   const presented = auth.startsWith('Bearer ') ? auth.slice(7).trim() : '';
-  const ok = presented.length === TOKEN.length &&
-    crypto.timingSafeEqual(Buffer.from(presented), Buffer.from(TOKEN));
-  if (!ok) return json(res, 401, { error: 'unauthorized' });
+  const user = presented ? findUserByToken(presented) : getSessionUser(req);
+  if (!user) return json(res, 401, { error: 'unauthorized' });
 
   try {
     // ---- health
     if (req.method === 'GET' && parts[1] === 'health') {
-      return json(res, 200, { ok: true, articles: db.articles.length, highlights: db.highlights.length });
+      return json(res, 200, {
+        ok: true,
+        articles: store.articleCount(user.id),
+        highlights: store.highlightCount(user.id),
+      });
+    }
+
+    // ---- current account
+    if (req.method === 'GET' && parts[1] === 'me' && parts.length === 2) {
+      return json(res, 200, {
+        username: user.username,
+        token: user.token,
+        emailAddress: INBOUND_DOMAIN ? `${user.emailAlias}@${INBOUND_DOMAIN}` : null,
+        createdAt: user.createdAt,
+      });
     }
 
     // ---- articles collection
     if (parts[1] === 'articles' && parts.length === 2) {
       if (req.method === 'GET') {
-        const includeArchived = url.searchParams.get('includeArchived') === '1';
-        const since = parseInt(url.searchParams.get('since') || '0', 10) || 0;
-        let list = db.articles;
-        if (!includeArchived) list = list.filter((a) => !a.archived);
-        if (since) list = list.filter((a) => a.updatedAt > since);
-        list = [...list].sort((a, b) => b.savedAt - a.savedAt);
-        return json(res, 200, { articles: list.map(articleMeta) });
+        const list = searchArticles(user, {
+          includeArchived: url.searchParams.get('includeArchived') === '1',
+          since: parseInt(url.searchParams.get('since') || '0', 10) || 0,
+          q: url.searchParams.get('q') || '',
+          domain: url.searchParams.get('domain') || '',
+          highlighted: url.searchParams.get('highlighted') === '1',
+        });
+        return json(res, 200, { articles: list.map(pubArticleMeta) });
       }
       if (req.method === 'POST') {
-        const b = JSON.parse(await readBody(req) || '{}');
+        const b = parseBody(await readBody(req), req.headers['content-type']);
         const artUrl = sanitizeString(b.url);
         const html = typeof b.html === 'string' ? b.html : '';
         if (!artUrl || !html) return json(res, 400, { error: 'url and html are required' });
         const now = Date.now();
-        let a = db.articles.find((x) => x.url === artUrl);
-        if (!a) {
-          a = { id: newId(), url: artUrl, savedAt: b.savedAt || now, archived: false, favorite: false, readParagraph: 0 };
-          db.articles.push(a);
+        const fields = {
+          title: sanitizeString(b.title) || artUrl,
+          byline: sanitizeString(b.byline),
+          siteName: sanitizeString(b.siteName),
+          excerpt: sanitizeString(b.excerpt),
+          html,
+          textContent: typeof b.textContent === 'string' ? b.textContent : null,
+          updatedAt: now,
+        };
+        let a = store.articleByUrl(user.id, artUrl);
+        if (a) {
+          store.updateArticleContent(a.id, fields);
+        } else {
+          a = {
+            id: newId(), userId: user.id, url: artUrl,
+            savedAt: b.savedAt || now, archived: false, favorite: false, readParagraph: 0,
+            ...fields,
+          };
+          store.insertArticle(a);
         }
-        a.title = sanitizeString(b.title) || artUrl;
-        a.byline = sanitizeString(b.byline);
-        a.siteName = sanitizeString(b.siteName);
-        a.excerpt = sanitizeString(b.excerpt);
-        a.html = html;
-        a.textContent = typeof b.textContent === 'string' ? b.textContent : null;
-        a.updatedAt = now;
-        persist();
-        return json(res, 201, a);
+        return json(res, 201, pubArticle(store.getArticle(a.id, user.id)));
       }
     }
 
     // ---- single article
     if (parts[1] === 'articles' && parts.length === 3) {
-      const a = db.articles.find((x) => x.id === parts[2]);
+      const a = store.getArticle(parts[2], user.id);
       if (!a) return json(res, 404, { error: 'article not found' });
-      if (req.method === 'GET') return json(res, 200, a);
+      if (req.method === 'GET') return json(res, 200, pubArticle(a));
       if (req.method === 'PATCH') {
-        const b = JSON.parse(await readBody(req) || '{}');
-        if (typeof b.archived === 'boolean') a.archived = b.archived;
-        if (typeof b.favorite === 'boolean') a.favorite = b.favorite;
-        if (Number.isInteger(b.readParagraph) && b.readParagraph >= 0) a.readParagraph = b.readParagraph;
-        a.updatedAt = Date.now();
-        persist();
-        return json(res, 200, articleMeta(a));
+        const b = parseBody(await readBody(req), req.headers['content-type']);
+        store.patchArticle(a.id, {
+          archived: typeof b.archived === 'boolean' ? b.archived : undefined,
+          favorite: typeof b.favorite === 'boolean' ? b.favorite : undefined,
+          readParagraph: b.readParagraph,
+          updatedAt: Date.now(),
+        });
+        return json(res, 200, pubArticleMeta(store.getArticle(a.id, user.id)));
       }
       if (req.method === 'DELETE') {
-        db.articles = db.articles.filter((x) => x.id !== a.id);
-        db.highlights = db.highlights.filter((h) => h.articleId !== a.id);
-        persist();
+        store.deleteArticle(a.id);
         return json(res, 200, { ok: true });
       }
     }
 
     // ---- highlights nested under an article
     if (parts[1] === 'articles' && parts.length === 4 && parts[3] === 'highlights') {
-      const a = db.articles.find((x) => x.id === parts[2]);
+      const a = store.getArticle(parts[2], user.id);
       if (!a) return json(res, 404, { error: 'article not found' });
       if (req.method === 'GET') {
-        return json(res, 200, { highlights: db.highlights.filter((h) => h.articleId === a.id) });
+        return json(res, 200, { highlights: store.highlightsForArticle(a.id).map(pubHighlight) });
       }
       if (req.method === 'POST') {
-        const b = JSON.parse(await readBody(req) || '{}');
+        const b = parseBody(await readBody(req), req.headers['content-type']);
         const text = sanitizeString(b.text, 20000);
         if (!text) return json(res, 400, { error: 'text is required' });
         if (b.clientId) {
-          const dup = db.highlights.find((h) => h.clientId === b.clientId);
-          if (dup) return json(res, 200, dup);
+          const dup = store.highlightByClientId(user.id, sanitizeString(b.clientId));
+          if (dup) return json(res, 200, pubHighlight(dup));
         }
         const h = {
           id: newId(),
+          userId: user.id,
           clientId: sanitizeString(b.clientId) || null,
           articleId: a.id,
           text,
@@ -212,32 +426,26 @@ const server = http.createServer(async (req, res) => {
           paragraphIndex: Number.isInteger(b.paragraphIndex) ? b.paragraphIndex : null,
           createdAt: b.createdAt || Date.now(),
         };
-        db.highlights.push(h);
-        persist();
-        return json(res, 201, h);
+        store.insertHighlight(h);
+        return json(res, 201, pubHighlight(h));
       }
     }
 
     // ---- highlights collection / export / delete
     if (parts[1] === 'highlights') {
       if (req.method === 'GET' && parts.length === 2) {
-        const withArticle = db.highlights.map((h) => {
-          const a = db.articles.find((x) => x.id === h.articleId);
-          return { ...h, articleTitle: a ? a.title : null, articleUrl: a ? a.url : null };
-        });
-        return json(res, 200, { highlights: withArticle });
+        return json(res, 200, { highlights: store.highlightsForUser(user.id).map(pubHighlight) });
       }
       if (req.method === 'GET' && parts.length === 3 && parts[2] === 'export.md') {
         const byArticle = new Map();
-        for (const h of db.highlights) {
+        for (const h of store.highlightsForUser(user.id)) {
           if (!byArticle.has(h.articleId)) byArticle.set(h.articleId, []);
           byArticle.get(h.articleId).push(h);
         }
         let md = '# Highlights\n';
-        for (const [articleId, hs] of byArticle) {
-          const a = db.articles.find((x) => x.id === articleId);
-          md += `\n## ${a ? a.title : 'Unknown article'}\n`;
-          if (a) md += `${a.url}\n`;
+        for (const hs of byArticle.values()) {
+          md += `\n## ${hs[0].articleTitle || 'Unknown article'}\n`;
+          if (hs[0].articleUrl) md += `${hs[0].articleUrl}\n`;
           for (const h of hs.sort((x, y) => x.createdAt - y.createdAt)) {
             md += `\n> ${h.text.replace(/\n/g, '\n> ')}\n`;
             if (h.note) md += `\n${h.note}\n`;
@@ -247,10 +455,8 @@ const server = http.createServer(async (req, res) => {
         return res.end(md);
       }
       if (req.method === 'DELETE' && parts.length === 3) {
-        const before = db.highlights.length;
-        db.highlights = db.highlights.filter((h) => h.id !== parts[2]);
-        if (db.highlights.length === before) return json(res, 404, { error: 'highlight not found' });
-        persist();
+        const { changes } = store.deleteHighlight(parts[2], user.id);
+        if (!changes) return json(res, 404, { error: 'highlight not found' });
         return json(res, 200, { ok: true });
       }
     }
@@ -265,6 +471,14 @@ const server = http.createServer(async (req, res) => {
 
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`ReadLater server listening on http://0.0.0.0:${PORT}`);
-  console.log(`API token: ${TOKEN}`);
-  console.log('Configure this URL + token in the Firefox extension and the Android app.');
+  const users = store.userCount();
+  if (users === 0) {
+    console.log(`No accounts yet — open http://localhost:${PORT}/signup in a browser to create one.`);
+    if (LEGACY_TOKEN) console.log('The first account will adopt the existing API token and any existing articles.');
+  } else {
+    console.log(`${users} account(s). Each account's API token is on its /settings page.`);
+  }
+  if (INBOUND_SECRET) {
+    console.log(`Email-to-save enabled${INBOUND_DOMAIN ? ` for @${INBOUND_DOMAIN}` : ''} — webhook at /api/inbound-email`);
+  }
 });
