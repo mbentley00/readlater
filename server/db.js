@@ -105,12 +105,19 @@ END;
 const rowUser = (r) => r || null;
 const rowArticle = (r) => r && { ...r, archived: !!r.archived, favorite: !!r.favorite };
 
-const stripTags = (html) => String(html || '').replace(/<[^>]+>/g, ' ');
+// Extract readable text for word counting. Crucially, remove the CONTENT of
+// script/style/head/noscript/svg blocks — not just their tags — or embedded
+// JSON-LD and inline scripts (common in imported article HTML) inflate the
+// count and make reading-time estimates far too long.
+const htmlToText = (html) => String(html || '')
+  .replace(/<(script|style|head|noscript|svg|template)\b[\s\S]*?<\/\1\s*>/gi, ' ')
+  .replace(/<!--[\s\S]*?-->/g, ' ')
+  .replace(/<[^>]+>/g, ' ');
 const countWords = (s) => {
   const t = String(s || '').trim();
   return t ? t.split(/\s+/).length : 0;
 };
-const articleWordCount = (a) => countWords(a.textContent || stripTags(a.html));
+const articleWordCount = (a) => countWords(a.textContent || htmlToText(a.html));
 
 /** Turn a user query into an FTS5 MATCH expression: each term quoted, prefix-matched, ANDed. */
 function ftsQuery(q) {
@@ -127,19 +134,34 @@ function open(dataDir) {
   sqlite.pragma('foreign_keys = ON');
   sqlite.exec(SCHEMA);
 
+  // Recompute wordCount for every article WITHOUT loading all bodies into
+  // memory at once (24k full HTML bodies via .all() OOMs a small VM). Stream
+  // the rows with an iterator, keep only {id, wordCount}, then batch-update.
+  const recomputeAllWordCounts = () => {
+    const sel = sqlite.prepare('SELECT id, textContent, html FROM articles');
+    const pairs = [];
+    for (const r of sel.iterate()) pairs.push([r.id, articleWordCount(r)]); // html not retained
+    const upd = sqlite.prepare('UPDATE articles SET wordCount = ? WHERE id = ?');
+    sqlite.transaction(() => {
+      for (const [id, wc] of pairs) upd.run(wc, id);
+    })();
+  };
+
   // databases created before wordCount existed: add the column and backfill
   const articleCols = sqlite.prepare('PRAGMA table_info(articles)').all().map((c) => c.name);
   if (!articleCols.includes('wordCount')) {
     sqlite.exec("ALTER TABLE articles ADD COLUMN wordCount INTEGER NOT NULL DEFAULT 0");
-    const rows = sqlite.prepare('SELECT id, textContent, html FROM articles').all();
-    const upd = sqlite.prepare('UPDATE articles SET wordCount = ? WHERE id = ?');
-    sqlite.transaction(() => {
-      for (const r of rows) upd.run(articleWordCount(r), r.id);
-    })();
+    recomputeAllWordCounts();
   }
   // separate listening position (TTS) from the manual scroll position
   if (!articleCols.includes('ttsParagraph')) {
     sqlite.exec("ALTER TABLE articles ADD COLUMN ttsParagraph INTEGER NOT NULL DEFAULT 0");
+  }
+  // one-time recompute after the script/style-stripping fix (imported
+  // articles were over-counted by embedded JSON-LD / scripts).
+  if (sqlite.pragma('user_version', { simple: true }) < 2) {
+    recomputeAllWordCounts();
+    sqlite.pragma('user_version = 2');
   }
 
   migrateLegacyJson(sqlite, dataDir);

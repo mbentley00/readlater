@@ -107,12 +107,12 @@ function page({ title, body, user, active = '', nonce = '', script = '', article
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="referrer" content="no-referrer">
-<title>${escapeHtml(title)} — ReadLater</title>
+<title>${escapeHtml(title)} — Earmark</title>
 <link rel="icon" href="${FAVICON}">
 <style>${CSS}</style>
 </head>
 <body>
-<header class="site"><a class="brand" href="/">📚 ReadLater</a>${nav}</header>
+<header class="site"><a class="brand" href="/">📖 Earmark</a>${nav}</header>
 <main>${body}</main>
 ${script ? `<script nonce="${nonce}">${script}</script>` : ''}
 </body>

@@ -315,6 +315,16 @@ async function main() {
     assert.strictEqual(r.body.articles.length, 1, 'search matches textContent');
     assert.strictEqual(r.body.articles[0].title, 'Ownership Explained');
     assert.strictEqual(r.body.articles[0].wordCount, 6, 'list metadata carries wordCount');
+
+    // wordCount ignores script/style content (would otherwise inflate reading time)
+    r = await api('POST', '/api/articles', {
+      url: 'https://example.com/scripted',
+      title: 'ScriptedWord',
+      html: '<script type="application/ld+json">{"a":"' + 'x '.repeat(500) + '"}</script>' +
+        '<p>Just five real words here.</p>',
+    });
+    assert.ok(r.body.wordCount < 20, `script content excluded from wordCount (got ${r.body.wordCount})`);
+    await api('DELETE', `/api/articles/${r.body.id}`);
     r = await api('GET', '/api/articles?q=borrow+zebra');
     assert.strictEqual(r.body.articles.length, 0, 'all terms must match');
     // q matches archived only with includeArchived
