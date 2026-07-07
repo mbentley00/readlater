@@ -67,6 +67,9 @@ class TtsService : Service() {
         private const val CHANNEL_ID = "tts_playback"
         private const val NOTIFICATION_ID = 1001
 
+        /** How many upcoming paragraphs to keep synthesized ahead of playback. */
+        private const val PREFETCH_AHEAD = 3
+
         /** Current playback state, observable from anywhere. */
         val stateFlow = MutableStateFlow(TtsPlaybackState())
 
@@ -774,6 +777,20 @@ class TtsService : Service() {
         }
     }
 
+    /** Queue synthesis of the next few paragraphs so short ones don't outrun
+     *  the engine (the cause of gaps between short paragraphs). synthesize() is
+     *  idempotent, so re-requesting already-ready/in-flight ones is free. */
+    private fun prefetchAhead(fromIdx: Int) {
+        var p = fromIdx
+        var queued = 0
+        while (queued < PREFETCH_AHEAD) {
+            val n = nextSpeakable(p + 1) ?: break
+            synthesize(n)
+            p = n
+            queued++
+        }
+    }
+
     private fun synthesize(idx: Int) {
         if (idx < 0 || synthesizing.contains(idx) || readyFiles.contains(idx)) return
         val engine = tts ?: return
@@ -857,7 +874,7 @@ class TtsService : Service() {
             cancelAudioWatchdog()
             track.play()
             logDbg("playing (AudioTrack) idx=$idx sr=${wav.sampleRate} ch=${wav.channels} from=${fromMs}ms")
-            nextSpeakable(idx + 1)?.let { synthesize(it) } // prefetch
+            prefetchAhead(idx) // keep synthesis ahead of playback (short paragraphs)
             publishState(); updatePlaybackState(); updateNotification()
 
             val frameBytes = wav.channels * 2

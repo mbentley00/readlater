@@ -86,6 +86,14 @@ class MainActivity : ComponentActivity() {
                             onBack = {
                                 app.settings.lastArticleId = ""
                                 navController.popBackStack()
+                            },
+                            // Archiving the playing article advances to the next
+                            // one — replace this article in the back stack so Back
+                            // still returns to the list.
+                            onOpenArticle = { nextId ->
+                                navController.navigate("reader/$nextId") {
+                                    popUpTo("reader/$articleId") { inclusive = true }
+                                }
                             }
                         )
                     }

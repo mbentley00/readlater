@@ -124,7 +124,7 @@ private fun sendTtsCommand(
 
 @OptIn(ExperimentalMaterial3Api::class, FlowPreview::class)
 @Composable
-fun ReaderScreen(articleId: String, onBack: () -> Unit) {
+fun ReaderScreen(articleId: String, onBack: () -> Unit, onOpenArticle: (String) -> Unit = {}) {
     val context = LocalContext.current
     val app = context.applicationContext as ReadLaterApp
     val repo = app.repository
@@ -298,10 +298,11 @@ fun ReaderScreen(articleId: String, onBack: () -> Unit) {
                                         val next = repo.nextInboxArticle(a)
                                         if (next != null) {
                                             sendTtsCommand(context, TtsService.ACTION_PLAY, next.id, 0)
+                                            onOpenArticle(next.id) // open the next article's reader
                                         } else {
                                             sendTtsCommand(context, TtsService.ACTION_STOP)
+                                            onBack()
                                         }
-                                        onBack()
                                     }
                                 } else {
                                     onBack()
