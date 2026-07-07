@@ -1,12 +1,16 @@
 package com.readlater.app
 
 import android.Manifest
+import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
+import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.lifecycle.lifecycleScope
+import kotlinx.coroutines.launch
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -42,6 +46,10 @@ class MainActivity : ComponentActivity() {
 
         val app = application as ReadLaterApp
 
+        // A share (link sent from another app) saves in the background and opens
+        // to the inbox rather than resuming the last-read article.
+        val startedFromShare = handleShareIntent(intent)
+
         setContent {
             ReadLaterTheme {
                 val navController = rememberNavController()
@@ -53,8 +61,10 @@ class MainActivity : ComponentActivity() {
                 LaunchedEffect(Unit) {
                     if (!resumeHandled) {
                         resumeHandled = true
-                        val last = app.settings.lastArticleId
-                        if (last.isNotBlank()) navController.navigate("reader/$last")
+                        if (!startedFromShare) {
+                            val last = app.settings.lastArticleId
+                            if (last.isNotBlank()) navController.navigate("reader/$last")
+                        }
                     }
                 }
 
@@ -91,5 +101,35 @@ class MainActivity : ComponentActivity() {
                 }
             }
         }
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        handleShareIntent(intent)
+    }
+
+    /** Save a shared link via the server (which fetches + extracts the page).
+     *  Returns true if the intent was a share we handled. */
+    private fun handleShareIntent(intent: Intent?): Boolean {
+        if (intent?.action != Intent.ACTION_SEND) return false
+        val shared = intent.getStringExtra(Intent.EXTRA_TEXT)?.trim().orEmpty()
+        if (shared.isEmpty()) return false
+        val app = application as ReadLaterApp
+        if (app.settings.token.isBlank()) {
+            Toast.makeText(this, "Sign in to Earmark in Settings first", Toast.LENGTH_LONG).show()
+            return true
+        }
+        Toast.makeText(this, "Saving to Earmark…", Toast.LENGTH_SHORT).show()
+        lifecycleScope.launch {
+            try {
+                val title = app.apiClient.saveUrl(shared)
+                Toast.makeText(this@MainActivity, "Saved: $title", Toast.LENGTH_LONG).show()
+                runCatching { app.repository.syncNow() } // pull it into the list
+            } catch (e: Exception) {
+                Toast.makeText(this@MainActivity, "Couldn't save: ${e.message ?: "error"}", Toast.LENGTH_LONG).show()
+            }
+        }
+        return true
     }
 }

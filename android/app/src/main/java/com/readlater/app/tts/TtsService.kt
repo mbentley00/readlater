@@ -287,6 +287,7 @@ class TtsService : Service() {
                 handleStop()
                 return@launch
             }
+            logDbg("loaded ${blocks.size} blocks, ${blocks.count { speakableText(it) != null }} speakable — ${article.title.take(40)}")
             // Default resume point: the listening position, falling back to the
             // scroll position for articles never played before.
             val resumeAt = if (article.ttsParagraph > 0) article.ttsParagraph else article.readParagraph
@@ -728,8 +729,10 @@ class TtsService : Service() {
     private fun advanceAndSpeak() {
         val next = nextSpeakable(currentIndex + 1)
         if (next == null) {
-            // Finished the article; handleStop pushes the final position.
-            currentIndex = blocks.size - 1
+            // Genuinely finished the article. Reset the listening position so a
+            // replay starts from the top rather than the last paragraph.
+            logDbg("article complete at idx=$currentIndex / ${blocks.size} blocks")
+            currentIndex = 0
             handleStop()
         } else {
             currentIndex = next
@@ -860,10 +863,10 @@ class TtsService : Service() {
             val frameBytes = wav.channels * 2
             val startByte = wav.dataOffset + (fromMs.toLong() * wav.sampleRate / 1000 * frameBytes)
                 .coerceIn(0L, wav.dataLen)
-            val totalFrames = (wav.dataOffset + wav.dataLen - startByte) / frameBytes
             val myGen = ++playThreadGen
             playThread = Thread {
                 try {
+                    var bytesWritten = 0L
                     java.io.RandomAccessFile(file, "r").use { raf ->
                         raf.seek(startByte)
                         val buf = ByteArray(16 * 1024)
@@ -875,19 +878,28 @@ class TtsService : Service() {
                             var off = 0
                             while (off < n && myGen == playThreadGen) {
                                 val w = track.write(buf, off, n - off)
-                                if (w <= 0) break
+                                if (w <= 0) { off = -1; break } // error / track stopped
                                 off += w
+                                bytesWritten += w
                             }
+                            if (off < 0) break
                             remaining -= n
                         }
-                        // wait for the buffered audio to finish playing
-                        while (myGen == playThreadGen &&
-                            (track.playbackHeadPosition.toLong() and 0xFFFFFFFFL) < totalFrames
-                        ) Thread.sleep(40)
                     }
+                    // Drain against the frames we ACTUALLY wrote (the header's
+                    // declared length could exceed the real PCM), with a hard
+                    // deadline so a stalled playback head can never hang the
+                    // article on a paragraph — that was cutting articles short.
+                    val framesToDrain = bytesWritten / frameBytes
+                    val deadline = System.currentTimeMillis() +
+                        (framesToDrain * 1000L / trackSampleRate) + 2000
+                    while (myGen == playThreadGen &&
+                        (track.playbackHeadPosition.toLong() and 0xFFFFFFFFL) < framesToDrain &&
+                        System.currentTimeMillis() < deadline
+                    ) Thread.sleep(40)
                     if (myGen == playThreadGen) mainHandler.post {
                         if (myGen == playThreadGen && isPlaying && preparedIdx == idx) {
-                            logDbg("completed idx=$idx")
+                            logDbg("completed idx=$idx (${bytesWritten}B)")
                             synthFile(idx).delete(); readyFiles.remove(idx)
                             preparedIdx = -1; resumePositionMs = 0
                             advanceAndSpeak()

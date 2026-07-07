@@ -187,6 +187,18 @@ class ApiClient(private val settings: Settings) {
         execute(builder("/api/articles/$id").delete().build())
     }
 
+    /** POST /api/save-url — server fetches + extracts the page. Returns the
+     *  saved article's title, or throws on failure. */
+    suspend fun saveUrl(sharedText: String): String {
+        val json = JSONObject().put("url", sharedText)
+        val body = execute(
+            builder("/api/save-url")
+                .post(json.toString().toRequestBody(jsonMediaType))
+                .build()
+        )
+        return JSONObject(body).optString("title", "Saved")
+    }
+
     /** GET /api/articles/{id}/highlights */
     suspend fun getHighlights(articleId: String): List<RemoteHighlight> {
         val body = execute(builder("/api/articles/$articleId/highlights").get().build())
