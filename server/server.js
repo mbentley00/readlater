@@ -68,12 +68,20 @@ const audioMetaFile = (id) => path.join(AUDIO_DIR, `${id}.json`);
 
 const ttsQueued = new Set();
 const ttsPending = [];
+const ttsFailedAt = new Map(); // articleId -> ms of last failure (backoff)
+const TTS_FAIL_COOLDOWN = 5 * 60 * 1000;
 let ttsRunning = false;
 
 function enqueueTts(articleId, userId, force = false) {
   if (!tts.enabled()) return false;
   if (ttsQueued.has(articleId)) return true;
   if (!force && fs.existsSync(audioMetaFile(articleId))) return false;
+  // Don't re-attempt a recently-failed synth on every status poll (e.g. while
+  // the provider is out of balance) — a manual POST (force) clears this.
+  if (!force) {
+    const failedAt = ttsFailedAt.get(articleId);
+    if (failedAt && Date.now() - failedAt < TTS_FAIL_COOLDOWN) return false;
+  }
   ttsQueued.add(articleId);
   ttsPending.push({ articleId, userId });
   pumpTts();
@@ -95,9 +103,11 @@ async function pumpTts() {
           paragraphOffsetsMs: r.paragraphOffsetsMs, size: r.wav.length, createdAt: Date.now(),
         }));
         console.log(`TTS synthesized ${articleId}: ${r.wav.length} bytes, ${r.paragraphOffsetsMs.length} paragraphs`);
+        ttsFailedAt.delete(articleId);
       }
     } catch (e) {
       console.error(`TTS failed for ${articleId}: ${e.message}`);
+      ttsFailedAt.set(articleId, Date.now());
     } finally {
       ttsQueued.delete(articleId);
     }
