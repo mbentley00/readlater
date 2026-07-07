@@ -534,6 +534,8 @@ fun ReaderScreen(articleId: String, onBack: () -> Unit, onOpenArticle: (String) 
                 TextButton(onClick = {
                     resumeChoice = null
                     followTts = true
+                    // Resuming the listening position starts playback from there.
+                    sendTtsCommand(context, TtsService.ACTION_PLAY, articleId, tts)
                     scope.launch { listState.scrollToItem(tts) }
                 }) { Text("Listening · $ttsPct%") }
             }
