@@ -287,9 +287,26 @@ fun ReaderScreen(articleId: String, onBack: () -> Unit) {
                         }
                         IconButton(onClick = {
                             val wasArchived = a.archived
+                            val ttsOnThis = isTtsThisArticle
                             repo.toggleArchive(a)
-                            // Archiving finishes reading — return to the list.
-                            if (!wasArchived) onBack()
+                            // Archiving finishes reading — return to the list. If
+                            // this article was the one being read aloud, advance
+                            // the listening queue to the next inbox article.
+                            if (!wasArchived) {
+                                if (ttsOnThis) {
+                                    scope.launch {
+                                        val next = repo.nextInboxArticle(a)
+                                        if (next != null) {
+                                            sendTtsCommand(context, TtsService.ACTION_PLAY, next.id, 0)
+                                        } else {
+                                            sendTtsCommand(context, TtsService.ACTION_STOP)
+                                        }
+                                        onBack()
+                                    }
+                                } else {
+                                    onBack()
+                                }
+                            }
                         }) {
                             Icon(
                                 if (a.archived) Icons.Filled.Unarchive else Icons.Filled.Archive,

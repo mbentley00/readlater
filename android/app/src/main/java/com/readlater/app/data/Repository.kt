@@ -35,6 +35,10 @@ class Repository(
 
     fun article(id: String): Flow<ArticleEntity?> = articleDao.articleFlow(id)
 
+    /** The next inbox article to auto-play after finishing/archiving this one. */
+    suspend fun nextInboxArticle(current: ArticleEntity): ArticleEntity? =
+        withContext(Dispatchers.IO) { articleDao.nextInboxAfter(current.savedAt, current.id) }
+
     fun highlightsFor(articleId: String): Flow<List<HighlightEntity>> =
         highlightDao.byArticle(articleId)
 

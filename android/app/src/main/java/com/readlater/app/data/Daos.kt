@@ -20,6 +20,14 @@ interface ArticleDao {
     @Query("SELECT * FROM articles WHERE id = :id")
     suspend fun getById(id: String): ArticleEntity?
 
+    /** Next inbox article after the given one, in newest-first (list) order. */
+    @Query(
+        "SELECT * FROM articles WHERE archived = 0 AND html IS NOT NULL AND " +
+            "(savedAt < :savedAt OR (savedAt = :savedAt AND id > :id)) " +
+            "ORDER BY savedAt DESC, id ASC LIMIT 1"
+    )
+    suspend fun nextInboxAfter(savedAt: Long, id: String): ArticleEntity?
+
     @Query("SELECT * FROM articles")
     suspend fun getAll(): List<ArticleEntity>
 
