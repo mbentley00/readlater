@@ -39,6 +39,10 @@ import androidx.compose.material.icons.filled.Remove
 import androidx.compose.material.icons.filled.SkipNext
 import androidx.compose.material.icons.filled.SkipPrevious
 import androidx.compose.material.icons.filled.Star
+import androidx.compose.material.icons.filled.Search
+import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.KeyboardArrowUp
+import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.StarBorder
 import androidx.compose.material.icons.filled.Unarchive
 import androidx.compose.material3.AlertDialog
@@ -60,6 +64,8 @@ import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextField
+import androidx.compose.material3.TextFieldDefaults
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
@@ -244,9 +250,68 @@ fun ReaderScreen(articleId: String, onBack: () -> Unit, onOpenArticle: (String) 
         }
     }
 
+    // Find in article: match block indices, navigable with prev/next.
+    var searchActive by remember { mutableStateOf(false) }
+    var searchQuery by remember { mutableStateOf("") }
+    val matchBlocks = remember(searchQuery, blocks) {
+        val q = searchQuery.trim()
+        if (q.length < 2) emptyList()
+        else blocks.indices.filter { blockPlainText(blocks[it]).contains(q, ignoreCase = true) }
+    }
+    var currentMatch by remember { mutableStateOf(0) }
+    LaunchedEffect(matchBlocks) {
+        currentMatch = 0
+        if (matchBlocks.isNotEmpty()) listState.scrollToItem(matchBlocks[0])
+    }
+    fun goToMatch(delta: Int) {
+        if (matchBlocks.isEmpty()) return
+        currentMatch = ((currentMatch + delta) % matchBlocks.size + matchBlocks.size) % matchBlocks.size
+        scope.launch { listState.scrollToItem(matchBlocks[currentMatch]) }
+    }
+
     Scaffold(
         snackbarHost = { SnackbarHost(snackbarHostState) },
         topBar = {
+            if (searchActive) {
+                TopAppBar(
+                    navigationIcon = {
+                        IconButton(onClick = { searchActive = false; searchQuery = "" }) {
+                            Icon(Icons.Filled.Close, contentDescription = "Close search")
+                        }
+                    },
+                    title = {
+                        TextField(
+                            value = searchQuery,
+                            onValueChange = { searchQuery = it },
+                            placeholder = { Text("Find in article") },
+                            singleLine = true,
+                            colors = TextFieldDefaults.colors(
+                                focusedContainerColor = Color.Transparent,
+                                unfocusedContainerColor = Color.Transparent,
+                                focusedIndicatorColor = Color.Transparent,
+                                unfocusedIndicatorColor = Color.Transparent
+                            ),
+                            modifier = Modifier.fillMaxWidth()
+                        )
+                    },
+                    actions = {
+                        if (searchQuery.trim().length >= 2) {
+                            Text(
+                                text = if (matchBlocks.isEmpty()) "0" else "${currentMatch + 1}/${matchBlocks.size}",
+                                style = MaterialTheme.typography.labelMedium,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                            IconButton(onClick = { goToMatch(-1) }, enabled = matchBlocks.isNotEmpty()) {
+                                Icon(Icons.Filled.KeyboardArrowUp, contentDescription = "Previous match")
+                            }
+                            IconButton(onClick = { goToMatch(1) }, enabled = matchBlocks.isNotEmpty()) {
+                                Icon(Icons.Filled.KeyboardArrowDown, contentDescription = "Next match")
+                            }
+                        }
+                    }
+                )
+                return@Scaffold
+            }
             TopAppBar(
                 title = {
                     Column {
@@ -276,6 +341,9 @@ fun ReaderScreen(articleId: String, onBack: () -> Unit, onOpenArticle: (String) 
                 },
                 actions = {
                     val a = article
+                    IconButton(onClick = { searchActive = true }) {
+                        Icon(Icons.Filled.Search, contentDescription = "Find in article")
+                    }
                     if (a != null) {
                         IconButton(onClick = { repo.toggleFavorite(a) }) {
                             Icon(
@@ -494,6 +562,7 @@ fun ReaderScreen(articleId: String, onBack: () -> Unit, onOpenArticle: (String) 
                         BlockItem(
                             block = block,
                             paraHighlights = highlightsByPara[index].orEmpty(),
+                            searchQuery = if (searchActive) searchQuery.trim() else "",
                             isSpoken = isTtsThisArticle && ttsState.paragraphIndex == index,
                             onLongPress = { text ->
                                 sheetTarget = SheetTarget.Create(index, text)
@@ -568,10 +637,31 @@ fun ReaderScreen(articleId: String, onBack: () -> Unit, onOpenArticle: (String) 
 }
 
 @OptIn(ExperimentalFoundationApi::class)
+/** Plain speakable/searchable text of a block ("" for images without alt). */
+private fun blockPlainText(block: Block): String = when (block) {
+    is Block.Paragraph -> block.text
+    is Block.Heading -> block.text
+    is Block.Quote -> block.text
+    is Block.ImageBlock -> block.alt.orEmpty()
+}
+
+private val SearchMatchColor = Color(0x804FC3F7) // distinct from the amber highlight
+
+/** Add a background span for every case-insensitive occurrence of [query]. */
+private fun androidx.compose.ui.text.AnnotatedString.Builder.addSearchSpans(text: String, query: String) {
+    if (query.length < 2) return
+    var i = text.indexOf(query, 0, ignoreCase = true)
+    while (i >= 0) {
+        addStyle(SpanStyle(background = SearchMatchColor), i, i + query.length)
+        i = text.indexOf(query, i + query.length, ignoreCase = true)
+    }
+}
+
 @Composable
 private fun BlockItem(
     block: Block,
     paraHighlights: List<HighlightEntity>,
+    searchQuery: String,
     isSpoken: Boolean,
     onLongPress: (String) -> Unit,
     onDoubleTap: (String) -> Unit,
@@ -586,7 +676,9 @@ private fun BlockItem(
                 else -> MaterialTheme.typography.titleMedium
             }
             Text(
-                text = block.text,
+                text = remember(block.text, searchQuery) {
+                    buildAnnotatedString { append(block.text); addSearchSpans(block.text, searchQuery) }
+                },
                 style = style,
                 modifier = Modifier
                     .fillMaxWidth()
@@ -617,6 +709,7 @@ private fun BlockItem(
             text = block.text,
             isQuote = false,
             paraHighlights = paraHighlights,
+            searchQuery = searchQuery,
             isSpoken = isSpoken,
             onLongPress = onLongPress,
             onDoubleTap = onDoubleTap,
@@ -627,6 +720,7 @@ private fun BlockItem(
             text = block.text,
             isQuote = true,
             paraHighlights = paraHighlights,
+            searchQuery = searchQuery,
             isSpoken = isSpoken,
             onLongPress = onLongPress,
             onDoubleTap = onDoubleTap,
@@ -652,6 +746,7 @@ private fun HighlightableText(
     text: String,
     isQuote: Boolean,
     paraHighlights: List<HighlightEntity>,
+    searchQuery: String,
     isSpoken: Boolean,
     onLongPress: (String) -> Unit,
     onDoubleTap: (String) -> Unit,
@@ -659,7 +754,7 @@ private fun HighlightableText(
 ) {
     // Render each highlight whose text is a substring of the paragraph as an inline
     // background span; if any highlight doesn't match, tint the whole paragraph.
-    val annotated = remember(text, paraHighlights) {
+    val annotated = remember(text, paraHighlights, searchQuery) {
         buildAnnotatedString {
             append(text)
             for (h in paraHighlights) {
@@ -668,6 +763,7 @@ private fun HighlightableText(
                     addStyle(SpanStyle(background = HighlightSpanColor), start, start + h.text.length)
                 }
             }
+            addSearchSpans(text, searchQuery)
         }
     }
     val hasUnmatchedHighlight = remember(text, paraHighlights) {
