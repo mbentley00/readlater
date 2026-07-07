@@ -12,7 +12,7 @@
 //   TTS_SAMPLE_RATE default 24000 (Kokoro's native rate)
 
 const DEFAULT_URL = 'https://api.deepinfra.com/v1/openai/audio/speech';
-const MAX_CHUNK_CHARS = 1800; // keep each API call within limits
+const MAX_CHUNK_CHARS = 1000; // keep each API call well within provider limits
 
 const cfg = () => ({
   url: process.env.TTS_API_URL || DEFAULT_URL,
@@ -115,8 +115,21 @@ async function synthChunk(text) {
     headers: { Authorization: `Bearer ${c.key}`, 'Content-Type': 'application/json' },
     body: JSON.stringify({ model: c.model, voice: c.voice, input: text, response_format: 'wav' }),
   });
-  if (!resp.ok) throw new Error(`tts api ${resp.status}: ${(await resp.text()).slice(0, 200)}`);
-  return Buffer.from(await resp.arrayBuffer());
+  if (!resp.ok) {
+    throw new Error(`tts api ${resp.status}: ${(await resp.text()).slice(0, 200)}`);
+  }
+  const buf = Buffer.from(await resp.arrayBuffer());
+  // Punctuation-only / trivial input can yield an empty 200 — skip it rather
+  // than fail the whole article.
+  if (buf.length === 0) return null;
+  // Otherwise a non-WAV body is a genuine error — surface exactly what came
+  // back (a JSON error, base64 wrapper, etc.) so it's diagnosable.
+  if (buf.length < 44 || buf.toString('ascii', 0, 4) !== 'RIFF') {
+    const ct = resp.headers.get('content-type') || '?';
+    const snippet = buf.toString('utf8', 0, 200).replace(/\s+/g, ' ');
+    throw new Error(`non-WAV response (ct=${ct}, ${buf.length}B, chars=${text.length}): ${snippet}`);
+  }
+  return buf;
 }
 
 /**
@@ -137,7 +150,12 @@ async function synthesizeArticle(article) {
   for (const para of paragraphs) {
     paragraphOffsetsMs.push(bytesToMs(totalBytes));
     for (const chunk of chunkText(para)) {
-      const wav = await synthChunk(chunk);
+      const text = chunk.trim();
+      // Skip chunks with nothing to say (empty, or punctuation/symbols only) —
+      // those return empty audio and break the request.
+      if (!text || !/[\p{L}\p{N}]/u.test(text)) continue;
+      const wav = await synthChunk(text);
+      if (!wav) continue; // provider returned empty audio for this chunk
       const { pcm, sampleRate: sr } = pcmOf(wav);
       sampleRate = sr;
       pcmParts.push(pcm);
