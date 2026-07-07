@@ -22,7 +22,7 @@ function notify(title, message) {
 async function savePage(tabId) {
   const { serverUrl, token } = await getSettings();
   if (!serverUrl || !token) {
-    notify('ReadLater: not configured', 'Set your server URL and token in the extension options first.');
+    notify('Earmark: not configured', 'Set your server URL and token in the extension options first.');
     browser.runtime.openOptionsPage();
     return { ok: false, error: 'not configured' };
   }
@@ -40,11 +40,11 @@ async function savePage(tabId) {
     });
     article = results && results[0];
   } catch (e) {
-    notify('ReadLater: cannot read this page', String(e.message || e));
+    notify('Earmark: cannot read this page', String(e.message || e));
     return { ok: false, error: `This page cannot be captured (${e.message || e})` };
   }
   if (!article || !article.html) {
-    notify('ReadLater: nothing to save', 'Could not find article content on this page.');
+    notify('Earmark: nothing to save', 'Could not find article content on this page.');
     return { ok: false, error: 'no article content found' };
   }
 
@@ -61,10 +61,10 @@ async function savePage(tabId) {
       const body = await res.text();
       throw new Error(`server replied ${res.status}: ${body.slice(0, 200)}`);
     }
-    notify('Saved to ReadLater', article.title);
+    notify('Saved to Earmark', article.title);
     return { ok: true, title: article.title };
   } catch (e) {
-    notify('ReadLater: save failed', String(e.message || e));
+    notify('Earmark: save failed', String(e.message || e));
     return { ok: false, error: String(e.message || e) };
   }
 }
@@ -72,7 +72,7 @@ async function savePage(tabId) {
 // Context menu.
 browser.contextMenus.create({
   id: 'readlater-save',
-  title: 'Save page to ReadLater',
+  title: 'Save page to Earmark',
   contexts: ['page', 'selection', 'link', 'image', 'video', 'audio', 'frame', 'editable'],
 });
 browser.contextMenus.onClicked.addListener((info, tab) => {
@@ -83,6 +83,11 @@ browser.contextMenus.onClicked.addListener((info, tab) => {
 browser.commands.onCommand.addListener(async (command) => {
   if (command !== 'save-page') return;
   const [tab] = await browser.tabs.query({ active: true, currentWindow: true });
+  if (tab) savePage(tab.id);
+});
+
+// Toolbar icon: save the current page immediately (no popup / extra click).
+browser.browserAction.onClicked.addListener((tab) => {
   if (tab) savePage(tab.id);
 });
 

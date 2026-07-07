@@ -1,8 +1,8 @@
 {
   "manifest_version": 2,
-  "name": "ReadLater — Save to your reader",
-  "version": "1.0.2",
-  "description": "Save the current page — exactly as rendered in your browser — to your self-hosted ReadLater server for reading in the Android app.",
+  "name": "Earmark — Save to your reader",
+  "version": "1.0.3",
+  "description": "Save the current page — exactly as rendered in your browser — to your self-hosted Earmark server for reading in the Android app.",
   "icons": {
     "48": "icons/icon.svg",
     "96": "icons/icon.svg"
@@ -18,8 +18,7 @@
   },
   "browser_action": {
     "default_icon": "icons/icon.svg",
-    "default_title": "Save to ReadLater",
-    "default_popup": "popup.html"
+    "default_title": "Save to Earmark"
   },
   "options_ui": {
     "page": "options.html",

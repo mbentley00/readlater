@@ -249,6 +249,7 @@ function pubHighlight(h) {
 }
 
 const searchArticles = (user, opts) => store.searchArticles(user.id, opts);
+const countArticles = (user, opts) => store.countArticles(user.id, opts);
 
 function json(res, status, obj) {
   const body = JSON.stringify(obj);
@@ -312,7 +313,7 @@ const ctx = {
   store, newId, sanitizeString, readBody, parseBody,
   createUser, verifyPassword, findUserByName, newEmailAlias,
   createSession, sessionCookie, getSessionUser, destroySession,
-  searchArticles, hostOf,
+  searchArticles, countArticles, hostOf,
   ALLOW_SIGNUP, INBOUND_DOMAIN, APK_FILE,
 };
 

@@ -119,6 +119,45 @@ const countWords = (s) => {
 };
 const articleWordCount = (a) => countWords(a.textContent || htmlToText(a.html));
 
+const ARTICLE_SORTS = {
+  newest: 'a.savedAt DESC',
+  oldest: 'a.savedAt ASC',
+  longest: 'a.wordCount DESC',
+  shortest: 'a.wordCount ASC',
+};
+
+/** Shared WHERE builder for searchArticles + countArticles. */
+function buildArticleWhere(userId, {
+  q = '', domain = '', highlighted = false, includeArchived = false, since = 0,
+  favoriteOnly = false, archivedOnly = false, minWords = 0, maxWords = 0, minHighlights = 0,
+} = {}) {
+  const where = ['a.userId = @userId'];
+  const args = { userId };
+  if (archivedOnly) where.push('a.archived = 1');
+  else if (!includeArchived) where.push('a.archived = 0');
+  if (favoriteOnly) where.push('a.favorite = 1');
+  if (since) { where.push('a.updatedAt > @since'); args.since = since; }
+  if (domain) {
+    const d = String(domain).toLowerCase().replace(/^www\./, '');
+    where.push("(a.domain = @domain OR a.domain LIKE '%.' || @domain)");
+    args.domain = d;
+  }
+  if (minWords > 0) { where.push('a.wordCount >= @minWords'); args.minWords = minWords; }
+  if (maxWords > 0) { where.push('a.wordCount <= @maxWords'); args.maxWords = maxWords; }
+  if (minHighlights > 0) {
+    where.push('(SELECT COUNT(*) FROM highlights h WHERE h.articleId = a.id) >= @minHighlights');
+    args.minHighlights = minHighlights;
+  } else if (highlighted) {
+    where.push('EXISTS (SELECT 1 FROM highlights h WHERE h.articleId = a.id)');
+  }
+  const match = ftsQuery(q);
+  if (match) {
+    where.push('a.rowid IN (SELECT rowid FROM articles_fts WHERE articles_fts MATCH @match)');
+    args.match = match;
+  }
+  return { where, args };
+}
+
 /** Turn a user query into an FTS5 MATCH expression: each term quoted, prefix-matched, ANDed. */
 function ftsQuery(q) {
   const terms = String(q).split(/\s+/).filter(Boolean);
@@ -233,35 +272,25 @@ function open(dataDir) {
      * Search/filter a user's articles (metadata only — html/textContent never
      * leave the database here). All filters optional; newest first.
      */
-    searchArticles: (userId, { q = '', domain = '', highlighted = false, includeArchived = false, since = 0, favoriteOnly = false, archivedOnly = false, minWords = 0, maxWords = 0, minHighlights = 0 } = {}) => {
-      const where = ['a.userId = @userId'];
-      const args = { userId };
-      if (archivedOnly) where.push('a.archived = 1');
-      else if (!includeArchived) where.push('a.archived = 0');
-      if (favoriteOnly) where.push('a.favorite = 1');
-      if (since) { where.push('a.updatedAt > @since'); args.since = since; }
-      if (domain) {
-        const d = String(domain).toLowerCase().replace(/^www\./, '');
-        where.push("(a.domain = @domain OR a.domain LIKE '%.' || @domain)");
-        args.domain = d;
-      }
-      if (minWords > 0) { where.push('a.wordCount >= @minWords'); args.minWords = minWords; }
-      if (maxWords > 0) { where.push('a.wordCount <= @maxWords'); args.maxWords = maxWords; }
-      if (minHighlights > 0) {
-        where.push('(SELECT COUNT(*) FROM highlights h WHERE h.articleId = a.id) >= @minHighlights');
-        args.minHighlights = minHighlights;
-      } else if (highlighted) {
-        where.push('EXISTS (SELECT 1 FROM highlights h WHERE h.articleId = a.id)');
-      }
-      const match = ftsQuery(q);
-      if (match) {
-        where.push('a.rowid IN (SELECT rowid FROM articles_fts WHERE articles_fts MATCH @match)');
-        args.match = match;
-      }
-      const sql = `SELECT a.id, a.userId, a.url, a.domain, a.savedAt, a.archived, a.favorite, a.readParagraph,
+    searchArticles: (userId, filters = {}) => {
+      const { where, args } = buildArticleWhere(userId, filters);
+      const order = ARTICLE_SORTS[filters.sort] || ARTICLE_SORTS.newest;
+      let sql = `SELECT a.id, a.userId, a.url, a.domain, a.savedAt, a.archived, a.favorite, a.readParagraph,
           a.ttsParagraph, a.title, a.byline, a.siteName, a.excerpt, a.wordCount, a.updatedAt
-        FROM articles a WHERE ${where.join(' AND ')} ORDER BY a.savedAt DESC`;
+        FROM articles a WHERE ${where.join(' AND ')} ORDER BY ${order}`;
+      const lim = Number(filters.limit) || 0;
+      if (lim > 0) {
+        sql += ' LIMIT @limit OFFSET @offset';
+        args.limit = lim;
+        args.offset = Math.max(0, Number(filters.offset) || 0);
+      }
       return sqlite.prepare(sql).all(args).map(rowArticle);
+    },
+
+    /** Total count for the same filters (for pagination). */
+    countArticles: (userId, filters = {}) => {
+      const { where, args } = buildArticleWhere(userId, filters);
+      return sqlite.prepare(`SELECT COUNT(*) c FROM articles a WHERE ${where.join(' AND ')}`).get(args).c;
     },
 
     domainCounts: (userId) =>
@@ -276,11 +305,28 @@ function open(dataDir) {
       FROM highlights h LEFT JOIN articles a ON a.id = h.articleId
       WHERE h.userId = ? ORDER BY h.createdAt DESC`).all(userId),
     /** Articles that have highlights, with counts — for the highlights page. */
-    highlightedArticles: (userId) =>
-      prep('hla', `SELECT a.id, a.title, a.siteName, a.savedAt, a.wordCount,
+    highlightedArticles: (userId, { q = '', limit = 0, offset = 0 } = {}) => {
+      const match = ftsQuery(q);
+      const filter = match ? 'AND a.rowid IN (SELECT rowid FROM articles_fts WHERE articles_fts MATCH @match)' : '';
+      let sql = `SELECT a.id, a.title, a.siteName, a.savedAt, a.wordCount,
           COUNT(h.id) AS n, MAX(h.createdAt) AS lastHighlightAt
         FROM highlights h JOIN articles a ON a.id = h.articleId
-        WHERE h.userId = ? GROUP BY a.id ORDER BY lastHighlightAt DESC`).all(userId),
+        WHERE h.userId = @userId ${filter}
+        GROUP BY a.id ORDER BY lastHighlightAt DESC`;
+      const args = { userId };
+      if (match) args.match = match;
+      if (limit > 0) { sql += ' LIMIT @limit OFFSET @offset'; args.limit = limit; args.offset = Math.max(0, offset); }
+      return sqlite.prepare(sql).all(args);
+    },
+    highlightedArticlesCount: (userId, { q = '' } = {}) => {
+      const match = ftsQuery(q);
+      const filter = match ? 'AND a.rowid IN (SELECT rowid FROM articles_fts WHERE articles_fts MATCH @match)' : '';
+      const sql = `SELECT COUNT(*) c FROM (SELECT a.id FROM highlights h JOIN articles a ON a.id = h.articleId
+        WHERE h.userId = @userId ${filter} GROUP BY a.id)`;
+      const args = { userId };
+      if (match) args.match = match;
+      return sqlite.prepare(sql).get(args).c;
+    },
 
     highlightCountsByArticle: (userId) => {
       const out = new Map();

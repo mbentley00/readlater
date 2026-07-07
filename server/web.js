@@ -47,6 +47,9 @@ ul.articles .title:hover { color:var(--accent); }
 .meta { color:var(--muted); font-size:.8rem; font-family: system-ui, sans-serif; margin-top:.15rem; }
 .actions { display:flex; gap:.35rem; font-family: system-ui, sans-serif; }
 button.act { background:none; border:1px solid var(--line); border-radius:6px; color:var(--muted); cursor:pointer; font-size:.78rem; padding:.15rem .5rem; }
+.pager { display:flex; gap:1rem; align-items:center; justify-content:center; margin:1.5rem 0; }
+.pager .act { padding:.35rem .8rem; text-decoration:none; }
+.pager .act.disabled { opacity:.35; pointer-events:none; }
 button.act:hover { color:var(--fg); border-color:var(--muted); }
 button.act.fav { border:none; font-size:1rem; }
 .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:1.6rem; max-width:22rem; margin:4rem auto; font-family:system-ui,sans-serif; }
@@ -63,7 +66,17 @@ article.reader img { max-width:100%; height:auto; }
 article.reader .content { overflow-wrap:break-word; }
 article.reader .content pre { overflow-x:auto; background:var(--card); padding:.8rem; border-radius:8px; font-size:.85rem; }
 article.reader .content blockquote { border-left:3px solid var(--line); margin-left:0; padding-left:1rem; color:var(--muted); }
-mark[data-hl] { background:var(--mark); color:inherit; padding:0 .1em; border-radius:2px; }
+mark[data-hl], mark[data-hl-id] { background:var(--mark); color:inherit; padding:0 .1em; border-radius:2px; }
+mark.flash { animation: hlflash 1.6s ease; }
+@keyframes hlflash { 0%,100% { background:var(--mark); } 25% { background:var(--accent); color:var(--accent-fg); } }
+.hl-panel { position:fixed; top:0; right:0; height:100%; width:min(360px,88vw); background:var(--card); border-left:1px solid var(--line); box-shadow:-4px 0 24px rgba(0,0,0,.15); overflow-y:auto; z-index:50; font-family:system-ui,sans-serif; }
+.hl-panel-head { display:flex; align-items:center; justify-content:space-between; padding:.9rem 1rem; border-bottom:1px solid var(--line); position:sticky; top:0; background:var(--card); }
+.hl-panel-body { padding:.5rem; }
+.hl-item { padding:.7rem .8rem; border-radius:8px; cursor:pointer; border:1px solid transparent; }
+.hl-item:hover { background:var(--bg); border-color:var(--line); }
+.hl-item-text { font-size:.9rem; line-height:1.45; }
+.hl-item .note { font-size:.8rem; color:var(--muted); margin-top:.3rem; font-style:italic; }
+.hl-item-actions { margin-top:.4rem; }
 .hl-block { border-left:3px solid var(--accent); padding:.2rem 0 .2rem 1rem; margin:1rem 0; }
 .hl-block .note { color:var(--muted); font-size:.9rem; }
 .hl-block .from { font-size:.8rem; font-family:system-ui,sans-serif; margin-top:.2rem; }
@@ -174,6 +187,9 @@ function filtersFromParams(get) {
   };
 }
 
+const PAGE_SIZE = 50;
+const SORTS = { newest: 'Newest', oldest: 'Oldest', longest: 'Longest', shortest: 'Shortest' };
+
 function listPage(ctx, user, view, url) {
   const get = (k) => url.searchParams.get(k) || '';
   const savedViews = ctx.store.listViews(user.id);
@@ -183,19 +199,27 @@ function listPage(ctx, user, view, url) {
   const domain = get('domain').trim();
   const hl = get('hl') || (get('highlighted') === '1' ? '1' : '');
   const len = get('len');
+  const sort = SORTS[get('sort')] ? get('sort') : 'newest';
   const searching = Boolean(q || domain || hl || len);
+  const pageNum = Math.max(1, parseInt(get('page'), 10) || 1);
+  const offset = (pageNum - 1) * PAGE_SIZE;
+  const paging = { sort, limit: PAGE_SIZE, offset };
 
-  let list, empty;
+  // Base filters that define the current view/search (used for both list + count).
+  let baseFilters, empty;
   if (savedView) {
-    list = ctx.searchArticles(user, { ...savedView.filters, includeArchived: !!savedView.filters.includeArchived });
+    baseFilters = { ...savedView.filters, includeArchived: !!savedView.filters.includeArchived };
     empty = 'No articles match this view.';
   } else if (searching) {
-    // search spans all views (archived included)
-    list = ctx.searchArticles(user, { ...filtersFromParams(get), includeArchived: true });
+    baseFilters = { ...filtersFromParams(get), includeArchived: true }; // search spans all
     empty = 'No articles match this search.';
-  } else if (view === 'favorites') { list = ctx.searchArticles(user, { favoriteOnly: true, includeArchived: true }); empty = 'No favorites yet — star an article to keep it here.'; }
-  else if (view === 'archive') { list = ctx.searchArticles(user, { archivedOnly: true }); empty = 'Nothing archived yet.'; }
-  else { list = ctx.searchArticles(user, {}); empty = 'Inbox empty — save something with the Firefox extension, or check <a href="/settings">Settings</a> to connect it.'; }
+  } else if (view === 'favorites') { baseFilters = { favoriteOnly: true, includeArchived: true }; empty = 'No favorites yet — star an article to keep it here.'; }
+  else if (view === 'archive') { baseFilters = { archivedOnly: true }; empty = 'Nothing archived yet.'; }
+  else { baseFilters = {}; empty = 'Inbox empty — save something with the Firefox extension, or check <a href="/settings">Settings</a> to connect it.'; }
+
+  const total = ctx.countArticles(user, baseFilters);
+  const list = ctx.searchArticles(user, { ...baseFilters, ...paging });
+  const pageCount = Math.max(1, Math.ceil(total / PAGE_SIZE));
 
   // domain dropdown: every domain this user has saved from, with counts
   const domainOptions = ctx.store.domainCounts(user.id)
@@ -220,9 +244,22 @@ function listPage(ctx, user, view, url) {
   <button class="act" type="submit">Save as view</button>
 </form>` : '';
 
+  const viewParam = get('view');
+  // Build a URL preserving the current view/filters/sort with overrides.
+  const buildQs = (overrides) => {
+    const cur = { view: viewParam, q, domain, len, hl, sort, ...overrides };
+    const p = new URLSearchParams();
+    for (const [k, v] of Object.entries(cur)) if (v && !(k === 'sort' && v === 'newest')) p.set(k, String(v));
+    const s = p.toString();
+    return s ? `/?${s}` : '/';
+  };
+  const sortOptions = Object.entries(SORTS)
+    .map(([k, label]) => `<option value="${k}" ${k === sort ? 'selected' : ''}>${label}</option>`).join('');
+
   const searchForm = `
 ${viewChips}
 <form class="search" method="get" action="/">
+  ${viewParam ? `<input type="hidden" name="view" value="${escapeHtml(viewParam)}">` : ''}
   <input type="search" name="q" value="${escapeHtml(q)}" placeholder="Search title, author, text…">
   <select name="domain"><option value="">All domains</option>${domainOptions}</select>
   <select name="len">
@@ -236,12 +273,19 @@ ${viewChips}
     <option value="1" ${hl === '1' ? 'selected' : ''}>has highlights</option>
     <option value="3" ${hl === '3' ? 'selected' : ''}>3+ highlights</option>
   </select>
+  <select name="sort">${sortOptions}</select>
   <button class="act" type="submit">Search</button>
-  ${searching || savedView ? '<a class="back" href="/">Clear</a>' : ''}
+  ${searching || savedView ? `<a class="back" href="${viewParam ? `/?view=${escapeHtml(viewParam)}` : '/'}">Clear</a>` : ''}
 </form>
-${savedView ? `<div class="meta">${list.length} article${list.length === 1 ? '' : 's'} in “${escapeHtml(savedView.name)}”</div>` : ''}
-${searching && !savedView ? `<div class="meta">${list.length} result${list.length === 1 ? '' : 's'}${q ? ` for “${escapeHtml(q)}”` : ''}${domain ? ` from ${escapeHtml(domain)}` : ''}</div>${saveViewForm}` : ''}
-${!searching && !savedView ? `<div class="meta">${list.length.toLocaleString('en-US')} article${list.length === 1 ? '' : 's'}</div>` : ''}`;
+${savedView ? `<div class="meta">${total.toLocaleString('en-US')} article${total === 1 ? '' : 's'} in “${escapeHtml(savedView.name)}”</div>` : ''}
+${searching && !savedView ? `<div class="meta">${total.toLocaleString('en-US')} result${total === 1 ? '' : 's'}${q ? ` for “${escapeHtml(q)}”` : ''}${domain ? ` from ${escapeHtml(domain)}` : ''}</div>${saveViewForm}` : ''}
+${!searching && !savedView ? `<div class="meta">${total.toLocaleString('en-US')} article${total === 1 ? '' : 's'}</div>` : ''}`;
+
+  const pager = pageCount > 1 ? `<div class="pager">
+  ${pageNum > 1 ? `<a class="act" href="${buildQs({ page: pageNum - 1 })}">← Prev</a>` : '<span class="act disabled">← Prev</span>'}
+  <span class="meta">Page ${pageNum} of ${pageCount}</span>
+  ${pageNum < pageCount ? `<a class="act" href="${buildQs({ page: pageNum + 1 })}">Next →</a>` : '<span class="act disabled">Next →</span>'}
+</div>` : '';
 
   const hlCounts = ctx.store.highlightCountsByArticle(user.id);
   const items = list.map((a) => {
@@ -271,7 +315,7 @@ ${!searching && !savedView ? `<div class="meta">${list.length.toLocaleString('en
 </div>`;
 
   const body = searchForm + importBar + (list.length
-    ? `<ul class="articles">${items}</ul>`
+    ? `<ul class="articles">${items}</ul>${pager}`
     : `<div class="empty">${empty}</div>`);
 
   const script = `
@@ -324,12 +368,11 @@ if (pdfFile) pdfFile.addEventListener('change', async () => {
 function readerPage(ctx, user, article) {
   const hls = ctx.store.highlightsForArticle(article.id);
   const meta = [article.siteName, article.byline, fmtDate(article.savedAt)].filter(Boolean).map(escapeHtml).join(' · ');
-  const hlSection = hls.length ? `
-  <section>
-    <h2>Highlights</h2>
-    ${hls.map((h) => `<div class="hl-block"><div>${escapeHtml(h.text)}</div>${h.note ? `<div class="note">${escapeHtml(h.note)}</div>` : ''}
-      <div class="from meta"><button class="act" data-act="del-hl" data-id="${h.id}">Delete</button></div></div>`).join('\n')}
-  </section>` : '';
+  const hlItems = hls.map((h) => `<div class="hl-item" data-hl-id="${h.id}">
+      <div class="hl-item-text">${escapeHtml(h.text)}</div>
+      ${h.note ? `<div class="note">${escapeHtml(h.note)}</div>` : ''}
+      <div class="hl-item-actions"><button class="act del-hl" data-id="${h.id}">Delete</button></div>
+    </div>`).join('\n');
 
   const body = `
 <a class="back" href="/">&larr; Back to list</a>
@@ -340,33 +383,54 @@ function readerPage(ctx, user, article) {
     <div class="actions reader-actions">
       <button class="act fav" data-act="favorite" data-val="${article.favorite ? 'false' : 'true'}" title="Favorite">${article.favorite ? '★' : '☆'}</button>
       <button class="act" data-act="archive" data-val="${article.archived ? 'false' : 'true'}">${article.archived ? 'Unarchive' : 'Archive'}</button>
+      <button class="act" id="hl-toggle">Highlights (${hls.length})</button>
     </div>
     <div class="meta">Select any text to highlight it.</div>
   </header>
   <div class="content" id="content">${article.html}</div>
 </article>
-${hlSection}
+<aside id="hl-panel" class="hl-panel" hidden>
+  <div class="hl-panel-head"><strong>Highlights (${hls.length})</strong><button class="act" id="hl-close">×</button></div>
+  <div class="hl-panel-body">${hls.length ? hlItems : '<div class="meta">No highlights yet. Select text in the article to add one.</div>'}</div>
+</aside>
 <div id="hl-tip" hidden><button id="hl-save">Highlight</button></div>`;
 
   const script = `
 const ARTICLE = ${JSON.stringify(article.id)};
 
-// mark existing highlights in the rendered article (best-effort text match)
-const HLS = ${JSON.stringify(hls.map((h) => h.text))};
+// mark existing highlights in the rendered article (best-effort text match),
+// tagging each mark with its highlight id so the side panel can jump to it.
+const HLS = ${JSON.stringify(hls.map((h) => ({ id: h.id, text: h.text })))};
 const root = document.getElementById('content');
-for (const text of HLS) {
+for (const h of HLS) {
   const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
   let node;
   while ((node = walker.nextNode())) {
-    const i = node.nodeValue.indexOf(text);
+    const i = node.nodeValue.indexOf(h.text);
     if (i < 0) continue;
     const range = document.createRange();
-    range.setStart(node, i); range.setEnd(node, i + text.length);
-    const mark = document.createElement('mark'); mark.dataset.hl = '1';
+    range.setStart(node, i); range.setEnd(node, i + h.text.length);
+    const mark = document.createElement('mark'); mark.dataset.hlId = h.id;
     try { range.surroundContents(mark); } catch (e) {}
     break;
   }
 }
+
+// Highlights side panel: toggle, jump-to, and delete.
+const panel = document.getElementById('hl-panel');
+document.getElementById('hl-toggle').addEventListener('click', () => { panel.hidden = !panel.hidden; });
+document.getElementById('hl-close').addEventListener('click', () => { panel.hidden = true; });
+document.querySelectorAll('.hl-item').forEach((item) => {
+  item.addEventListener('click', (e) => {
+    if (e.target.closest('button')) return;
+    const mark = root.querySelector('mark[data-hl-id="' + CSS.escape(item.dataset.hlId) + '"]');
+    if (mark) {
+      mark.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      mark.classList.add('flash');
+      setTimeout(() => mark.classList.remove('flash'), 1600);
+    }
+  });
+});
 
 // archive/favorite/delete-highlight buttons
 document.addEventListener('click', async (e) => {
@@ -409,10 +473,24 @@ document.getElementById('hl-save').addEventListener('mousedown', async (e) => {
   return { body, script };
 }
 
-function highlightsPage(ctx, user) {
+function highlightsPage(ctx, user, url) {
   // Grouped by article: which articles have highlights and how many. The
   // highlights themselves live on each article's reader page.
-  const arts = ctx.store.highlightedArticles(user.id);
+  const get = (k) => (url && url.searchParams.get(k)) || '';
+  const q = get('q').trim();
+  const pageNum = Math.max(1, parseInt(get('page'), 10) || 1);
+  const offset = (pageNum - 1) * PAGE_SIZE;
+
+  const total = ctx.store.highlightedArticlesCount(user.id, { q });
+  const arts = ctx.store.highlightedArticles(user.id, { q, limit: PAGE_SIZE, offset });
+  const pageCount = Math.max(1, Math.ceil(total / PAGE_SIZE));
+  const buildQs = (o) => {
+    const p = new URLSearchParams();
+    for (const [k, v] of Object.entries({ q, ...o })) if (v) p.set(k, String(v));
+    const s = p.toString();
+    return s ? `/highlights?${s}` : '/highlights';
+  };
+
   const items = arts.map((a) => {
     const meta = [
       a.siteName,
@@ -425,10 +503,24 @@ function highlightsPage(ctx, user) {
       <div class="actions"><span class="hl-count">${a.n} highlight${a.n > 1 ? 's' : ''}</span></div>
     </li>`;
   }).join('\n');
+
+  const pager = pageCount > 1 ? `<div class="pager">
+  ${pageNum > 1 ? `<a class="act" href="${buildQs({ page: pageNum - 1 })}">← Prev</a>` : '<span class="act disabled">← Prev</span>'}
+  <span class="meta">Page ${pageNum} of ${pageCount}</span>
+  ${pageNum < pageCount ? `<a class="act" href="${buildQs({ page: pageNum + 1 })}">Next →</a>` : '<span class="act disabled">Next →</span>'}
+</div>` : '';
+
+  const searchForm = `<form class="search" method="get" action="/highlights">
+  <input type="search" name="q" value="${escapeHtml(q)}" placeholder="Search highlighted articles…">
+  <button class="act" type="submit">Search</button>
+  ${q ? '<a class="back" href="/highlights">Clear</a>' : ''}
+</form>`;
+
   const body = `<h1>Highlights</h1>
-${arts.length ? `<div class="meta">${arts.length} article${arts.length === 1 ? '' : 's'} with highlights — open one to read them in place.</div>
-<ul class="articles">${items}</ul>`
-    : '<div class="empty">No highlights yet — long-press a paragraph in the Android app, or select text in the reader.</div>'}
+${searchForm}
+${total ? `<div class="meta">${total.toLocaleString('en-US')} article${total === 1 ? '' : 's'} with highlights — open one to read them in place.</div>
+<ul class="articles">${items}</ul>${pager}`
+    : `<div class="empty">${q ? 'No highlighted articles match that search.' : 'No highlights yet — long-press a paragraph in the Android app, or select text in the reader.'}</div>`}
 <p class="meta"><a href="/api/highlights/export.md">Export all as Markdown</a></p>`;
   return { body, script: '' };
 }
@@ -579,7 +671,7 @@ async function handle(ctx, req, res, url) {
     const article = ctx.store.getArticle(parts[1], user.id);
     if (article) { made = readerPage(ctx, user, article); title = article.title; active = ''; }
   } else if (route === 'GET /highlights') {
-    made = highlightsPage(ctx, user); title = 'Highlights'; active = 'highlights';
+    made = highlightsPage(ctx, user, url); title = 'Highlights'; active = 'highlights';
   } else if (route === 'GET /settings') {
     made = settingsPage(ctx, user, url, req); title = 'Settings'; active = 'settings';
   } else if (route === 'GET /favicon.ico') {
