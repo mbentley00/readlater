@@ -11,7 +11,6 @@ import android.content.pm.ServiceInfo
 import android.media.AudioAttributes
 import android.media.AudioFocusRequest
 import android.media.AudioManager
-import android.media.MediaPlayer
 import android.os.Build
 import android.os.Handler
 import android.os.IBinder
@@ -314,10 +313,10 @@ class TtsService : Service() {
         isPlaying = false
         playToken++          // invalidate any pending watchdog
         cancelAudioWatchdog()
-        if (!usingSpeakFallback && player?.isPlaying == true) {
-            // keep the exact position so resume continues mid-sentence
-            runCatching { resumePositionMs = player?.currentPosition ?: 0 }
-            runCatching { player?.pause() }
+        if (!usingSpeakFallback && audioTrack != null) {
+            // remember the exact position so resume continues mid-sentence
+            resumePositionMs = trackPositionMs()
+            releasePlayer()
         } else {
             tts?.stop() // fallback speak(): position is lost, resume re-speaks
         }
@@ -604,15 +603,19 @@ class TtsService : Service() {
         }
     }
 
-    // Playback: the engine SYNTHESIZES each paragraph to a file which we play
-    // with our OWN MediaPlayer. That is what makes Android route headset media
-    // buttons to us — with speak(), the engine's process owns the audio so the
-    // buttons went to the last music app. MediaPlayer also gives true
-    // mid-sentence pause/resume via seek. If an engine can't synthesize a
-    // usable file, we fall back to speak() for the session (audio still plays,
-    // just without reliable headset routing).
-    private var player: MediaPlayer? = null
-    private var playerFd: android.os.ParcelFileDescriptor? = null
+    // Playback: the engine SYNTHESIZES each paragraph to a WAV file; we read the
+    // raw PCM and stream it to an AudioTrack in OUR process. MediaPlayer failed
+    // here (the media service can't decode/route our private files), and — more
+    // importantly — audio played by our process is what makes Android route the
+    // headset media buttons to Earmark instead of the last music app. Pause/
+    // resume seeks by byte offset for true mid-sentence resume. If a file can't
+    // be parsed/played we fall back to speak() (audio works, buttons may not).
+    private var audioTrack: android.media.AudioTrack? = null
+    private var playThread: Thread? = null
+    @Volatile private var playThreadGen = 0
+    private var trackSampleRate = 22050
+    private var trackChannels = 1
+    private var trackStartMs = 0
     private var preparedIdx = -1
     private val readyFiles = mutableSetOf<Int>()
     private val synthesizing = mutableSetOf<Int>()
@@ -626,12 +629,22 @@ class TtsService : Service() {
 
     private fun synthFile(idx: Int) = java.io.File(cacheDir, "tts-$idx.wav")
 
+    /** ms already played on the current AudioTrack, from its playback head. */
+    private fun trackPositionMs(): Int {
+        val t = audioTrack ?: return trackStartMs
+        val frames = runCatching { t.playbackHeadPosition.toLong() and 0xFFFFFFFFL }.getOrDefault(0L)
+        return trackStartMs + (frames * 1000L / trackSampleRate).toInt()
+    }
+
     private fun releasePlayer() {
-        runCatching { player?.release() }
-        runCatching { playerFd?.close() }
-        player = null
-        playerFd = null
+        playThreadGen++            // signal any streaming thread to stop
+        val t = audioTrack
+        audioTrack = null
+        playThread = null
         preparedIdx = -1
+        runCatching { t?.pause() }
+        runCatching { t?.flush() }
+        runCatching { t?.release() }
     }
 
     /** Release the player and forget the paused position (position changed). */
@@ -733,18 +746,12 @@ class TtsService : Service() {
         playParagraph(idx, 0)
     }
 
-    /** Resume: continue the current paragraph from where we paused. */
+    /** Resume: continue the current paragraph from where we paused (we release
+     *  the AudioTrack on pause, so we re-stream from the saved byte offset). */
     private fun resumeSpeaking() {
-        if (!usingSpeakFallback && player != null && preparedIdx == currentIndex) {
-            audioStarted = true
-            runCatching { player?.start() }
-            logDbg("resume player idx=$currentIndex at ${resumePositionMs}ms")
-            publishState(); updatePlaybackState(); updateNotification()
-        } else {
-            val idx = nextSpeakable(currentIndex) ?: run { handleStop(); return }
-            currentIndex = idx
-            playParagraph(idx, resumePositionMs)
-        }
+        val idx = nextSpeakable(currentIndex) ?: run { handleStop(); return }
+        currentIndex = idx
+        playParagraph(idx, if (usingSpeakFallback) 0 else resumePositionMs)
     }
 
     private fun playParagraph(idx: Int, fromMs: Int) {
@@ -779,49 +786,125 @@ class TtsService : Service() {
         }
     }
 
+    /** Parsed PCM WAV layout. */
+    private data class WavInfo(val sampleRate: Int, val channels: Int, val bits: Int, val dataOffset: Long, val dataLen: Long)
+
+    private fun parseWav(file: java.io.File): WavInfo? = try {
+        java.io.RandomAccessFile(file, "r").use { raf ->
+            val riff = ByteArray(12); raf.readFully(riff)
+            fun tag(b: ByteArray, o: Int) = String(b, o, 4, Charsets.US_ASCII)
+            if (tag(riff, 0) != "RIFF" || tag(riff, 8) != "WAVE") return null
+            var sampleRate = 0; var channels = 0; var bits = 0
+            var dataOffset = -1L; var dataLen = 0L
+            val hdr = ByteArray(8)
+            while (raf.filePointer + 8 <= raf.length()) {
+                raf.readFully(hdr)
+                val id = tag(hdr, 0)
+                // little-endian chunk size
+                val size = ((hdr[4].toLong() and 0xFF)) or ((hdr[5].toLong() and 0xFF) shl 8) or
+                    ((hdr[6].toLong() and 0xFF) shl 16) or ((hdr[7].toLong() and 0xFF) shl 24)
+                if (id == "fmt ") {
+                    val fmt = ByteArray(size.toInt().coerceAtLeast(16)); raf.readFully(fmt, 0, minOf(fmt.size, size.toInt()))
+                    channels = (fmt[2].toInt() and 0xFF) or ((fmt[3].toInt() and 0xFF) shl 8)
+                    sampleRate = (fmt[4].toInt() and 0xFF) or ((fmt[5].toInt() and 0xFF) shl 8) or
+                        ((fmt[6].toInt() and 0xFF) shl 16) or ((fmt[7].toInt() and 0xFF) shl 24)
+                    bits = (fmt[14].toInt() and 0xFF) or ((fmt[15].toInt() and 0xFF) shl 8)
+                    if (size.toInt() > fmt.size) raf.seek(raf.filePointer + (size - fmt.size))
+                } else if (id == "data") {
+                    dataOffset = raf.filePointer
+                    dataLen = minOf(size, raf.length() - dataOffset)
+                    break
+                } else {
+                    raf.seek(raf.filePointer + size + (size and 1)) // chunks are word-aligned
+                }
+            }
+            if (sampleRate <= 0 || bits != 16 || channels <= 0 || dataOffset < 0) null
+            else WavInfo(sampleRate, channels, bits, dataOffset, dataLen)
+        }
+    } catch (e: Exception) { logDbg("WAV parse err: ${e.message}"); null }
+
     private fun startFilePlayback(idx: Int, fromMs: Int) {
         releasePlayer()
+        val file = synthFile(idx)
+        val wav = parseWav(file) ?: run { logDbg("bad WAV idx=$idx"); beginSpeakFallback("unparseable wav"); return }
         try {
-            // Hand MediaPlayer a FileDescriptor we open — the media service runs
-            // in a separate process (mediaserver) that CANNOT open our private
-            // cache files by path, so setDataSource(path) silently hangs.
-            val fd = android.os.ParcelFileDescriptor.open(
-                synthFile(idx), android.os.ParcelFileDescriptor.MODE_READ_ONLY
-            )
-            playerFd = fd
-            player = MediaPlayer().apply {
-                setAudioAttributes(playbackAudioAttributes)
-                setDataSource(fd.fileDescriptor)
-                setOnPreparedListener { mp ->
-                    preparedIdx = idx
-                    if (fromMs > 0) runCatching { mp.seekTo(fromMs) }
-                    if (isPlaying) {
-                        mp.start()
-                        audioStarted = true
-                        cancelAudioWatchdog()
-                        logDbg("playing idx=$idx (${mp.duration}ms) from=${fromMs}ms")
+            val channelMask = if (wav.channels >= 2) android.media.AudioFormat.CHANNEL_OUT_STEREO
+                else android.media.AudioFormat.CHANNEL_OUT_MONO
+            val minBuf = android.media.AudioTrack.getMinBufferSize(
+                wav.sampleRate, channelMask, android.media.AudioFormat.ENCODING_PCM_16BIT
+            ).coerceAtLeast(64 * 1024)
+            val track = android.media.AudioTrack.Builder()
+                .setAudioAttributes(playbackAudioAttributes)
+                .setAudioFormat(
+                    android.media.AudioFormat.Builder()
+                        .setSampleRate(wav.sampleRate)
+                        .setChannelMask(channelMask)
+                        .setEncoding(android.media.AudioFormat.ENCODING_PCM_16BIT)
+                        .build()
+                )
+                .setBufferSizeInBytes(minBuf)
+                .setTransferMode(android.media.AudioTrack.MODE_STREAM)
+                .build()
+            audioTrack = track
+            trackSampleRate = wav.sampleRate
+            trackChannels = wav.channels
+            trackStartMs = fromMs
+            preparedIdx = idx
+            audioStarted = true
+            cancelAudioWatchdog()
+            track.play()
+            logDbg("playing (AudioTrack) idx=$idx sr=${wav.sampleRate} ch=${wav.channels} from=${fromMs}ms")
+            nextSpeakable(idx + 1)?.let { synthesize(it) } // prefetch
+            publishState(); updatePlaybackState(); updateNotification()
+
+            val frameBytes = wav.channels * 2
+            val startByte = wav.dataOffset + (fromMs.toLong() * wav.sampleRate / 1000 * frameBytes)
+                .coerceIn(0L, wav.dataLen)
+            val totalFrames = (wav.dataOffset + wav.dataLen - startByte) / frameBytes
+            val myGen = ++playThreadGen
+            playThread = Thread {
+                try {
+                    java.io.RandomAccessFile(file, "r").use { raf ->
+                        raf.seek(startByte)
+                        val buf = ByteArray(16 * 1024)
+                        var remaining = wav.dataOffset + wav.dataLen - startByte
+                        while (myGen == playThreadGen && remaining > 0) {
+                            val toRead = minOf(buf.size.toLong(), remaining).toInt()
+                            val n = raf.read(buf, 0, toRead)
+                            if (n <= 0) break
+                            var off = 0
+                            while (off < n && myGen == playThreadGen) {
+                                val w = track.write(buf, off, n - off)
+                                if (w <= 0) break
+                                off += w
+                            }
+                            remaining -= n
+                        }
+                        // wait for the buffered audio to finish playing
+                        while (myGen == playThreadGen &&
+                            (track.playbackHeadPosition.toLong() and 0xFFFFFFFFL) < totalFrames
+                        ) Thread.sleep(40)
                     }
-                    // prefetch the next paragraph while this one plays
-                    nextSpeakable(idx + 1)?.let { synthesize(it) }
-                    publishState(); updatePlaybackState(); updateNotification()
+                    if (myGen == playThreadGen) mainHandler.post {
+                        if (myGen == playThreadGen && isPlaying && preparedIdx == idx) {
+                            logDbg("completed idx=$idx")
+                            synthFile(idx).delete(); readyFiles.remove(idx)
+                            preparedIdx = -1; resumePositionMs = 0
+                            advanceAndSpeak()
+                        }
+                    }
+                } catch (e: Exception) {
+                    mainHandler.post {
+                        if (myGen == playThreadGen) {
+                            logDbg("AudioTrack ERROR idx=$idx: ${e.message}")
+                            if (isPlaying) beginSpeakFallback("audiotrack error")
+                        }
+                    }
                 }
-                setOnCompletionListener {
-                    logDbg("completed idx=$idx")
-                    synthFile(idx).delete(); readyFiles.remove(idx)
-                    preparedIdx = -1; resumePositionMs = 0
-                    if (isPlaying) advanceAndSpeak()
-                }
-                setOnErrorListener { _, what, extra ->
-                    logDbg("PLAYER ERROR idx=$idx what=$what extra=$extra")
-                    releasePlayer()
-                    if (isPlaying) beginSpeakFallback("player error")
-                    true
-                }
-                prepareAsync()
-            }
+            }.also { it.isDaemon = true; it.start() }
         } catch (e: Exception) {
-            logDbg("PLAYER EXCEPTION idx=$idx: ${e.message}")
-            beginSpeakFallback("player exception")
+            logDbg("AudioTrack INIT ERROR idx=$idx: ${e.message}")
+            beginSpeakFallback("audiotrack init")
         }
     }
 
