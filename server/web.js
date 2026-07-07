@@ -307,9 +307,12 @@ ${!searching && !savedView ? `<div class="meta">${total.toLocaleString('en-US')}
       </div></li>`;
   }).join('\n');
 
+  // Bulk-archive only makes sense on the inbox (not archive/favorites/search).
+  const isInbox = !searching && !savedView && view !== 'archive' && view !== 'favorites';
   const importBar = `
 <div class="importbar meta">
   <button id="import-pdf" class="act">Import PDF…</button>
+  ${isInbox ? '<button id="bulk-archive" class="act">Archive older than 1 year</button>' : ''}
   <span id="import-status"></span>
   <input type="file" id="pdf-file" accept=".pdf,application/pdf" style="display:none">
 </div>`;
@@ -340,6 +343,20 @@ document.addEventListener('click', async (e) => {
       body: JSON.stringify({ [act]: btn.dataset.val === 'true' }),
     });
   }
+  location.reload();
+});
+
+// Bulk-archive everything older than a year.
+const bulkBtn = document.getElementById('bulk-archive');
+if (bulkBtn) bulkBtn.addEventListener('click', async () => {
+  if (!confirm('Archive every inbox article older than 1 year?')) return;
+  bulkBtn.disabled = true; bulkBtn.textContent = 'Archiving…';
+  const res = await fetch('/api/articles/bulk-archive', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ olderThanDays: 365 }),
+  });
+  const d = await res.json().catch(() => ({}));
+  alert('Archived ' + (d.archived || 0) + ' article(s) older than a year.');
   location.reload();
 });
 

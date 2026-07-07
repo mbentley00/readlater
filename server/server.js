@@ -582,6 +582,16 @@ const server = http.createServer(async (req, res) => {
       }
     }
 
+    // ---- bulk archive: archive all inbox articles older than N days
+    if (req.method === 'POST' && parts[1] === 'articles' && parts[2] === 'bulk-archive' && parts.length === 3) {
+      const b = parseBody(await readBody(req), req.headers['content-type']);
+      const days = Number.isFinite(b.olderThanDays) ? Math.max(0, b.olderThanDays) : 365;
+      const now = Date.now();
+      const before = now - days * 24 * 60 * 60 * 1000;
+      const archived = store.bulkArchiveBefore(user.id, before, now);
+      return json(res, 200, { archived, olderThanDays: days });
+    }
+
     // ---- save by URL: fetch the page server-side, create a quick article, and
     // upgrade its content via the LLM in the background. Used by Android share.
     if (req.method === 'POST' && parts[1] === 'save-url' && parts.length === 2) {

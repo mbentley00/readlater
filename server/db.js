@@ -263,6 +263,12 @@ function open(dataDir) {
           readParagraph: Number.isInteger(readParagraph) && readParagraph >= 0 ? readParagraph : null,
           ttsParagraph: Number.isInteger(ttsParagraph) && ttsParagraph >= 0 ? ttsParagraph : null,
         }),
+    /** Archive all of a user's non-archived articles saved before [beforeMs].
+     *  Returns how many were archived. */
+    bulkArchiveBefore: (userId, beforeMs, now) =>
+      prep('bab', 'UPDATE articles SET archived = 1, updatedAt = @now WHERE userId = @userId AND archived = 0 AND savedAt < @before')
+        .run({ userId, before: beforeMs, now }).changes,
+
     deleteArticle: (id) => {
       prep('adh', 'DELETE FROM highlights WHERE articleId = ?').run(id);
       return prep('ad', 'DELETE FROM articles WHERE id = ?').run(id);

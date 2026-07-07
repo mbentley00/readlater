@@ -471,6 +471,25 @@ async function main() {
     r = await api('POST', '/api/save-url', { url: 'not a url' });
     assert.strictEqual(r.status, 400, 'non-URL rejected');
 
+    // ---- bulk archive older than N days ----------------------------------
+    r = await api('POST', '/api/articles', {
+      url: 'https://example.com/ancient', title: 'Ancient Article',
+      html: '<p>Old.</p>', savedAt: Date.now() - 400 * 24 * 60 * 60 * 1000,
+    });
+    const ancientId = r.body.id;
+    r = await api('POST', '/api/articles', {
+      url: 'https://example.com/recent', title: 'Recent Article', html: '<p>New.</p>',
+    });
+    const recentId = r.body.id;
+    r = await api('POST', '/api/articles/bulk-archive', { olderThanDays: 365 });
+    assert.ok(r.body.archived >= 1, 'bulk-archive archived at least the ancient article');
+    r = await api('GET', `/api/articles/${ancientId}`);
+    assert.strictEqual(r.body.archived, true, 'ancient article got archived');
+    r = await api('GET', `/api/articles/${recentId}`);
+    assert.strictEqual(r.body.archived, false, 'recent article left in the inbox');
+    await api('DELETE', `/api/articles/${ancientId}`);
+    await api('DELETE', `/api/articles/${recentId}`);
+
     // ---- server TTS (Kokoro) ---------------------------------------------
     // Saving an article pre-computes audio; metadata carries per-paragraph
     // offsets and the WAV streams back.
