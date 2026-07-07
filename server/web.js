@@ -95,8 +95,13 @@ form.search label { color:var(--muted); display:flex; gap:.3rem; align-items:cen
 .view-chip .del-view { border:none; font-size:.9rem; padding:0 .3rem; }
 form.saveview { display:flex; gap:.5rem; margin:.6rem 0 0; font-family:system-ui,sans-serif; }
 form.saveview input[name=name] { padding:.3rem .5rem; border:1px solid var(--line); border-radius:6px; background:var(--card); color:var(--fg); font-size:.85rem; }
-#hl-tip { position:absolute; z-index:10; }
-#hl-tip button { background:var(--accent); color:var(--accent-fg); border:none; border-radius:6px; padding:.35rem .8rem; cursor:pointer; font:.85rem system-ui,sans-serif; box-shadow:0 2px 8px rgba(0,0,0,.25); }
+#hl-tip, #hl-menu { position:absolute; z-index:60; }
+#hl-tip button, #hl-menu button { background:var(--accent); color:var(--accent-fg); border:none; border-radius:6px; padding:.35rem .8rem; cursor:pointer; font:.85rem system-ui,sans-serif; box-shadow:0 2px 8px rgba(0,0,0,.25); }
+mark[data-hl-id] { cursor:pointer; }
+/* When the panel is open on a wide screen, shrink the page so the article and
+   panel are both fully visible instead of the panel overlapping the text. */
+body { transition:padding-right .2s ease; }
+@media (min-width:820px) { body.hl-open { padding-right:min(380px,42vw); } }
 .settings dt { font-family:system-ui,sans-serif; font-size:.8rem; color:var(--muted); margin-top:1.2rem; }
 .settings dd { margin:.25rem 0 0; }
 .back { font-family:system-ui,sans-serif; font-size:.85rem; text-decoration:none; }
@@ -106,7 +111,6 @@ function page({ title, body, user, active = '', nonce = '', script = '', article
   const nav = user ? `
     <nav>
       <a href="/" class="${active === 'inbox' ? 'active' : ''}">Inbox</a>
-      <a href="/?view=favorites" class="${active === 'favorites' ? 'active' : ''}">Favorites</a>
       <a href="/?view=archive" class="${active === 'archive' ? 'active' : ''}">Archive</a>
       <a href="/highlights" class="${active === 'highlights' ? 'active' : ''}">Highlights</a>
     </nav>
@@ -410,7 +414,8 @@ function readerPage(ctx, user, article) {
   <div class="hl-panel-head"><strong>Highlights (${hls.length})</strong><button class="act" id="hl-close">×</button></div>
   <div class="hl-panel-body">${hls.length ? hlItems : '<div class="meta">No highlights yet. Select text in the article to add one.</div>'}</div>
 </aside>
-<div id="hl-tip" hidden><button id="hl-save">Highlight</button></div>`;
+<div id="hl-tip" hidden><button id="hl-save">Highlight</button></div>
+<div id="hl-menu" hidden><button id="hl-menu-del">Delete highlight</button></div>`;
 
   const script = `
 const ARTICLE = ${JSON.stringify(article.id)};
@@ -433,21 +438,49 @@ for (const h of HLS) {
   }
 }
 
-// Highlights side panel: toggle, jump-to, and delete.
+// Highlights side panel: toggle (pushes the page aside), jump-to, and delete.
 const panel = document.getElementById('hl-panel');
-document.getElementById('hl-toggle').addEventListener('click', () => { panel.hidden = !panel.hidden; });
-document.getElementById('hl-close').addEventListener('click', () => { panel.hidden = true; });
+function setPanel(open) { panel.hidden = !open; document.body.classList.toggle('hl-open', open); }
+document.getElementById('hl-toggle').addEventListener('click', () => setPanel(panel.hidden));
+document.getElementById('hl-close').addEventListener('click', () => setPanel(false));
+function flashMark(id) {
+  const mark = root.querySelector('mark[data-hl-id="' + CSS.escape(id) + '"]');
+  if (mark) {
+    mark.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    mark.classList.add('flash');
+    setTimeout(() => mark.classList.remove('flash'), 1600);
+  }
+}
 document.querySelectorAll('.hl-item').forEach((item) => {
-  item.addEventListener('click', (e) => {
-    if (e.target.closest('button')) return;
-    const mark = root.querySelector('mark[data-hl-id="' + CSS.escape(item.dataset.hlId) + '"]');
-    if (mark) {
-      mark.scrollIntoView({ behavior: 'smooth', block: 'center' });
-      mark.classList.add('flash');
-      setTimeout(() => mark.classList.remove('flash'), 1600);
-    }
-  });
+  item.addEventListener('click', (e) => { if (!e.target.closest('button')) flashMark(item.dataset.hlId); });
 });
+async function deleteHighlight(id) {
+  if (!confirm('Delete this highlight?')) return;
+  await fetch('/api/highlights/' + id, { method: 'DELETE' });
+  location.reload();
+}
+// Panel "Delete" buttons.
+document.querySelectorAll('.hl-item .del-hl').forEach((b) => {
+  b.addEventListener('click', (e) => { e.stopPropagation(); deleteHighlight(b.dataset.id); });
+});
+
+// Click a highlight inside the article -> a small Delete menu at that spot.
+const menu = document.getElementById('hl-menu');
+let menuHlId = null;
+root.addEventListener('click', (e) => {
+  const mark = e.target.closest('mark[data-hl-id]');
+  if (!mark) return;
+  e.stopPropagation();
+  menuHlId = mark.dataset.hlId;
+  const r = mark.getBoundingClientRect();
+  menu.style.top = (window.scrollY + r.bottom + 4) + 'px';
+  menu.style.left = (window.scrollX + r.left) + 'px';
+  menu.hidden = false;
+});
+document.addEventListener('click', (e) => {
+  if (!e.target.closest('#hl-menu') && !e.target.closest('mark[data-hl-id]')) menu.hidden = true;
+});
+document.getElementById('hl-menu-del').addEventListener('click', () => { menu.hidden = true; if (menuHlId) deleteHighlight(menuHlId); });
 
 // archive/favorite/delete-highlight buttons
 document.addEventListener('click', async (e) => {
@@ -493,20 +526,27 @@ document.getElementById('hl-save').addEventListener('mousedown', async (e) => {
 function highlightsPage(ctx, user, url) {
   // Grouped by article: which articles have highlights and how many. The
   // highlights themselves live on each article's reader page.
+  const HL_SORTS = { recent: 'Recently highlighted', oldest: 'Oldest highlighted', most: 'Most highlights', title: 'Title A–Z' };
   const get = (k) => (url && url.searchParams.get(k)) || '';
   const q = get('q').trim();
+  const domain = get('domain').trim();
+  const sort = HL_SORTS[get('sort')] ? get('sort') : 'recent';
   const pageNum = Math.max(1, parseInt(get('page'), 10) || 1);
   const offset = (pageNum - 1) * PAGE_SIZE;
 
-  const total = ctx.store.highlightedArticlesCount(user.id, { q });
-  const arts = ctx.store.highlightedArticles(user.id, { q, limit: PAGE_SIZE, offset });
+  const total = ctx.store.highlightedArticlesCount(user.id, { q, domain });
+  const arts = ctx.store.highlightedArticles(user.id, { q, domain, sort, limit: PAGE_SIZE, offset });
   const pageCount = Math.max(1, Math.ceil(total / PAGE_SIZE));
   const buildQs = (o) => {
     const p = new URLSearchParams();
-    for (const [k, v] of Object.entries({ q, ...o })) if (v) p.set(k, String(v));
+    for (const [k, v] of Object.entries({ q, domain, sort, ...o })) if (v && !(k === 'sort' && v === 'recent')) p.set(k, String(v));
     const s = p.toString();
     return s ? `/highlights?${s}` : '/highlights';
   };
+  const domainOpts = ctx.store.highlightedDomains(user.id)
+    .map(({ domain: d, n }) => `<option value="${escapeHtml(d)}" ${d === domain ? 'selected' : ''}>${escapeHtml(d)} (${n})</option>`).join('');
+  const sortOpts = Object.entries(HL_SORTS)
+    .map(([k, label]) => `<option value="${k}" ${k === sort ? 'selected' : ''}>${label}</option>`).join('');
 
   const items = arts.map((a) => {
     const meta = [
@@ -529,15 +569,17 @@ function highlightsPage(ctx, user, url) {
 
   const searchForm = `<form class="search" method="get" action="/highlights">
   <input type="search" name="q" value="${escapeHtml(q)}" placeholder="Search highlighted articles…">
-  <button class="act" type="submit">Search</button>
-  ${q ? '<a class="back" href="/highlights">Clear</a>' : ''}
+  <select name="domain"><option value="">All domains</option>${domainOpts}</select>
+  <select name="sort">${sortOpts}</select>
+  <button class="act" type="submit">Apply</button>
+  ${q || domain || sort !== 'recent' ? '<a class="back" href="/highlights">Clear</a>' : ''}
 </form>`;
 
   const body = `<h1>Highlights</h1>
 ${searchForm}
 ${total ? `<div class="meta">${total.toLocaleString('en-US')} article${total === 1 ? '' : 's'} with highlights — open one to read them in place.</div>
 <ul class="articles">${items}</ul>${pager}`
-    : `<div class="empty">${q ? 'No highlighted articles match that search.' : 'No highlights yet — long-press a paragraph in the Android app, or select text in the reader.'}</div>`}
+    : `<div class="empty">${q || domain ? 'No highlighted articles match those filters.' : 'No highlights yet — long-press a paragraph in the Android app, or select text in the reader.'}</div>`}
 <p class="meta"><a href="/api/highlights/export.md">Export all as Markdown</a></p>`;
   return { body, script: '' };
 }
