@@ -70,6 +70,10 @@ class TtsService : Service() {
         /** How many upcoming paragraphs to keep synthesized ahead of playback. */
         private const val PREFETCH_AHEAD = 3
 
+        /** Deliberate pause between paragraphs for the neural (Kaldi/sherpa)
+         *  voice — its delivery runs paragraphs together, so a beat helps. */
+        private const val KALDI_PARAGRAPH_GAP_MS = 500L
+
         /** Current playback state, observable from anywhere. */
         val stateFlow = MutableStateFlow(TtsPlaybackState())
 
@@ -740,7 +744,17 @@ class TtsService : Service() {
         } else {
             currentIndex = next
             articleId?.let { app.repository.saveTtsPositionLocal(it, next) }
-            speakCurrent()
+            // Neural voice: insert a short beat before the next paragraph so it's
+            // easier to follow. Skipped for the system voice (which already
+            // pauses at paragraph breaks). Cancelled if the user pauses/seeks.
+            if (initializedEngine == sherpaEngine) {
+                val token = playToken
+                mainHandler.postDelayed({
+                    if (isPlaying && playToken == token && currentIndex == next) speakCurrent()
+                }, KALDI_PARAGRAPH_GAP_MS)
+            } else {
+                speakCurrent()
+            }
         }
     }
 
