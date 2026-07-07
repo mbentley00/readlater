@@ -84,9 +84,35 @@ function startMockAnthropic(port) {
   return new Promise((resolve) => server.listen(port, '127.0.0.1', () => resolve(server)));
 }
 
+/** Fake OpenAI-compatible /audio/speech: returns a tiny valid WAV whose length
+ *  scales with the input, so paragraph offsets come out strictly increasing. */
+function startMockTts(port) {
+  const server = http.createServer((req, res) => {
+    let body = '';
+    req.on('data', (c) => { body += c; });
+    req.on('end', () => {
+      const input = (() => { try { return JSON.parse(body).input || ''; } catch { return ''; } })();
+      const sampleRate = 24000;
+      const samples = Math.max(2400, input.length * 240); // ~10ms/char
+      const pcm = Buffer.alloc(samples * 2);
+      const h = Buffer.alloc(44);
+      h.write('RIFF', 0); h.writeUInt32LE(36 + pcm.length, 4); h.write('WAVE', 8);
+      h.write('fmt ', 12); h.writeUInt32LE(16, 16); h.writeUInt16LE(1, 20); h.writeUInt16LE(1, 22);
+      h.writeUInt32LE(sampleRate, 24); h.writeUInt32LE(sampleRate * 2, 28);
+      h.writeUInt16LE(2, 32); h.writeUInt16LE(16, 34);
+      h.write('data', 36); h.writeUInt32LE(pcm.length, 40);
+      res.writeHead(200, { 'Content-Type': 'audio/wav' });
+      res.end(Buffer.concat([h, pcm]));
+    });
+  });
+  return new Promise((resolve) => server.listen(port, '127.0.0.1', () => resolve(server)));
+}
+
 async function main() {
   const MOCK_LLM_PORT = PORT + 1;
   const mockLlm = await startMockAnthropic(MOCK_LLM_PORT);
+  const MOCK_TTS_PORT = PORT + 2;
+  const mockTts = await startMockTts(MOCK_TTS_PORT);
 
   // pre-seed an old-format db (no users) to test legacy migration
   fs.writeFileSync(path.join(DATA_DIR, 'db.json'), JSON.stringify({
@@ -100,6 +126,8 @@ async function main() {
       READLATER_INBOUND_SECRET: 'whsec-test', READLATER_INBOUND_DOMAIN: 'in.test',
       ANTHROPIC_API_KEY: 'sk-ant-test-not-real',
       ANTHROPIC_BASE_URL: `http://127.0.0.1:${MOCK_LLM_PORT}`,
+      TTS_API_KEY: 'tts-test-not-real',
+      TTS_API_URL: `http://127.0.0.1:${MOCK_TTS_PORT}`,
     },
     stdio: ['ignore', 'pipe', 'inherit'],
   });
@@ -419,6 +447,34 @@ async function main() {
     assert.strictEqual(r.status, 201, 'session cookie can create highlights');
     await api('DELETE', `/api/highlights/${r.body.id}`);
 
+    // ---- server TTS (Kokoro) ---------------------------------------------
+    // Saving an article pre-computes audio; metadata carries per-paragraph
+    // offsets and the WAV streams back.
+    r = await api('POST', '/api/articles', {
+      url: 'https://example.com/tts-article',
+      title: 'Spoken Article',
+      html: '<p>First paragraph to read aloud.</p><p>Second paragraph follows here.</p>',
+    });
+    assert.strictEqual(r.status, 201);
+    const ttsId = r.body.id;
+    let audio = null;
+    for (let i = 0; i < 50; i++) {
+      r = await api('GET', `/api/articles/${ttsId}/audio`);
+      if (r.body.ready) { audio = r.body; break; }
+      await new Promise((res2) => setTimeout(res2, 100));
+    }
+    assert.ok(audio && audio.ready, 'server TTS produced audio on save');
+    assert.strictEqual(audio.paragraphOffsetsMs.length, 2, 'one time offset per paragraph');
+    assert.strictEqual(audio.paragraphOffsetsMs[0], 0, 'first paragraph starts at 0ms');
+    assert.ok(audio.paragraphOffsetsMs[1] > 0, 'second paragraph starts later');
+    let wr = await fetch(BASE + `/api/articles/${ttsId}/audio.wav`, { headers: HEADERS });
+    assert.strictEqual(wr.status, 200);
+    const wbuf = Buffer.from(await wr.arrayBuffer());
+    assert.strictEqual(wbuf.toString('ascii', 0, 4), 'RIFF', 'audio.wav is a WAV');
+    // Range requests work (the app seeks)
+    wr = await fetch(BASE + `/api/articles/${ttsId}/audio.wav`, { headers: { ...HEADERS, Range: 'bytes=0-43' } });
+    assert.strictEqual(wr.status, 206, 'audio.wav honors Range requests');
+
     // ---- LLM parse rescue -------------------------------------------------
     // A save flagged with fallbackHtml gets asynchronously re-extracted.
     r = await api('POST', '/api/articles', {
@@ -564,6 +620,7 @@ async function main() {
     console.log('All server tests passed ✔');
   } finally {
     mockLlm.close();
+    mockTts.close();
     const exited = new Promise((resolve) => proc.on('exit', resolve));
     proc.kill('SIGTERM');
     await exited;

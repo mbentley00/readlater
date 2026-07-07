@@ -29,6 +29,7 @@ const web = require('./web');
 const { open, hostOf } = require('./db');
 const llm = require('./llm');
 const pdf = require('./pdf');
+const tts = require('./tts');
 
 const PORT = parseInt(process.env.PORT || '8090', 10);
 const DATA_DIR = process.env.READLATER_DATA_DIR || path.join(__dirname, 'data');
@@ -55,6 +56,54 @@ if (!LEGACY_TOKEN && fs.existsSync(TOKEN_FILE)) {
 
 // ---------------------------------------------------------------- storage
 const store = open(DATA_DIR);
+
+// ---------------------------------------------------------------- server TTS
+// Kokoro-synthesized article audio, pre-computed on save and cached on the
+// volume. A tiny single-flight queue keeps synthesis serialized (one API call
+// stream at a time) so a burst of saves doesn't hammer the provider.
+const AUDIO_DIR = path.join(DATA_DIR, 'audio');
+fs.mkdirSync(AUDIO_DIR, { recursive: true });
+const audioWavFile = (id) => path.join(AUDIO_DIR, `${id}.wav`);
+const audioMetaFile = (id) => path.join(AUDIO_DIR, `${id}.json`);
+
+const ttsQueued = new Set();
+const ttsPending = [];
+let ttsRunning = false;
+
+function enqueueTts(articleId, userId, force = false) {
+  if (!tts.enabled()) return false;
+  if (ttsQueued.has(articleId)) return true;
+  if (!force && fs.existsSync(audioMetaFile(articleId))) return false;
+  ttsQueued.add(articleId);
+  ttsPending.push({ articleId, userId });
+  pumpTts();
+  return true;
+}
+
+async function pumpTts() {
+  if (ttsRunning) return;
+  ttsRunning = true;
+  while (ttsPending.length) {
+    const { articleId, userId } = ttsPending.shift();
+    try {
+      const a = store.getArticle(articleId, userId);
+      if (a) {
+        const r = await tts.synthesizeArticle(a);
+        fs.writeFileSync(audioWavFile(articleId), r.wav);
+        fs.writeFileSync(audioMetaFile(articleId), JSON.stringify({
+          voice: r.voice, durationMs: r.durationMs, sampleRate: r.sampleRate,
+          paragraphOffsetsMs: r.paragraphOffsetsMs, size: r.wav.length, createdAt: Date.now(),
+        }));
+        console.log(`TTS synthesized ${articleId}: ${r.wav.length} bytes, ${r.paragraphOffsetsMs.length} paragraphs`);
+      }
+    } catch (e) {
+      console.error(`TTS failed for ${articleId}: ${e.message}`);
+    } finally {
+      ttsQueued.delete(articleId);
+    }
+  }
+  ttsRunning = false;
+}
 store.pruneSessions(Date.now());
 process.on('SIGINT', () => { store.close(); process.exit(0); });
 process.on('SIGTERM', () => { store.close(); process.exit(0); });
@@ -471,6 +520,10 @@ const server = http.createServer(async (req, res) => {
           store.insertArticle(a);
         }
 
+        // Pre-compute the server voice for freshly-saved articles (skips
+        // archived imports and no-ops when TTS isn't configured).
+        if (!(b.archived === true)) enqueueTts(a.id, user.id);
+
         // LLM rescue: the extension flags saves it thinks it parsed badly by
         // attaching the stripped page HTML. Respond fast with what we have,
         // upgrade the stored article in the background (bumping updatedAt so
@@ -522,6 +575,52 @@ const server = http.createServer(async (req, res) => {
       if (req.method === 'DELETE') {
         store.deleteArticle(a.id);
         return json(res, 200, { ok: true });
+      }
+    }
+
+    // ---- server-synthesized audio for an article
+    if (parts[1] === 'articles' && parts.length === 4 && (parts[3] === 'audio' || parts[3] === 'audio.wav')) {
+      const a = store.getArticle(parts[2], user.id);
+      if (!a) return json(res, 404, { error: 'article not found' });
+      const hasAudio = fs.existsSync(audioMetaFile(a.id)) && fs.existsSync(audioWavFile(a.id));
+
+      // GET .../audio → status + timing metadata (kicks off synthesis if absent)
+      if (req.method === 'GET' && parts[3] === 'audio') {
+        if (hasAudio) {
+          const meta = JSON.parse(fs.readFileSync(audioMetaFile(a.id), 'utf8'));
+          return json(res, 200, { ready: true, ...meta });
+        }
+        const queued = enqueueTts(a.id, user.id);
+        return json(res, 200, { ready: false, enabled: tts.enabled(), queued });
+      }
+
+      // GET .../audio.wav → stream the audio (supports Range for seeking)
+      if (req.method === 'GET' && parts[3] === 'audio.wav') {
+        if (!hasAudio) return json(res, 404, { error: 'audio not ready' });
+        const file = audioWavFile(a.id);
+        const size = fs.statSync(file).size;
+        const range = req.headers.range;
+        if (range) {
+          const m = /bytes=(\d+)-(\d*)/.exec(range);
+          const start = m ? parseInt(m[1], 10) : 0;
+          const end = m && m[2] ? parseInt(m[2], 10) : size - 1;
+          res.writeHead(206, {
+            'Content-Type': 'audio/wav',
+            'Content-Range': `bytes ${start}-${end}/${size}`,
+            'Accept-Ranges': 'bytes',
+            'Content-Length': end - start + 1,
+          });
+          return fs.createReadStream(file, { start, end }).pipe(res);
+        }
+        res.writeHead(200, { 'Content-Type': 'audio/wav', 'Content-Length': size, 'Accept-Ranges': 'bytes' });
+        return fs.createReadStream(file).pipe(res);
+      }
+
+      // POST .../audio → force (re)generation
+      if (req.method === 'POST' && parts[3] === 'audio') {
+        if (!tts.enabled()) return json(res, 503, { error: 'server TTS not configured' });
+        enqueueTts(a.id, user.id, true);
+        return json(res, 202, { queued: true });
       }
     }
 

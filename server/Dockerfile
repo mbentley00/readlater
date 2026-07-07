@@ -4,7 +4,7 @@ FROM node:22-slim
 WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev
-COPY server.js web.js db.js llm.js pdf.js ./
+COPY server.js web.js db.js llm.js pdf.js tts.js ./
 ENV READLATER_DATA_DIR=/data \
     PORT=8090
 EXPOSE 8090
