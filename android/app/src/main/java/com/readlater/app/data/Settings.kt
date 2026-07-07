@@ -54,6 +54,14 @@ class Settings(context: Context) {
             prefs.edit().putBoolean(KEY_SERVER_VOICE, value).apply()
         }
 
+    /** When server voice is on but audio isn't ready, wait for the server to
+     *  finish generating instead of falling back to the device voice. */
+    var waitForServerVoice: Boolean
+        get() = prefs.getBoolean(KEY_WAIT_SERVER_VOICE, false)
+        set(value) {
+            prefs.edit().putBoolean(KEY_WAIT_SERVER_VOICE, value).apply()
+        }
+
     /** TTS voice name within the engine; "" = auto (highest quality). */
     var ttsVoice: String
         get() = prefs.getString(KEY_TTS_VOICE, "").orEmpty()
@@ -84,6 +92,7 @@ class Settings(context: Context) {
         const val KEY_TTS_ENGINE = "tts_engine"
         const val KEY_TTS_VOICE = "tts_voice"
         const val KEY_SERVER_VOICE = "server_voice"
+        const val KEY_WAIT_SERVER_VOICE = "wait_server_voice"
         const val KEY_LAST_SYNC = "last_sync_at"
     }
 }

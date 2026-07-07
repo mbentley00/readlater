@@ -323,6 +323,9 @@ class TtsService : Service() {
             if (app.settings.useServerVoice && tryStartServerVoice(article.id)) {
                 return@launch
             }
+            // The server check/wait can take time; bail if the user cancelled
+            // or switched articles meanwhile.
+            if (!isPlaying || articleId != article.id) return@launch
             initTts() // re-checks the preferred engine; no-op when unchanged
             if (ttsReady) speakCurrent()
         }
@@ -1028,17 +1031,33 @@ class TtsService : Service() {
     private suspend fun tryStartServerVoice(id: String): Boolean {
         // Bounded check so a slow/cold server doesn't delay the device-voice
         // fallback. The audio-status GET also queues generation server-side.
-        val meta = kotlinx.coroutines.withTimeoutOrNull(3500) { app.apiClient.audioMeta(id) }
-        if (meta == null) {
+        val initial = kotlinx.coroutines.withTimeoutOrNull(3500) { app.apiClient.audioMeta(id) }
+        if (initial == null) {
             scope.launch { runCatching { app.apiClient.audioMeta(id) } } // ensure generation is queued
             logDbg("server audio check slow — device voice now; generating in background")
             return false
         }
-        if (!meta.enabled) return false
-        if (!meta.ready) {
+        if (!initial.enabled) return false
+
+        val meta: com.readlater.app.data.ApiClient.AudioMeta = if (initial.ready) {
+            initial
+        } else if (!app.settings.waitForServerVoice) {
             logDbg("server audio not cached — generating; using device voice now")
             return false
+        } else {
+            // Forced wait: poll until the server finishes generating (generation
+            // was already queued by the status GET). Cancellable; ~3 min cap.
+            logDbg("server audio not cached — waiting for server voice")
+            var got: com.readlater.app.data.ApiClient.AudioMeta? = null
+            for (i in 0 until 60) {
+                if (id != articleId || !isPlaying) return false // cancelled
+                kotlinx.coroutines.delay(3000)
+                val m = app.apiClient.audioMeta(id)
+                if (m?.ready == true) { got = m; break }
+            }
+            got ?: run { logDbg("server voice wait timed out — device voice"); return false }
         }
+
         val fmt = if (meta.format == "opus") "opus" else "wav"
         val file = serverAudioFile(id, fmt)
         if (file.length() < 44) {

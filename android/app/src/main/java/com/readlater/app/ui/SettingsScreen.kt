@@ -235,7 +235,25 @@ fun SettingsScreen(onBack: () -> Unit) {
                     settings.useServerVoice = it
                 })
             }
-            if (!serverVoice) {
+            if (serverVoice) {
+                var waitServer by remember { mutableStateOf(settings.waitForServerVoice) }
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text("Always wait for server voice", style = MaterialTheme.typography.bodyLarge)
+                        Text(
+                            "When the neural audio isn't ready yet, wait for it to finish " +
+                                "generating instead of using the device voice. Play may pause for " +
+                                "a bit while it prepares.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                    Switch(checked = waitServer, onCheckedChange = {
+                        waitServer = it
+                        settings.waitForServerVoice = it
+                    })
+                }
+            } else {
                 Text(
                     "With server voice off, the engine and voice below are used.",
                     style = MaterialTheme.typography.bodySmall,
