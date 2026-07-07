@@ -11,6 +11,7 @@ import android.content.pm.ServiceInfo
 import android.media.AudioAttributes
 import android.media.AudioFocusRequest
 import android.media.AudioManager
+import android.media.MediaPlayer
 import android.os.Build
 import android.os.Handler
 import android.os.IBinder
@@ -311,8 +312,15 @@ class TtsService : Service() {
         if (!isPlaying) return
         logDbg("PAUSE (idx=$currentIndex)")
         isPlaying = false
-        clearSynthCache() // cancel the in-flight utterance
-        tts?.stop()
+        playToken++          // invalidate any pending watchdog
+        cancelAudioWatchdog()
+        if (!usingSpeakFallback && player?.isPlaying == true) {
+            // keep the exact position so resume continues mid-sentence
+            runCatching { resumePositionMs = player?.currentPosition ?: 0 }
+            runCatching { player?.pause() }
+        } else {
+            tts?.stop() // fallback speak(): position is lost, resume re-speaks
+        }
         releaseWakeLock()
         // Pushing save: sync the paused position to the server right away.
         articleId?.let { app.repository.saveTtsPosition(it, currentIndex) }
@@ -596,77 +604,100 @@ class TtsService : Service() {
         }
     }
 
-    // Playback uses the engine's own speak() path. An earlier design
-    // synthesized each paragraph to a file and played it via a MediaPlayer to
-    // influence media-button routing, but that produced NO audio for some
-    // engines/devices (sherpa and Google both) while speak() — the same path
-    // the Settings preview uses — works reliably. Audio focus + an active
-    // MediaSession give us the button routing instead.
-    private var utteranceGen = 0    // increments per utterance; stale callbacks ignored
+    // Playback: the engine SYNTHESIZES each paragraph to a file which we play
+    // with our OWN MediaPlayer. That is what makes Android route headset media
+    // buttons to us — with speak(), the engine's process owns the audio so the
+    // buttons went to the last music app. MediaPlayer also gives true
+    // mid-sentence pause/resume via seek. If an engine can't synthesize a
+    // usable file, we fall back to speak() for the session (audio still plays,
+    // just without reliable headset routing).
+    private var player: MediaPlayer? = null
+    private var preparedIdx = -1
+    private val readyFiles = mutableSetOf<Int>()
+    private val synthesizing = mutableSetOf<Int>()
+    private var awaitingIdx = -1
+    private var awaitingFromMs = 0
+    private var resumePositionMs = 0
+    private var usingSpeakFallback = false
+    private var fallbackToasted = false
     private var audioStarted = false
+    private var playToken = 0
 
-    /** Invalidate any in-flight utterance so its callbacks are ignored. */
-    private fun clearSynthCache() {
-        utteranceGen++
-        audioStarted = false
+    private fun synthFile(idx: Int) = java.io.File(cacheDir, "tts-$idx.wav")
+
+    private fun releasePlayer() {
+        runCatching { player?.release() }
+        player = null
+        preparedIdx = -1
+    }
+
+    /** Release the player and forget the paused position (position changed). */
+    private fun discardPlayer() {
+        releasePlayer()
+        resumePositionMs = 0
+        playToken++
         cancelAudioWatchdog()
     }
-    private fun discardPlayer() = clearSynthCache()
 
-    // Each paragraph is spoken as a queue of sentences so pause/resume can
-    // continue from the current sentence rather than restarting the paragraph.
-    // utteranceId encodes "utt-<gen>-<sentenceIndex>".
-    private var sentences: List<String> = emptyList()
-    private var sentencesForIndex = -1
-    private var sentenceIdx = 0
-
-    private fun splitSentences(text: String): List<String> {
-        val out = ArrayList<String>()
-        val m = java.util.regex.Pattern
-            .compile("[^.!?]*[.!?]+[\"')\\]]*\\s*|[^.!?]+$")
-            .matcher(text)
-        while (m.find()) m.group().trim().takeIf { it.isNotEmpty() }?.let { out.add(it) }
-        return if (out.isEmpty()) listOf(text) else out
-    }
-
-    private fun parseUtt(id: String?): Pair<Int, Int>? {
-        val parts = (id ?: return null).removePrefix("utt-").split("-")
-        if (parts.size != 2) return null
-        val g = parts[0].toIntOrNull() ?: return null
-        val s = parts[1].toIntOrNull() ?: return null
-        return g to s
+    /** Full reset: new article or stop. */
+    private fun clearSynthCache() {
+        discardPlayer()
+        readyFiles.clear()
+        synthesizing.clear()
+        awaitingIdx = -1
+        usingSpeakFallback = false
+        fallbackToasted = false
+        cacheDir.listFiles()?.filter { it.name.startsWith("tts-") }?.forEach { it.delete() }
     }
 
     private val utteranceListener = object : UtteranceProgressListener() {
         override fun onStart(utteranceId: String?) {
-            val (gen, si) = parseUtt(utteranceId) ?: return
-            mainHandler.post {
-                if (gen == utteranceGen) {
-                    audioStarted = true
-                    sentenceIdx = si
-                    cancelAudioWatchdog()
-                    logDbg("speaking gen=$gen idx=$currentIndex s=$si/${sentences.size}")
-                    updateNotification()
-                }
+            if (utteranceId?.startsWith("spk-") == true) mainHandler.post {
+                audioStarted = true
+                cancelAudioWatchdog()
+                logDbg("speaking (fallback) idx=$currentIndex")
+                updateNotification()
             }
         }
 
         override fun onDone(utteranceId: String?) {
-            val (gen, si) = parseUtt(utteranceId) ?: return
+            val id = utteranceId ?: return
             mainHandler.post {
-                if (gen == utteranceGen && isPlaying && si >= sentences.size - 1) {
-                    // last sentence of the paragraph finished → next paragraph
-                    logDbg("done gen=$gen idx=$currentIndex")
-                    advanceAndSpeak()
+                when {
+                    id.startsWith("synth-") -> {
+                        val idx = id.removePrefix("synth-").toIntOrNull() ?: return@post
+                        synthesizing.remove(idx)
+                        val f = synthFile(idx)
+                        if (f.exists() && f.length() > 128) {
+                            readyFiles.add(idx)
+                            logDbg("synth done idx=$idx (${f.length()} bytes)")
+                            if (idx == awaitingIdx && isPlaying) { awaitingIdx = -1; startFilePlayback(idx, awaitingFromMs) }
+                        } else {
+                            logDbg("synth EMPTY idx=$idx")
+                            if (idx == awaitingIdx && isPlaying) { awaitingIdx = -1; beginSpeakFallback("empty synth file") }
+                        }
+                    }
+                    id.startsWith("spk-") -> {
+                        val idx = id.removePrefix("spk-").toIntOrNull() ?: return@post
+                        if (usingSpeakFallback && isPlaying && idx == currentIndex) {
+                            logDbg("done (fallback) idx=$idx")
+                            advanceAndSpeak()
+                        }
+                    }
                 }
             }
         }
 
         private fun failed(utteranceId: String?) {
-            val (gen, _) = parseUtt(utteranceId) ?: return
+            val id = utteranceId ?: return
             mainHandler.post {
-                if (gen == utteranceGen && isPlaying) {
-                    logDbg("utterance ERROR gen=$gen")
+                if (id.startsWith("synth-")) {
+                    val idx = id.removePrefix("synth-").toIntOrNull() ?: return@post
+                    synthesizing.remove(idx)
+                    logDbg("synth ERROR idx=$idx")
+                    if (idx == awaitingIdx && isPlaying) { awaitingIdx = -1; beginSpeakFallback("synth error") }
+                } else if (id.startsWith("spk-") && isPlaying) {
+                    logDbg("fallback speak ERROR")
                     failEngineAndRetry("The voice engine reported an error")
                 }
             }
@@ -691,83 +722,159 @@ class TtsService : Service() {
         }
     }
 
-    /** Start the current paragraph from its first sentence. */
+    /** Start the current paragraph from the beginning. */
     private fun speakCurrent() {
         val idx = nextSpeakable(currentIndex) ?: run { handleStop(); return }
         currentIndex = idx
-        sentences = speakableText(blocks[idx])?.let { splitSentences(it) } ?: run { handleStop(); return }
-        sentencesForIndex = idx
-        speakFromSentence(0)
+        resumePositionMs = 0
+        playParagraph(idx, 0)
     }
 
-    /** Resume: continue the current paragraph from the sentence we paused on. */
+    /** Resume: continue the current paragraph from where we paused. */
     private fun resumeSpeaking() {
-        if (sentencesForIndex == currentIndex && sentenceIdx in sentences.indices) {
-            speakFromSentence(sentenceIdx)
+        if (!usingSpeakFallback && player != null && preparedIdx == currentIndex) {
+            audioStarted = true
+            runCatching { player?.start() }
+            logDbg("resume player idx=$currentIndex at ${resumePositionMs}ms")
+            publishState(); updatePlaybackState(); updateNotification()
         } else {
-            speakCurrent()
+            val idx = nextSpeakable(currentIndex) ?: run { handleStop(); return }
+            currentIndex = idx
+            playParagraph(idx, resumePositionMs)
         }
     }
 
-    private fun speakFromSentence(startSentence: Int) {
-        val engine = tts
-        if (engine == null || !ttsReady) {
-            initTts() // onInit → resumeSpeaking once ready
+    private fun playParagraph(idx: Int, fromMs: Int) {
+        if (tts == null || !ttsReady) { initTts(); return } // onInit → resumeSpeaking
+        audioStarted = false
+        playToken++
+        if (usingSpeakFallback) { speakFallback(idx); return }
+        if (readyFiles.contains(idx) && synthFile(idx).exists()) {
+            startFilePlayback(idx, fromMs)
+        } else {
+            awaitingIdx = idx
+            awaitingFromMs = fromMs
+            releasePlayer()
+            synthesize(idx)
+            armAudioWatchdog(playToken)
+            publishState(); updatePlaybackState(); updateNotification()
+        }
+    }
+
+    private fun synthesize(idx: Int) {
+        if (idx < 0 || synthesizing.contains(idx) || readyFiles.contains(idx)) return
+        val engine = tts ?: return
+        val text = speakableText(blocks.getOrNull(idx) ?: return) ?: return
+        synthesizing.add(idx)
+        engine.setSpeechRate(app.settings.ttsSpeechRate)
+        logDbg("synth queue idx=$idx (${text.length} chars) engine=${initializedEngine ?: "system"}")
+        val res = engine.synthesizeToFile(text, android.os.Bundle(), synthFile(idx), "synth-$idx")
+        if (res != TextToSpeech.SUCCESS) {
+            synthesizing.remove(idx)
+            logDbg("synth REJECTED idx=$idx code=$res")
+            if (idx == awaitingIdx) beginSpeakFallback("synth rejected")
+        }
+    }
+
+    private fun startFilePlayback(idx: Int, fromMs: Int) {
+        releasePlayer()
+        try {
+            player = MediaPlayer().apply {
+                setAudioAttributes(playbackAudioAttributes)
+                setDataSource(synthFile(idx).path)
+                setOnPreparedListener { mp ->
+                    preparedIdx = idx
+                    if (fromMs > 0) runCatching { mp.seekTo(fromMs) }
+                    if (isPlaying) {
+                        mp.start()
+                        audioStarted = true
+                        cancelAudioWatchdog()
+                        logDbg("playing idx=$idx (${mp.duration}ms) from=${fromMs}ms")
+                    }
+                    // prefetch the next paragraph while this one plays
+                    nextSpeakable(idx + 1)?.let { synthesize(it) }
+                    publishState(); updatePlaybackState(); updateNotification()
+                }
+                setOnCompletionListener {
+                    logDbg("completed idx=$idx")
+                    synthFile(idx).delete(); readyFiles.remove(idx)
+                    preparedIdx = -1; resumePositionMs = 0
+                    if (isPlaying) advanceAndSpeak()
+                }
+                setOnErrorListener { _, what, extra ->
+                    logDbg("PLAYER ERROR idx=$idx what=$what extra=$extra")
+                    releasePlayer()
+                    if (isPlaying) beginSpeakFallback("player error")
+                    true
+                }
+                prepareAsync()
+            }
+        } catch (e: Exception) {
+            logDbg("PLAYER EXCEPTION idx=$idx: ${e.message}")
+            beginSpeakFallback("player exception")
+        }
+    }
+
+    // Fallback: engine can't produce a playable file → use speak(). Audio still
+    // works; headset buttons may not route (the engine owns the audio then).
+    private fun beginSpeakFallback(why: String) {
+        logDbg("SPEAK FALLBACK ($why) — headset buttons may not route now")
+        usingSpeakFallback = true
+        releasePlayer()
+        if (!fallbackToasted) {
+            fallbackToasted = true
+            Toast.makeText(this, "This voice streams through the system; headset controls may be limited", Toast.LENGTH_LONG).show()
+        }
+        speakFallback(currentIndex)
+    }
+
+    private fun speakFallback(idx: Int) {
+        val engine = tts ?: return
+        val text = speakableText(blocks.getOrNull(idx) ?: return) ?: run { advanceAndSpeak(); return }
+        currentIndex = idx
+        audioStarted = false
+        playToken++
+        engine.setSpeechRate(app.settings.ttsSpeechRate)
+        logDbg("speak (fallback) idx=$idx")
+        val res = engine.speak(text, TextToSpeech.QUEUE_FLUSH, null, "spk-$idx")
+        if (res != TextToSpeech.SUCCESS) {
+            logDbg("fallback speak REJECTED code=$res")
+            failEngineAndRetry("The voice engine rejected the request")
             return
         }
-        audioStarted = false
-        sentenceIdx = startSentence.coerceIn(0, (sentences.size - 1).coerceAtLeast(0))
-        val gen = ++utteranceGen
-        engine.setSpeechRate(app.settings.ttsSpeechRate)
-        logDbg("speak gen=$gen idx=$currentIndex from s=$sentenceIdx/${sentences.size} engine=${initializedEngine ?: "system"}")
-        var queued = false
-        for (i in sentenceIdx until sentences.size) {
-            val mode = if (!queued) TextToSpeech.QUEUE_FLUSH else TextToSpeech.QUEUE_ADD
-            val res = engine.speak(sentences[i], mode, null, "utt-$gen-$i")
-            if (res != TextToSpeech.SUCCESS) {
-                logDbg("speak REJECTED idx=$currentIndex s=$i code=$res")
-                failEngineAndRetry("The voice engine rejected the request")
-                return
-            }
-            queued = true
-        }
-        if (!queued) { advanceAndSpeak(); return }
-        armAudioWatchdog(gen)
-        publishState()
-        updatePlaybackState()
-        updateNotification()
+        armAudioWatchdog(playToken)
+        publishState(); updatePlaybackState(); updateNotification()
     }
 
-    // If audio never starts (engine stuck loading a model, or silently
-    // failing), fall back to the system voice instead of sitting silent.
+    // If no audio starts, fall back / skip instead of sitting silent.
     private var audioWatchdogGen = 0
     private fun cancelAudioWatchdog() { audioWatchdogGen++ }
-    private fun armAudioWatchdog(utterGen: Int) {
+    private fun armAudioWatchdog(token: Int) {
         val w = ++audioWatchdogGen
         mainHandler.postDelayed({
-            if (w == audioWatchdogGen && isPlaying && utterGen == utteranceGen && !audioStarted) {
-                logDbg("WATCHDOG: no audio for gen=$utterGen")
-                failEngineAndRetry("The selected voice isn't responding")
+            if (w == audioWatchdogGen && isPlaying && token == playToken && !audioStarted) {
+                logDbg("WATCHDOG: no audio (token=$token)")
+                if (!usingSpeakFallback) beginSpeakFallback("watchdog: no audio")
+                else failEngineAndRetry("The selected voice isn't responding")
             }
         }, 12_000)
     }
 
     private fun failEngineAndRetry(reason: String) {
-        logDbg("fallback: $reason (was ${initializedEngine ?: "system default"})")
+        logDbg("engine fallback: $reason (was ${initializedEngine ?: "system default"})")
         cancelAudioWatchdog()
         if (initializedEngine == null) {
-            // already on the system default — skip this paragraph
             Toast.makeText(this, "$reason — skipping paragraph", Toast.LENGTH_LONG).show()
             advanceAndSpeak()
             return
         }
         Toast.makeText(this, "$reason — using the system voice", Toast.LENGTH_LONG).show()
         engineBlockedThisSession = initializedEngine
-        tts?.stop()
-        tts?.shutdown()
-        tts = null
-        ttsReady = false
-        initTts() // re-inits with the system default, then speakCurrent
+        tts?.stop(); tts?.shutdown(); tts = null; ttsReady = false
+        // Give the fresh engine its own chance at file playback.
+        usingSpeakFallback = false
+        readyFiles.clear(); synthesizing.clear(); awaitingIdx = -1
+        initTts() // re-inits with the system default, then resumeSpeaking
     }
 
     /** Engine that failed this session; skipped until the service restarts. */
