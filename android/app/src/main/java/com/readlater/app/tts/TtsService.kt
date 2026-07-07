@@ -42,7 +42,9 @@ import kotlinx.coroutines.withContext
 data class TtsPlaybackState(
     val articleId: String? = null,
     val paragraphIndex: Int = 0,
-    val isPlaying: Boolean = false
+    val isPlaying: Boolean = false,
+    /** Playing but no audio yet — checking the server / synthesizing / downloading. */
+    val preparing: Boolean = false
 )
 
 /**
@@ -307,7 +309,10 @@ class TtsService : Service() {
             currentIndex = (if (startParagraph >= 0) startParagraph else resumeAt)
                 .coerceIn(0, blocks.size - 1)
             isPlaying = true
+            audioStarted = false
             clearSynthCache() // article or rate may have changed; drop stale audio
+            publishState() // show "preparing" immediately while we set up audio
+            updateNotification()
             recomputeDurations()
             updateMetadata()
             acquireWakeLock()
@@ -1241,7 +1246,7 @@ class TtsService : Service() {
     // ------------------------------------------------------------------ state
 
     private fun publishState() {
-        stateFlow.value = TtsPlaybackState(articleId, currentIndex, isPlaying)
+        stateFlow.value = TtsPlaybackState(articleId, currentIndex, isPlaying, isPlaying && !audioStarted)
     }
 
     private fun updatePlaybackState() {

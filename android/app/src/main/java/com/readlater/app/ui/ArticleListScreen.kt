@@ -55,15 +55,19 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import android.content.Context
 import android.content.Intent
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.GraphicEq
+import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material3.Surface
+import androidx.compose.material3.TextField
+import androidx.compose.material3.TextFieldDefaults
 import com.readlater.app.ReadLaterApp
 import com.readlater.app.data.ArticleEntity
 import com.readlater.app.data.RemoteView
@@ -128,9 +132,13 @@ fun ArticleListScreen(
     var showArchived by remember { mutableStateOf(false) }
     var selectedView by remember { mutableStateOf<RemoteView?>(null) }
     var views by remember { mutableStateOf<List<RemoteView>>(emptyList()) }
+    var searchActive by remember { mutableStateOf(false) }
+    var searchQuery by remember { mutableStateOf("") }
 
-    val unsorted by remember(showArchived, selectedView) {
-        if (selectedView != null) repo.allArticles() else repo.articles(showArchived)
+    // While searching, look across the whole library (incl. archived), not just
+    // the current inbox/archive tab.
+    val unsorted by remember(showArchived, selectedView, searchActive) {
+        if (selectedView != null || searchActive) repo.allArticles() else repo.articles(showArchived)
     }.collectAsState(initial = emptyList())
     val hlCounts by repo.highlightCounts().collectAsState(initial = emptyList())
     var syncing by remember { mutableStateOf(false) }
@@ -139,12 +147,24 @@ fun ArticleListScreen(
         mutableStateOf(runCatching { SortMode.valueOf(app.settings.listSort) }.getOrDefault(SortMode.NEWEST))
     }
     var sortMenuOpen by remember { mutableStateOf(false) }
-    val articles = remember(unsorted, sortMode, selectedView, hlCounts) {
+
+    val articles = remember(unsorted, sortMode, selectedView, hlCounts, searchQuery, searchActive) {
         val counts = hlCounts.associate { it.articleId to it.n }
         val view = selectedView
-        val filtered = if (view != null) {
+        var filtered = if (view != null) {
             unsorted.filter { matchesView(it, view, counts[it.id] ?: 0) }
         } else unsorted
+        val q = searchQuery.trim()
+        if (searchActive && q.length < 2) {
+            filtered = emptyList() // waiting for a query
+        } else if (q.length >= 2) {
+            filtered = filtered.filter {
+                it.title.contains(q, ignoreCase = true) ||
+                    (it.excerpt?.contains(q, ignoreCase = true) == true) ||
+                    (it.siteName?.contains(q, ignoreCase = true) == true) ||
+                    it.url.contains(q, ignoreCase = true)
+            }
+        }
         when (sortMode) {
             SortMode.NEWEST -> filtered.sortedByDescending { it.savedAt }
             SortMode.OLDEST -> filtered.sortedBy { it.savedAt }
@@ -189,8 +209,38 @@ fun ArticleListScreen(
         snackbarHost = { SnackbarHost(snackbarHostState) },
         topBar = {
             TopAppBar(
-                title = { Text("Earmark") },
+                navigationIcon = {
+                    if (searchActive) {
+                        IconButton(onClick = { searchActive = false; searchQuery = "" }) {
+                            Icon(Icons.Filled.Close, contentDescription = "Close search")
+                        }
+                    }
+                },
+                title = {
+                    if (searchActive) {
+                        TextField(
+                            value = searchQuery,
+                            onValueChange = { searchQuery = it },
+                            placeholder = { Text("Search your library") },
+                            singleLine = true,
+                            colors = TextFieldDefaults.colors(
+                                focusedContainerColor = Color.Transparent,
+                                unfocusedContainerColor = Color.Transparent,
+                                focusedIndicatorColor = Color.Transparent,
+                                unfocusedIndicatorColor = Color.Transparent
+                            ),
+                            modifier = Modifier.fillMaxWidth()
+                        )
+                    } else {
+                        Text("Earmark")
+                    }
+                },
                 actions = {
+                    if (!searchActive) {
+                        IconButton(onClick = { searchActive = true }) {
+                            Icon(Icons.Filled.Search, contentDescription = "Search")
+                        }
+                    }
                     Box {
                         IconButton(onClick = { sortMenuOpen = true }) {
                             Icon(Icons.AutoMirrored.Filled.Sort, contentDescription = "Sort")
@@ -259,7 +309,11 @@ fun ArticleListScreen(
                         Spacer(modifier = Modifier.width(12.dp))
                         Column(modifier = Modifier.weight(1f)) {
                             Text(
-                                text = if (ttsState.isPlaying) "NOW PLAYING" else "PAUSED",
+                                text = when {
+                                    ttsState.preparing -> "PREPARING AUDIO…"
+                                    ttsState.isPlaying -> "NOW PLAYING"
+                                    else -> "PAUSED"
+                                },
                                 style = MaterialTheme.typography.labelSmall,
                                 color = MaterialTheme.colorScheme.primary
                             )
@@ -268,6 +322,12 @@ fun ArticleListScreen(
                                 style = MaterialTheme.typography.titleSmall,
                                 maxLines = 1,
                                 overflow = TextOverflow.Ellipsis
+                            )
+                        }
+                        if (ttsState.preparing) {
+                            CircularProgressIndicator(
+                                modifier = Modifier.size(24.dp).padding(end = 4.dp),
+                                strokeWidth = 2.dp
                             )
                         }
                         IconButton(onClick = {

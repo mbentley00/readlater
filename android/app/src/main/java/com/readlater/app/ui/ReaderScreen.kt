@@ -20,6 +20,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.itemsIndexed
@@ -450,11 +451,15 @@ fun ReaderScreen(articleId: String, onBack: () -> Unit, onOpenArticle: (String) 
                         }
                     }
                 ) {
-                    Icon(
-                        if (isTtsThisArticle && ttsState.isPlaying) Icons.Filled.Pause
-                        else Icons.Filled.PlayArrow,
-                        contentDescription = "Play or pause"
-                    )
+                    if (isTtsThisArticle && ttsState.preparing) {
+                        CircularProgressIndicator(modifier = Modifier.size(24.dp), strokeWidth = 2.dp)
+                    } else {
+                        Icon(
+                            if (isTtsThisArticle && ttsState.isPlaying) Icons.Filled.Pause
+                            else Icons.Filled.PlayArrow,
+                            contentDescription = "Play or pause"
+                        )
+                    }
                 }
                 IconButton(onClick = { sendTtsCommand(context, TtsService.ACTION_NEXT) }) {
                     Icon(Icons.Filled.SkipNext, contentDescription = "Next paragraph")
