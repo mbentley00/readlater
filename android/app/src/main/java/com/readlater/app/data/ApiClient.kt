@@ -187,6 +187,54 @@ class ApiClient(private val settings: Settings) {
         execute(builder("/api/articles/$id").delete().build())
     }
 
+    /** Status + timing of an article's server-synthesized audio. */
+    data class AudioMeta(
+        val ready: Boolean,
+        val enabled: Boolean,
+        val durationMs: Int,
+        val sampleRate: Int,
+        val offsetsMs: IntArray
+    )
+
+    /** GET /api/articles/{id}/audio — status + per-paragraph offsets. Also asks
+     *  the server to start generating if it isn't cached yet. */
+    suspend fun audioMeta(articleId: String): AudioMeta? = try {
+        val o = JSONObject(execute(builder("/api/articles/$articleId/audio").get().build()))
+        val arr = o.optJSONArray("paragraphOffsetsMs")
+        val offsets = IntArray(arr?.length() ?: 0) { arr!!.getInt(it) }
+        AudioMeta(
+            ready = o.optBoolean("ready", false),
+            enabled = o.optBoolean("enabled", true),
+            durationMs = o.optInt("durationMs", 0),
+            sampleRate = o.optInt("sampleRate", 24000),
+            offsetsMs = offsets
+        )
+    } catch (_: Exception) {
+        null
+    }
+
+    /** POST /api/articles/{id}/audio — force (re)generation. */
+    suspend fun requestAudioGeneration(articleId: String) {
+        runCatching {
+            execute(builder("/api/articles/$articleId/audio").post(ByteArray(0).toRequestBody()).build())
+        }
+    }
+
+    /** GET /api/articles/{id}/audio.wav — stream the WAV to [dest]. */
+    suspend fun downloadAudio(articleId: String, dest: java.io.File): Boolean = withContext(Dispatchers.IO) {
+        try {
+            val resp = client.newCall(builder("/api/articles/$articleId/audio.wav").get().build()).execute()
+            resp.use { r ->
+                if (!r.isSuccessful) return@withContext false
+                val body = r.body ?: return@withContext false
+                dest.outputStream().use { out -> body.byteStream().copyTo(out) }
+            }
+            dest.length() > 44
+        } catch (_: Exception) {
+            dest.delete(); false
+        }
+    }
+
     /** POST /api/save-url — server fetches + extracts the page. Returns the
      *  saved article's title, or throws on failure. */
     suspend fun saveUrl(sharedText: String): String {

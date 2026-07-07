@@ -46,6 +46,14 @@ class Settings(context: Context) {
             prefs.edit().putString(KEY_TTS_ENGINE, value).apply()
         }
 
+    /** Use server-synthesized (Kokoro) audio when available, instead of the
+     *  on-device engine. Falls back to on-device when audio isn't ready. */
+    var useServerVoice: Boolean
+        get() = prefs.getBoolean(KEY_SERVER_VOICE, false)
+        set(value) {
+            prefs.edit().putBoolean(KEY_SERVER_VOICE, value).apply()
+        }
+
     /** TTS voice name within the engine; "" = auto (highest quality). */
     var ttsVoice: String
         get() = prefs.getString(KEY_TTS_VOICE, "").orEmpty()
@@ -75,6 +83,7 @@ class Settings(context: Context) {
         const val KEY_LAST_ARTICLE = "last_article_id"
         const val KEY_TTS_ENGINE = "tts_engine"
         const val KEY_TTS_VOICE = "tts_voice"
+        const val KEY_SERVER_VOICE = "server_voice"
         const val KEY_LAST_SYNC = "last_sync_at"
     }
 }

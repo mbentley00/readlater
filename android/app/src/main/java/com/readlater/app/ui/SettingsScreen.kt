@@ -48,6 +48,7 @@ import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.compose.material3.Surface
+import androidx.compose.material3.Switch
 import androidx.compose.runtime.collectAsState
 import androidx.compose.ui.unit.sp
 import com.readlater.app.BuildConfig
@@ -214,6 +215,33 @@ fun SettingsScreen(onBack: () -> Unit) {
             HorizontalDivider()
 
             Text("Text to speech", style = MaterialTheme.typography.titleMedium)
+
+            // Server voice (Kokoro) — higher-quality audio synthesized on the
+            // server and streamed to the app; falls back to the device engine
+            // when audio isn't ready yet (and asks the server to generate it).
+            var serverVoice by remember { mutableStateOf(settings.useServerVoice) }
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Column(modifier = Modifier.weight(1f)) {
+                    Text("Server voice (Kokoro)", style = MaterialTheme.typography.bodyLarge)
+                    Text(
+                        "Higher-quality neural voice, synthesized on the server. " +
+                            "Falls back to the device voice while audio is being prepared.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+                Switch(checked = serverVoice, onCheckedChange = {
+                    serverVoice = it
+                    settings.useServerVoice = it
+                })
+            }
+            if (!serverVoice) {
+                Text(
+                    "With server voice off, the engine and voice below are used.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
 
             // Engine + voice pickers. A probe TextToSpeech instance (recreated
             // when the engine changes) enumerates voices and plays previews.

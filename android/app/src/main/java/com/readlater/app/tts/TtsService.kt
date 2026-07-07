@@ -132,7 +132,7 @@ class TtsService : Service() {
                     }
                     currentIndex = nextSpeakable(idx) ?: return
                     articleId?.let { app.repository.saveTtsPositionLocal(it, currentIndex) }
-                    if (isPlaying) speakCurrent() else {
+                    if (isPlaying) playFromCurrent() else {
                         discardPlayer()
                         publishState()
                         updatePlaybackState()
@@ -312,6 +312,12 @@ class TtsService : Service() {
             updateMetadata()
             acquireWakeLock()
             requestAudioFocus()
+            speakableBlocks = blocks.indices.filter { speakableText(blocks[it]) != null }
+            // Prefer the server (Kokoro) voice when enabled and available;
+            // otherwise (incl. not-yet-generated) fall back to the device voice.
+            if (app.settings.useServerVoice && tryStartServerVoice(article.id)) {
+                return@launch
+            }
             initTts() // re-checks the preferred engine; no-op when unchanged
             if (ttsReady) speakCurrent()
         }
@@ -368,7 +374,7 @@ class TtsService : Service() {
         val next = nextSpeakable(currentIndex + 1) ?: return
         currentIndex = next
         articleId?.let { app.repository.saveTtsPositionLocal(it, next) }
-        if (isPlaying) speakCurrent() else {
+        if (isPlaying) playFromCurrent() else {
             discardPlayer()
             publishState()
             updateNotification()
@@ -383,7 +389,7 @@ class TtsService : Service() {
         val prev = prevSpeakable(currentIndex - 1) ?: return
         currentIndex = prev
         articleId?.let { app.repository.saveTtsPositionLocal(it, prev) }
-        if (isPlaying) speakCurrent() else {
+        if (isPlaying) playFromCurrent() else {
             discardPlayer()
             publishState()
             updateNotification()
@@ -459,7 +465,7 @@ class TtsService : Service() {
         if (idx != currentIndex) {
             currentIndex = idx
             articleId?.let { app.repository.saveTtsPositionLocal(it, idx) }
-            if (isPlaying) speakCurrent() else {
+            if (isPlaying) playFromCurrent() else {
                 publishState()
                 updateNotification()
             }
@@ -481,7 +487,7 @@ class TtsService : Service() {
         if (requested < 0 || blocks.isEmpty() || articleId == null) return
         currentIndex = nextSpeakable(requested.coerceIn(0, blocks.size - 1)) ?: return
         articleId?.let { app.repository.saveTtsPosition(it, currentIndex) }
-        if (isPlaying) speakCurrent() else {
+        if (isPlaying) playFromCurrent() else {
             discardPlayer() // paused mid-paragraph audio is now stale
             publishState()
             updatePlaybackState()
@@ -643,6 +649,35 @@ class TtsService : Service() {
 
     private fun synthFile(idx: Int) = java.io.File(cacheDir, "tts-$idx.wav")
 
+    // --- Server voice (Kokoro): one downloaded WAV for the whole article,
+    // played continuously; playback time maps to app paragraphs via the
+    // server's per-paragraph offsets so highlight/resume keep working.
+    private var serverMode = false
+    private var serverOffsetsMs = IntArray(0)
+    private var speakableBlocks: List<Int> = emptyList() // app block indices that are speakable
+    private fun serverWavFile(id: String) = java.io.File(cacheDir, "server-$id.wav")
+
+    /** App block index playing at time [ms]. */
+    private fun blockForMs(ms: Int): Int {
+        if (serverOffsetsMs.isEmpty() || speakableBlocks.isEmpty()) return currentIndex
+        var p = 0
+        for (i in serverOffsetsMs.indices) { if (serverOffsetsMs[i] <= ms) p = i else break }
+        return speakableBlocks.getOrElse(p) { speakableBlocks.last() }
+    }
+
+    /** Playback time (ms) at which app block [blockIdx] starts. */
+    private fun msForBlock(blockIdx: Int): Int {
+        if (serverOffsetsMs.isEmpty() || speakableBlocks.isEmpty()) return 0
+        var p = speakableBlocks.indexOfFirst { it >= blockIdx }
+        if (p < 0) p = speakableBlocks.size - 1
+        return serverOffsetsMs.getOrElse(p.coerceAtLeast(0)) { 0 }
+    }
+
+    /** Resume playback of the current paragraph in whichever mode is active. */
+    private fun playFromCurrent() {
+        if (serverMode) startServerStream(msForBlock(currentIndex)) else speakCurrent()
+    }
+
     /** ms already played on the current AudioTrack, from its playback head. */
     private fun trackPositionMs(): Int {
         val t = audioTrack ?: return trackStartMs
@@ -677,6 +712,7 @@ class TtsService : Service() {
         awaitingIdx = -1
         usingSpeakFallback = false
         fallbackToasted = false
+        serverMode = false
         cacheDir.listFiles()?.filter { it.name.startsWith("tts-") }?.forEach { it.delete() }
     }
 
@@ -775,6 +811,7 @@ class TtsService : Service() {
     /** Resume: continue the current paragraph from where we paused (we release
      *  the AudioTrack on pause, so we re-stream from the saved byte offset). */
     private fun resumeSpeaking() {
+        if (serverMode) { startServerStream(resumePositionMs); return }
         val idx = nextSpeakable(currentIndex) ?: run { handleStop(); return }
         currentIndex = idx
         playParagraph(idx, if (usingSpeakFallback) 0 else resumePositionMs)
@@ -954,6 +991,134 @@ class TtsService : Service() {
         } catch (e: Exception) {
             logDbg("AudioTrack INIT ERROR idx=$idx: ${e.message}")
             beginSpeakFallback("audiotrack init")
+        }
+    }
+
+    /**
+     * Try to play server-synthesized (Kokoro) audio. Returns true if it started.
+     * When the audio isn't cached yet it asks the server to generate it (so it's
+     * ready next time) and returns false so the caller uses the device voice now.
+     */
+    private suspend fun tryStartServerVoice(id: String): Boolean {
+        val meta = app.apiClient.audioMeta(id) ?: return false
+        if (!meta.enabled) return false
+        if (!meta.ready) {
+            app.apiClient.requestAudioGeneration(id) // generate for next time
+            logDbg("server audio not cached — requested generation; using device voice now")
+            return false
+        }
+        val file = serverWavFile(id)
+        if (file.length() < 44) {
+            logDbg("downloading server audio for $id")
+            if (!app.apiClient.downloadAudio(id, file)) { logDbg("server audio download failed"); return false }
+        }
+        if (id != articleId || !isPlaying) return false // superseded while downloading
+        serverOffsetsMs = meta.offsetsMs
+        serverMode = true
+        logDbg("server voice: ${serverOffsetsMs.size} paragraphs, ${file.length()} bytes")
+        startServerStream(msForBlock(currentIndex))
+        return true
+    }
+
+    /** Stream the whole-article server WAV via AudioTrack from [fromMs], updating
+     *  the current paragraph from playback time as it goes. */
+    private fun startServerStream(fromMs: Int) {
+        releasePlayer()
+        val file = serverWavFile(articleId ?: return)
+        val wav = parseWav(file) ?: run {
+            logDbg("server WAV parse failed — device voice")
+            serverMode = false; speakCurrent(); return
+        }
+        try {
+            val channelMask = if (wav.channels >= 2) android.media.AudioFormat.CHANNEL_OUT_STEREO
+                else android.media.AudioFormat.CHANNEL_OUT_MONO
+            val minBuf = android.media.AudioTrack.getMinBufferSize(
+                wav.sampleRate, channelMask, android.media.AudioFormat.ENCODING_PCM_16BIT
+            ).coerceAtLeast(64 * 1024)
+            val track = android.media.AudioTrack.Builder()
+                .setAudioAttributes(playbackAudioAttributes)
+                .setAudioFormat(
+                    android.media.AudioFormat.Builder()
+                        .setSampleRate(wav.sampleRate)
+                        .setChannelMask(channelMask)
+                        .setEncoding(android.media.AudioFormat.ENCODING_PCM_16BIT)
+                        .build()
+                )
+                .setBufferSizeInBytes(minBuf)
+                .setTransferMode(android.media.AudioTrack.MODE_STREAM)
+                .build()
+            audioTrack = track
+            trackSampleRate = wav.sampleRate
+            trackChannels = wav.channels
+            trackStartMs = fromMs
+            audioStarted = true
+            cancelAudioWatchdog()
+            track.play()
+            logDbg("playing (server) from=${fromMs}ms")
+            publishState(); updatePlaybackState(); updateNotification()
+
+            val frameBytes = wav.channels * 2
+            val startByte = wav.dataOffset + (fromMs.toLong() * wav.sampleRate / 1000 * frameBytes)
+                .coerceIn(0L, wav.dataLen)
+            val myGen = ++playThreadGen
+            playThread = Thread {
+                try {
+                    var bytesWritten = 0L
+                    var lastBlock = -1
+                    java.io.RandomAccessFile(file, "r").use { raf ->
+                        raf.seek(startByte)
+                        val buf = ByteArray(16 * 1024)
+                        var remaining = wav.dataOffset + wav.dataLen - startByte
+                        while (myGen == playThreadGen && remaining > 0) {
+                            val toRead = minOf(buf.size.toLong(), remaining).toInt()
+                            val n = raf.read(buf, 0, toRead)
+                            if (n <= 0) break
+                            var off = 0
+                            while (off < n && myGen == playThreadGen) {
+                                val w = track.write(buf, off, n - off)
+                                if (w <= 0) { off = -1; break }
+                                off += w
+                                bytesWritten += w
+                            }
+                            if (off < 0) break
+                            remaining -= n
+                            // advance the highlighted paragraph as playback moves
+                            val blk = blockForMs(trackPositionMs())
+                            if (blk != lastBlock) {
+                                lastBlock = blk
+                                mainHandler.post {
+                                    if (myGen == playThreadGen && isPlaying && serverMode) {
+                                        currentIndex = blk
+                                        articleId?.let { app.repository.saveTtsPositionLocal(it, blk) }
+                                        publishState(); updateNotification()
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    val framesToDrain = bytesWritten / frameBytes
+                    val deadline = System.currentTimeMillis() +
+                        (framesToDrain * 1000L / trackSampleRate) + 2000
+                    while (myGen == playThreadGen &&
+                        (track.playbackHeadPosition.toLong() and 0xFFFFFFFFL) < framesToDrain &&
+                        System.currentTimeMillis() < deadline
+                    ) Thread.sleep(40)
+                    if (myGen == playThreadGen) mainHandler.post {
+                        if (myGen == playThreadGen && isPlaying && serverMode) {
+                            logDbg("server complete (${bytesWritten}B)")
+                            currentIndex = 0
+                            handleStop()
+                        }
+                    }
+                } catch (e: Exception) {
+                    mainHandler.post {
+                        if (myGen == playThreadGen) { logDbg("server stream ERROR: ${e.message}"); if (isPlaying) handleStop() }
+                    }
+                }
+            }.also { it.isDaemon = true; it.start() }
+        } catch (e: Exception) {
+            logDbg("server AudioTrack INIT ERROR: ${e.message}")
+            serverMode = false; speakCurrent()
         }
     }
 
