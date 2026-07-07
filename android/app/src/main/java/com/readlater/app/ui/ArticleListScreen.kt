@@ -89,6 +89,7 @@ enum class SortMode(val label: String) {
     OLDEST("Oldest first"),
     LONGEST("Longest first"),
     SHORTEST("Shortest first"),
+    RANDOM("Random"),
 }
 
 /** ~225 words per minute; 0 when the word count is unknown. */
@@ -147,8 +148,11 @@ fun ArticleListScreen(
         mutableStateOf(runCatching { SortMode.valueOf(app.settings.listSort) }.getOrDefault(SortMode.NEWEST))
     }
     var sortMenuOpen by remember { mutableStateOf(false) }
+    // Stable shuffle so RANDOM doesn't reshuffle on every recomposition; a new
+    // seed (re-tapping Random) gives a fresh order.
+    var shuffleSeed by remember { mutableStateOf(0L) }
 
-    val articles = remember(unsorted, sortMode, selectedView, hlCounts, searchQuery, searchActive) {
+    val articles = remember(unsorted, sortMode, selectedView, hlCounts, searchQuery, searchActive, shuffleSeed) {
         val counts = hlCounts.associate { it.articleId to it.n }
         val view = selectedView
         var filtered = if (view != null) {
@@ -170,6 +174,7 @@ fun ArticleListScreen(
             SortMode.OLDEST -> filtered.sortedBy { it.savedAt }
             SortMode.LONGEST -> filtered.sortedByDescending { it.wordCount }
             SortMode.SHORTEST -> filtered.sortedBy { it.wordCount }
+            SortMode.RANDOM -> filtered.shuffled(kotlin.random.Random(shuffleSeed))
         }
     }
 
@@ -255,6 +260,8 @@ fun ArticleListScreen(
                                         }
                                     },
                                     onClick = {
+                                        // Re-tapping Random reshuffles.
+                                        if (mode == SortMode.RANDOM) shuffleSeed = System.currentTimeMillis()
                                         sortMode = mode
                                         app.settings.listSort = mode.name
                                         sortMenuOpen = false

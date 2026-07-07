@@ -97,6 +97,7 @@ class TtsService : Service() {
     private var ttsReady = false
     private var mediaSession: MediaSessionCompat? = null
     private var wakeLock: PowerManager.WakeLock? = null
+    private var wifiLock: android.net.wifi.WifiManager.WifiLock? = null
 
     private var articleId: String? = null
     private var articleTitle = ""
@@ -644,6 +645,7 @@ class TtsService : Service() {
     private var trackSampleRate = 22050
     private var trackChannels = 1
     private var trackStartMs = 0
+    private var trackSpeed = 1.0f // AudioTrack playback speed (server audio only)
     private var preparedIdx = -1
     private val readyFiles = mutableSetOf<Int>()
     private val synthesizing = mutableSetOf<Int>()
@@ -711,7 +713,20 @@ class TtsService : Service() {
     private fun trackPositionMs(): Int {
         val t = audioTrack ?: return trackStartMs
         val frames = runCatching { t.playbackHeadPosition.toLong() and 0xFFFFFFFFL }.getOrDefault(0L)
-        return trackStartMs + (frames * 1000L / trackSampleRate).toInt()
+        // playbackHeadPosition counts rendered (sink) frames = real elapsed time;
+        // at playback speed S the SOURCE position advances S× as fast.
+        val realMs = frames * 1000L / trackSampleRate
+        return trackStartMs + (realMs * trackSpeed).toInt()
+    }
+
+    /** Apply the user's speech rate to a server AudioTrack (pitch preserved). */
+    private fun applyTrackSpeed(track: android.media.AudioTrack, speed: Float) {
+        trackSpeed = speed
+        runCatching {
+            track.playbackParams = android.media.PlaybackParams()
+                .setSpeed(speed)
+                .setPitch(1.0f)
+        }
     }
 
     private fun releasePlayer() {
@@ -955,6 +970,7 @@ class TtsService : Service() {
             trackSampleRate = wav.sampleRate
             trackChannels = wav.channels
             trackStartMs = fromMs
+            trackSpeed = 1.0f // device audio is already synthesized at the set rate
             preparedIdx = idx
             audioStarted = true
             cancelAudioWatchdog()
@@ -1111,8 +1127,9 @@ class TtsService : Service() {
             trackStartMs = fromMs
             audioStarted = true
             cancelAudioWatchdog()
+            applyTrackSpeed(track, app.settings.ttsSpeechRate)
             track.play()
-            logDbg("playing (server) from=${fromMs}ms")
+            logDbg("playing (server) from=${fromMs}ms speed=$trackSpeed")
             publishState(); updatePlaybackState(); updateNotification()
 
             val frameBytes = wav.channels * 2
@@ -1154,7 +1171,8 @@ class TtsService : Service() {
                             }
                         }
                     }
-                    val framesToDrain = bytesWritten / frameBytes
+                    // sink frames rendered = source frames / speed
+                    val framesToDrain = ((bytesWritten / frameBytes) / trackSpeed).toLong()
                     val deadline = System.currentTimeMillis() +
                         (framesToDrain * 1000L / trackSampleRate) + 2000
                     while (myGen == playThreadGen &&
@@ -1233,13 +1251,15 @@ class TtsService : Service() {
                 trackSampleRate = sampleRate
                 trackChannels = channels
                 val frameBytes = channels * 2
+                val speed = app.settings.ttsSpeechRate
+                applyTrackSpeed(track, speed)
                 track.play()
                 mainHandler.post {
                     if (myGen == playThreadGen && isPlaying && serverMode) {
                         audioTrack = track
                         audioStarted = true
                         cancelAudioWatchdog()
-                        logDbg("playing (server opus) sr=$sampleRate ch=$channels from=${fromMs}ms")
+                        logDbg("playing (server opus) sr=$sampleRate ch=$channels from=${fromMs}ms speed=$speed")
                         publishState(); updatePlaybackState(); updateNotification()
                     }
                 }
@@ -1294,8 +1314,8 @@ class TtsService : Service() {
                         if (info.flags and android.media.MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0) sawOutputEOS = true
                     }
                 }
-                // let the buffered PCM finish playing
-                val framesToDrain = bytesWritten / frameBytes
+                // let the buffered PCM finish playing (sink frames = source/speed)
+                val framesToDrain = ((bytesWritten / frameBytes) / speed).toLong()
                 val deadline = System.currentTimeMillis() + (framesToDrain * 1000L / trackSampleRate) + 2000
                 while (myGen == playThreadGen &&
                     (track.playbackHeadPosition.toLong() and 0xFFFFFFFFL) < framesToDrain &&
@@ -1452,19 +1472,29 @@ class TtsService : Service() {
     // ------------------------------------------------------------------ wake lock
 
     private fun acquireWakeLock() {
-        if (wakeLock?.isHeld == true) return
-        val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
-        wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "ReadLater::TtsWakeLock").apply {
-            setReferenceCounted(false)
-            acquire(6 * 60 * 60 * 1000L) // safety cap: 6 hours
+        if (wakeLock?.isHeld != true) {
+            val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
+            wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "ReadLater::TtsWakeLock").apply {
+                setReferenceCounted(false)
+                acquire(6 * 60 * 60 * 1000L) // safety cap: 6 hours
+            }
+        }
+        // Keep WiFi awake too, so downloading/waiting for server audio doesn't
+        // stall when the screen turns off.
+        if (wifiLock?.isHeld != true) {
+            val wm = applicationContext.getSystemService(Context.WIFI_SERVICE) as android.net.wifi.WifiManager
+            wifiLock = wm.createWifiLock(android.net.wifi.WifiManager.WIFI_MODE_FULL_HIGH_PERF, "ReadLater::TtsWifi").apply {
+                setReferenceCounted(false)
+                acquire()
+            }
         }
     }
 
     private fun releaseWakeLock() {
-        if (wakeLock?.isHeld == true) {
-            wakeLock?.release()
-        }
+        if (wakeLock?.isHeld == true) wakeLock?.release()
         wakeLock = null
+        if (wifiLock?.isHeld == true) wifiLock?.release()
+        wifiLock = null
     }
 
     // ------------------------------------------------------------------ notification
