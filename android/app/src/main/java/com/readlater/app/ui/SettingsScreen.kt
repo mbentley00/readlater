@@ -346,6 +346,40 @@ fun SettingsScreen(onBack: () -> Unit) {
 
             HorizontalDivider()
 
+            Text("Background playback", style = MaterialTheme.typography.titleMedium)
+            val powerManager = context.getSystemService(android.content.Context.POWER_SERVICE) as android.os.PowerManager
+            // recomputed whenever the screen recomposes (e.g. returning from the
+            // system dialog) so the status reflects the current grant.
+            var batteryChecks by remember { mutableStateOf(0) }
+            val ignoringBattery = remember(batteryChecks) {
+                powerManager.isIgnoringBatteryOptimizations(context.packageName)
+            }
+            Text(
+                text = if (ignoringBattery)
+                    "Battery optimization is off for Earmark — playback should keep running in the background."
+                else
+                    "Android may stop playback when Earmark is in the background. Allow it to run unrestricted so listening isn't interrupted.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            if (!ignoringBattery) {
+                Button(onClick = {
+                    runCatching {
+                        context.startActivity(
+                            android.content.Intent(
+                                android.provider.Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
+                                android.net.Uri.parse("package:${context.packageName}")
+                            )
+                        )
+                    }
+                    batteryChecks++
+                }) { Text("Allow background playback") }
+            } else {
+                Text("Allowed ✓", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.primary)
+            }
+
+            HorizontalDivider()
+
             Text("About", style = MaterialTheme.typography.titleMedium)
             var latest by remember { mutableStateOf<Pair<String, Int>?>(null) }
             LaunchedEffect(Unit) { latest = app.apiClient.latestAppVersion() }

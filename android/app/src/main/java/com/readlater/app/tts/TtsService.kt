@@ -251,6 +251,9 @@ class TtsService : Service() {
     }
 
     override fun onDestroy() {
+        // Best-effort: persist the listening position if we're being torn down
+        // mid-playback (repository scope is app-lived, so this survives us).
+        if (isPlaying) articleId?.let { app.repository.saveTtsPosition(it, currentIndex) }
         stateFlow.value = TtsPlaybackState()
         releaseWakeLock()
         abandonAudioFocus()
@@ -287,6 +290,9 @@ class TtsService : Service() {
                 return@launch
             }
             articleId = article.id
+            // Make this the cold-start resume target: if the process is killed
+            // while listening, reopening returns to this article.
+            app.settings.lastArticleId = article.id
             articleTitle = article.title
             articleSite = article.siteName.orEmpty()
             blocks = HtmlParser.parse(html)

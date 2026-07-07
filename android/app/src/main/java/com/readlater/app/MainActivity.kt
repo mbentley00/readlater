@@ -12,6 +12,7 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.lifecycle.lifecycleScope
 import kotlinx.coroutines.launch
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.saveable.rememberSaveable
@@ -79,12 +80,14 @@ class MainActivity : ComponentActivity() {
                     composable("reader/{articleId}") { entry ->
                         val articleId = entry.arguments?.getString("articleId").orEmpty()
                         // Remember the open article so a cold start can resume it;
-                        // an intentional Back clears it.
+                        // an intentional Back clears it — unless we're still
+                        // listening to it (then it stays the resume target).
                         LaunchedEffect(articleId) { app.settings.lastArticleId = articleId }
+                        val ttsState by com.readlater.app.tts.TtsService.stateFlow.collectAsState()
                         ReaderScreen(
                             articleId = articleId,
                             onBack = {
-                                app.settings.lastArticleId = ""
+                                if (ttsState.articleId != articleId) app.settings.lastArticleId = ""
                                 navController.popBackStack()
                             },
                             // Archiving the playing article advances to the next
