@@ -657,20 +657,40 @@ class TtsService : Service() {
     private var speakableBlocks: List<Int> = emptyList() // app block indices that are speakable
     private fun serverWavFile(id: String) = java.io.File(cacheDir, "server-$id.wav")
 
+    // Map between server paragraph index and app speakable-block position. When
+    // the two segmentations have the same count this is 1:1; when they differ
+    // (the server splits <p>/<li> differently than the reader) we map
+    // proportionally so the highlight tracks across the whole article instead
+    // of stalling partway.
+    private fun blockForServerParagraph(p: Int): Int {
+        if (speakableBlocks.isEmpty()) return currentIndex
+        val n = serverOffsetsMs.size
+        val m = speakableBlocks.size
+        val q = if (n == m || n <= 1) p else Math.round(p.toDouble() * (m - 1) / (n - 1)).toInt()
+        return speakableBlocks[q.coerceIn(0, m - 1)]
+    }
+
+    private fun serverParagraphForBlock(blockIdx: Int): Int {
+        val n = serverOffsetsMs.size
+        val m = speakableBlocks.size
+        if (n == 0 || m == 0) return 0
+        val q = speakableBlocks.indexOfFirst { it >= blockIdx }.let { if (it < 0) m - 1 else it }
+        val p = if (n == m || m <= 1) q else Math.round(q.toDouble() * (n - 1) / (m - 1)).toInt()
+        return p.coerceIn(0, n - 1)
+    }
+
     /** App block index playing at time [ms]. */
     private fun blockForMs(ms: Int): Int {
         if (serverOffsetsMs.isEmpty() || speakableBlocks.isEmpty()) return currentIndex
         var p = 0
         for (i in serverOffsetsMs.indices) { if (serverOffsetsMs[i] <= ms) p = i else break }
-        return speakableBlocks.getOrElse(p) { speakableBlocks.last() }
+        return blockForServerParagraph(p)
     }
 
     /** Playback time (ms) at which app block [blockIdx] starts. */
     private fun msForBlock(blockIdx: Int): Int {
         if (serverOffsetsMs.isEmpty() || speakableBlocks.isEmpty()) return 0
-        var p = speakableBlocks.indexOfFirst { it >= blockIdx }
-        if (p < 0) p = speakableBlocks.size - 1
-        return serverOffsetsMs.getOrElse(p.coerceAtLeast(0)) { 0 }
+        return serverOffsetsMs[serverParagraphForBlock(blockIdx)]
     }
 
     /** Resume playback of the current paragraph in whichever mode is active. */
@@ -1000,11 +1020,17 @@ class TtsService : Service() {
      * ready next time) and returns false so the caller uses the device voice now.
      */
     private suspend fun tryStartServerVoice(id: String): Boolean {
-        val meta = app.apiClient.audioMeta(id) ?: return false
+        // Bounded check so a slow/cold server doesn't delay the device-voice
+        // fallback. The audio-status GET also queues generation server-side.
+        val meta = kotlinx.coroutines.withTimeoutOrNull(3500) { app.apiClient.audioMeta(id) }
+        if (meta == null) {
+            scope.launch { runCatching { app.apiClient.audioMeta(id) } } // ensure generation is queued
+            logDbg("server audio check slow — device voice now; generating in background")
+            return false
+        }
         if (!meta.enabled) return false
         if (!meta.ready) {
-            app.apiClient.requestAudioGeneration(id) // generate for next time
-            logDbg("server audio not cached — requested generation; using device voice now")
+            logDbg("server audio not cached — generating; using device voice now")
             return false
         }
         val file = serverWavFile(id)
