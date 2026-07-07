@@ -63,8 +63,18 @@ const store = open(DATA_DIR);
 // stream at a time) so a burst of saves doesn't hammer the provider.
 const AUDIO_DIR = path.join(DATA_DIR, 'audio');
 fs.mkdirSync(AUDIO_DIR, { recursive: true });
-const audioWavFile = (id) => path.join(AUDIO_DIR, `${id}.wav`);
+const audioFile = (id, ext) => path.join(AUDIO_DIR, `${id}.${ext}`);
 const audioMetaFile = (id) => path.join(AUDIO_DIR, `${id}.json`);
+const readAudioMeta = (id) => {
+  try { return JSON.parse(fs.readFileSync(audioMetaFile(id), 'utf8')); } catch { return null; }
+};
+// the audio file that actually backs an article's metadata ('' if missing)
+const audioDataFile = (id) => {
+  const meta = readAudioMeta(id);
+  if (!meta) return '';
+  const f = audioFile(id, meta.format || 'wav');
+  return fs.existsSync(f) ? f : '';
+};
 
 const ttsQueued = new Set();
 const ttsPending = [];
@@ -97,12 +107,17 @@ async function pumpTts() {
       const a = store.getArticle(articleId, userId);
       if (a) {
         const r = await tts.synthesizeArticle(a);
-        fs.writeFileSync(audioWavFile(articleId), r.wav);
+        // remove any prior file of the other format so only one is kept
+        for (const ext of ['wav', 'opus']) {
+          if (ext !== r.format) { try { fs.unlinkSync(audioFile(articleId, ext)); } catch {} }
+        }
+        fs.writeFileSync(audioFile(articleId, r.format), r.audio);
         fs.writeFileSync(audioMetaFile(articleId), JSON.stringify({
-          voice: r.voice, durationMs: r.durationMs, sampleRate: r.sampleRate,
-          paragraphOffsetsMs: r.paragraphOffsetsMs, size: r.wav.length, createdAt: Date.now(),
+          format: r.format, mime: r.mime, voice: r.voice, durationMs: r.durationMs,
+          sampleRate: r.sampleRate, paragraphOffsetsMs: r.paragraphOffsetsMs,
+          size: r.audio.length, createdAt: Date.now(),
         }));
-        console.log(`TTS synthesized ${articleId}: ${r.wav.length} bytes, ${r.paragraphOffsetsMs.length} paragraphs`);
+        console.log(`TTS synthesized ${articleId}: ${r.audio.length} bytes ${r.format}, ${r.paragraphOffsetsMs.length} paragraphs`);
         ttsFailedAt.delete(articleId);
       }
     } catch (e) {
@@ -657,25 +672,29 @@ const server = http.createServer(async (req, res) => {
     }
 
     // ---- server-synthesized audio for an article
-    if (parts[1] === 'articles' && parts.length === 4 && (parts[3] === 'audio' || parts[3] === 'audio.wav')) {
+    const audioMatch = parts.length === 4 && parts[1] === 'articles' &&
+      (parts[3] === 'audio' || parts[3] === 'audio.wav' || parts[3] === 'audio.opus');
+    if (audioMatch) {
       const a = store.getArticle(parts[2], user.id);
       if (!a) return json(res, 404, { error: 'article not found' });
-      const hasAudio = fs.existsSync(audioMetaFile(a.id)) && fs.existsSync(audioWavFile(a.id));
+      const dataFile = audioDataFile(a.id); // '' if not generated
 
       // GET .../audio → status + timing metadata (kicks off synthesis if absent)
       if (req.method === 'GET' && parts[3] === 'audio') {
-        if (hasAudio) {
-          const meta = JSON.parse(fs.readFileSync(audioMetaFile(a.id), 'utf8'));
+        if (dataFile) {
+          const meta = readAudioMeta(a.id);
           return json(res, 200, { ready: true, ...meta });
         }
         const queued = enqueueTts(a.id, user.id);
         return json(res, 200, { ready: false, enabled: tts.enabled(), queued });
       }
 
-      // GET .../audio.wav → stream the audio (supports Range for seeking)
-      if (req.method === 'GET' && parts[3] === 'audio.wav') {
-        if (!hasAudio) return json(res, 404, { error: 'audio not ready' });
-        const file = audioWavFile(a.id);
+      // GET .../audio.<wav|opus> → stream the audio (Range for seeking)
+      if (req.method === 'GET') {
+        const ext = parts[3].slice('audio.'.length);
+        const file = audioFile(a.id, ext);
+        if (!fs.existsSync(file)) return json(res, 404, { error: 'audio not ready' });
+        const mime = ext === 'opus' ? 'audio/ogg' : 'audio/wav';
         const size = fs.statSync(file).size;
         const range = req.headers.range;
         if (range) {
@@ -683,14 +702,14 @@ const server = http.createServer(async (req, res) => {
           const start = m ? parseInt(m[1], 10) : 0;
           const end = m && m[2] ? parseInt(m[2], 10) : size - 1;
           res.writeHead(206, {
-            'Content-Type': 'audio/wav',
+            'Content-Type': mime,
             'Content-Range': `bytes ${start}-${end}/${size}`,
             'Accept-Ranges': 'bytes',
             'Content-Length': end - start + 1,
           });
           return fs.createReadStream(file, { start, end }).pipe(res);
         }
-        res.writeHead(200, { 'Content-Type': 'audio/wav', 'Content-Length': size, 'Accept-Ranges': 'bytes' });
+        res.writeHead(200, { 'Content-Type': mime, 'Content-Length': size, 'Accept-Ranges': 'bytes' });
         return fs.createReadStream(file).pipe(res);
       }
 

@@ -1,5 +1,7 @@
 'use strict';
 
+const { spawn } = require('child_process');
+
 // Server-side text-to-speech: synthesize an article to a single WAV using a
 // Kokoro (or any OpenAI-compatible /audio/speech) endpoint, with per-paragraph
 // time offsets so the app can keep paragraph-level position/resume/highlight.
@@ -164,8 +166,24 @@ async function synthesizeArticle(article) {
   }
   const pcm = Buffer.concat(pcmParts, totalBytes);
   const wav = Buffer.concat([wavHeader(pcm.length, sampleRate), pcm]);
+
+  // Compress to Opus (~10x smaller) for storage + download. Falls back to the
+  // raw WAV if ffmpeg is unavailable or fails, so nothing breaks.
+  let audio = wav;
+  let format = 'wav';
+  let mime = 'audio/wav';
+  try {
+    audio = await encodeOpus(wav);
+    format = 'opus';
+    mime = 'audio/ogg';
+  } catch (e) {
+    console.error(`opus encode failed, storing WAV: ${e.message}`);
+  }
+
   return {
-    wav,
+    audio,
+    format,
+    mime,
     sampleRate,
     durationMs: bytesToMs(totalBytes),
     paragraphOffsetsMs,
@@ -173,4 +191,28 @@ async function synthesizeArticle(article) {
   };
 }
 
-module.exports = { enabled, paragraphsOf, synthesizeArticle, cfg };
+/** Encode a WAV buffer to Opus-in-Ogg via ffmpeg (24 kHz mono, ~28 kbps). */
+function encodeOpus(wav) {
+  return new Promise((resolve, reject) => {
+    const ff = spawn('ffmpeg', [
+      '-hide_banner', '-loglevel', 'error',
+      '-i', 'pipe:0',
+      '-c:a', 'libopus', '-b:a', '28k', '-ar', '24000', '-ac', '1',
+      '-f', 'ogg', 'pipe:1',
+    ]);
+    const out = [];
+    const err = [];
+    ff.stdout.on('data', (c) => out.push(c));
+    ff.stderr.on('data', (c) => err.push(c));
+    ff.on('error', reject); // e.g. ffmpeg not installed
+    ff.on('close', (code) => {
+      if (code === 0 && out.length) resolve(Buffer.concat(out));
+      else reject(new Error(`ffmpeg exit ${code}: ${Buffer.concat(err).toString().slice(0, 200)}`));
+    });
+    ff.stdin.on('error', () => {}); // ignore EPIPE if ffmpeg dies early
+    ff.stdin.write(wav);
+    ff.stdin.end();
+  });
+}
+
+module.exports = { enabled, paragraphsOf, synthesizeArticle, encodeOpus, cfg };

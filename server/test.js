@@ -491,13 +491,17 @@ async function main() {
     assert.strictEqual(audio.paragraphOffsetsMs.length, 2, 'one time offset per paragraph');
     assert.strictEqual(audio.paragraphOffsetsMs[0], 0, 'first paragraph starts at 0ms');
     assert.ok(audio.paragraphOffsetsMs[1] > 0, 'second paragraph starts later');
-    let wr = await fetch(BASE + `/api/articles/${ttsId}/audio.wav`, { headers: HEADERS });
+    // Audio is Opus when ffmpeg is present, else WAV — fetch by the reported format.
+    const fmt = audio.format || 'wav';
+    assert.ok(fmt === 'wav' || fmt === 'opus', `format is wav or opus (got ${fmt})`);
+    let wr = await fetch(BASE + `/api/articles/${ttsId}/audio.${fmt}`, { headers: HEADERS });
     assert.strictEqual(wr.status, 200);
     const wbuf = Buffer.from(await wr.arrayBuffer());
-    assert.strictEqual(wbuf.toString('ascii', 0, 4), 'RIFF', 'audio.wav is a WAV');
+    const magic = wbuf.toString('ascii', 0, 4);
+    assert.strictEqual(magic, fmt === 'opus' ? 'OggS' : 'RIFF', `audio.${fmt} has the right container`);
     // Range requests work (the app seeks)
-    wr = await fetch(BASE + `/api/articles/${ttsId}/audio.wav`, { headers: { ...HEADERS, Range: 'bytes=0-43' } });
-    assert.strictEqual(wr.status, 206, 'audio.wav honors Range requests');
+    wr = await fetch(BASE + `/api/articles/${ttsId}/audio.${fmt}`, { headers: { ...HEADERS, Range: 'bytes=0-43' } });
+    assert.strictEqual(wr.status, 206, 'audio honors Range requests');
 
     // ---- LLM parse rescue -------------------------------------------------
     // A save flagged with fallbackHtml gets asynchronously re-extracted.

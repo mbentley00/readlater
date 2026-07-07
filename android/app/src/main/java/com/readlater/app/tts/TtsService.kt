@@ -658,9 +658,10 @@ class TtsService : Service() {
     // played continuously; playback time maps to app paragraphs via the
     // server's per-paragraph offsets so highlight/resume keep working.
     private var serverMode = false
+    private var serverFormat = "wav"
     private var serverOffsetsMs = IntArray(0)
     private var speakableBlocks: List<Int> = emptyList() // app block indices that are speakable
-    private fun serverWavFile(id: String) = java.io.File(cacheDir, "server-$id.wav")
+    private fun serverAudioFile(id: String, ext: String) = java.io.File(cacheDir, "server-$id.$ext")
 
     // Map between server paragraph index and app speakable-block position. When
     // the two segmentations have the same count this is 1:1; when they differ
@@ -1038,24 +1039,31 @@ class TtsService : Service() {
             logDbg("server audio not cached — generating; using device voice now")
             return false
         }
-        val file = serverWavFile(id)
+        val fmt = if (meta.format == "opus") "opus" else "wav"
+        val file = serverAudioFile(id, fmt)
         if (file.length() < 44) {
-            logDbg("downloading server audio for $id")
-            if (!app.apiClient.downloadAudio(id, file)) { logDbg("server audio download failed"); return false }
+            logDbg("downloading server audio ($fmt) for $id")
+            if (!app.apiClient.downloadAudio(id, fmt, file)) { logDbg("server audio download failed"); return false }
         }
         if (id != articleId || !isPlaying) return false // superseded while downloading
         serverOffsetsMs = meta.offsetsMs
+        serverFormat = fmt
         serverMode = true
-        logDbg("server voice: ${serverOffsetsMs.size} paragraphs, ${file.length()} bytes")
+        logDbg("server voice ($fmt): ${serverOffsetsMs.size} paragraphs vs ${speakableBlocks.size} blocks, ${file.length()} bytes")
         startServerStream(msForBlock(currentIndex))
         return true
     }
 
+    /** Play the downloaded server audio, decoding Opus when needed. */
+    private fun startServerStream(fromMs: Int) {
+        if (serverFormat == "opus") startServerStreamOpus(fromMs) else startServerStreamWav(fromMs)
+    }
+
     /** Stream the whole-article server WAV via AudioTrack from [fromMs], updating
      *  the current paragraph from playback time as it goes. */
-    private fun startServerStream(fromMs: Int) {
+    private fun startServerStreamWav(fromMs: Int) {
         releasePlayer()
-        val file = serverWavFile(articleId ?: return)
+        val file = serverAudioFile(articleId ?: return, "wav")
         val wav = parseWav(file) ?: run {
             logDbg("server WAV parse failed — device voice")
             serverMode = false; speakCurrent(); return
@@ -1151,6 +1159,150 @@ class TtsService : Service() {
             logDbg("server AudioTrack INIT ERROR: ${e.message}")
             serverMode = false; speakCurrent()
         }
+    }
+
+    /** Decode the whole-article Opus (Ogg) with MediaCodec and play the PCM
+     *  through our AudioTrack — same in-process playback as the WAV path, just
+     *  with a decode step. Seeks by time; tracks the paragraph from playback. */
+    private fun startServerStreamOpus(fromMs: Int) {
+        releasePlayer()
+        val file = serverAudioFile(articleId ?: return, "opus")
+        if (file.length() < 4) { logDbg("opus file missing — device voice"); serverMode = false; speakCurrent(); return }
+        trackStartMs = fromMs
+        audioStarted = false
+        val myGen = ++playThreadGen
+        playThread = Thread {
+            var extractor: android.media.MediaExtractor? = null
+            var codec: android.media.MediaCodec? = null
+            var track: android.media.AudioTrack? = null
+            var fis: java.io.FileInputStream? = null
+            try {
+                fis = java.io.FileInputStream(file)
+                extractor = android.media.MediaExtractor().apply { setDataSource(fis!!.fd) }
+                var trackIdx = -1
+                var format: android.media.MediaFormat? = null
+                for (i in 0 until extractor.trackCount) {
+                    val f = extractor.getTrackFormat(i)
+                    if (f.getString(android.media.MediaFormat.KEY_MIME)?.startsWith("audio/") == true) {
+                        trackIdx = i; format = f; break
+                    }
+                }
+                if (trackIdx < 0 || format == null) throw IllegalStateException("no audio track in opus")
+                extractor.selectTrack(trackIdx)
+                if (fromMs > 0) extractor.seekTo(fromMs * 1000L, android.media.MediaExtractor.SEEK_TO_CLOSEST_SYNC)
+                val mime = format.getString(android.media.MediaFormat.KEY_MIME)!!
+                val sampleRate = format.getInteger(android.media.MediaFormat.KEY_SAMPLE_RATE)
+                val channels = format.getInteger(android.media.MediaFormat.KEY_CHANNEL_COUNT)
+                codec = android.media.MediaCodec.createDecoderByType(mime).apply { configure(format, null, null, 0); start() }
+                val channelMask = if (channels >= 2) android.media.AudioFormat.CHANNEL_OUT_STEREO
+                    else android.media.AudioFormat.CHANNEL_OUT_MONO
+                val minBuf = android.media.AudioTrack.getMinBufferSize(
+                    sampleRate, channelMask, android.media.AudioFormat.ENCODING_PCM_16BIT
+                ).coerceAtLeast(64 * 1024)
+                track = android.media.AudioTrack.Builder()
+                    .setAudioAttributes(playbackAudioAttributes)
+                    .setAudioFormat(
+                        android.media.AudioFormat.Builder()
+                            .setSampleRate(sampleRate)
+                            .setChannelMask(channelMask)
+                            .setEncoding(android.media.AudioFormat.ENCODING_PCM_16BIT)
+                            .build()
+                    )
+                    .setBufferSizeInBytes(minBuf)
+                    .setTransferMode(android.media.AudioTrack.MODE_STREAM)
+                    .build()
+                trackSampleRate = sampleRate
+                trackChannels = channels
+                val frameBytes = channels * 2
+                track.play()
+                mainHandler.post {
+                    if (myGen == playThreadGen && isPlaying && serverMode) {
+                        audioTrack = track
+                        audioStarted = true
+                        cancelAudioWatchdog()
+                        logDbg("playing (server opus) sr=$sampleRate ch=$channels from=${fromMs}ms")
+                        publishState(); updatePlaybackState(); updateNotification()
+                    }
+                }
+                val info = android.media.MediaCodec.BufferInfo()
+                var sawInputEOS = false
+                var sawOutputEOS = false
+                var bytesWritten = 0L
+                var lastBlock = -1
+                while (myGen == playThreadGen && !sawOutputEOS) {
+                    if (!sawInputEOS) {
+                        val inIdx = codec.dequeueInputBuffer(10000)
+                        if (inIdx >= 0) {
+                            val inBuf = codec.getInputBuffer(inIdx)!!
+                            val sz = extractor.readSampleData(inBuf, 0)
+                            if (sz < 0) {
+                                codec.queueInputBuffer(inIdx, 0, 0, 0, android.media.MediaCodec.BUFFER_FLAG_END_OF_STREAM)
+                                sawInputEOS = true
+                            } else {
+                                codec.queueInputBuffer(inIdx, 0, sz, extractor.sampleTime, 0)
+                                extractor.advance()
+                            }
+                        }
+                    }
+                    val outIdx = codec.dequeueOutputBuffer(info, 10000)
+                    if (outIdx >= 0) {
+                        if (info.size > 0) {
+                            val outBuf = codec.getOutputBuffer(outIdx)!!
+                            val chunk = ByteArray(info.size)
+                            outBuf.position(info.offset)
+                            outBuf.get(chunk)
+                            outBuf.clear()
+                            var off = 0
+                            while (off < chunk.size && myGen == playThreadGen) {
+                                val w = track.write(chunk, off, chunk.size - off)
+                                if (w <= 0) { off = -1; break }
+                                off += w; bytesWritten += w
+                            }
+                            if (off < 0) break
+                            val blk = blockForMs((info.presentationTimeUs / 1000).toInt())
+                            if (blk != lastBlock) {
+                                lastBlock = blk
+                                mainHandler.post {
+                                    if (myGen == playThreadGen && isPlaying && serverMode) {
+                                        currentIndex = blk
+                                        articleId?.let { app.repository.saveTtsPositionLocal(it, blk) }
+                                        publishState(); updateNotification()
+                                    }
+                                }
+                            }
+                        }
+                        codec.releaseOutputBuffer(outIdx, false)
+                        if (info.flags and android.media.MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0) sawOutputEOS = true
+                    }
+                }
+                // let the buffered PCM finish playing
+                val framesToDrain = bytesWritten / frameBytes
+                val deadline = System.currentTimeMillis() + (framesToDrain * 1000L / trackSampleRate) + 2000
+                while (myGen == playThreadGen &&
+                    (track.playbackHeadPosition.toLong() and 0xFFFFFFFFL) < framesToDrain &&
+                    System.currentTimeMillis() < deadline
+                ) Thread.sleep(40)
+                if (myGen == playThreadGen && sawOutputEOS) mainHandler.post {
+                    if (myGen == playThreadGen && isPlaying && serverMode) {
+                        logDbg("server opus complete (${bytesWritten}B)")
+                        currentIndex = 0
+                        handleStop()
+                    }
+                }
+            } catch (e: Exception) {
+                mainHandler.post {
+                    if (myGen == playThreadGen) {
+                        logDbg("server opus ERROR: ${e.message} — device voice")
+                        if (isPlaying && serverMode) { serverMode = false; releasePlayer(); speakCurrent() }
+                    }
+                }
+            } finally {
+                runCatching { codec?.stop() }; runCatching { codec?.release() }
+                runCatching { extractor?.release() }
+                runCatching { fis?.close() }
+                // the AudioTrack is owned by audioTrack/releasePlayer, not the thread
+            }
+        }.also { it.isDaemon = true; it.start() }
     }
 
     // Fallback: engine can't produce a playable file → use speak(). Audio still

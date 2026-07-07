@@ -193,6 +193,7 @@ class ApiClient(private val settings: Settings) {
         val enabled: Boolean,
         val durationMs: Int,
         val sampleRate: Int,
+        val format: String, // "opus" or "wav"
         val offsetsMs: IntArray
     )
 
@@ -207,6 +208,7 @@ class ApiClient(private val settings: Settings) {
             enabled = o.optBoolean("enabled", true),
             durationMs = o.optInt("durationMs", 0),
             sampleRate = o.optInt("sampleRate", 24000),
+            format = o.optString("format", "wav"),
             offsetsMs = offsets
         )
     } catch (_: Exception) {
@@ -220,10 +222,10 @@ class ApiClient(private val settings: Settings) {
         }
     }
 
-    /** GET /api/articles/{id}/audio.wav — stream the WAV to [dest]. */
-    suspend fun downloadAudio(articleId: String, dest: java.io.File): Boolean = withContext(Dispatchers.IO) {
+    /** GET /api/articles/{id}/audio.<format> — stream the audio to [dest]. */
+    suspend fun downloadAudio(articleId: String, format: String, dest: java.io.File): Boolean = withContext(Dispatchers.IO) {
         try {
-            val resp = client.newCall(builder("/api/articles/$articleId/audio.wav").get().build()).execute()
+            val resp = client.newCall(builder("/api/articles/$articleId/audio.$format").get().build()).execute()
             resp.use { r ->
                 if (!r.isSuccessful) return@withContext false
                 val body = r.body ?: return@withContext false
