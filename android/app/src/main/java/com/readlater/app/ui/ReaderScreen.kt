@@ -285,7 +285,12 @@ fun ReaderScreen(articleId: String, onBack: () -> Unit) {
                                 else LocalContentColor.current
                             )
                         }
-                        IconButton(onClick = { repo.toggleArchive(a) }) {
+                        IconButton(onClick = {
+                            val wasArchived = a.archived
+                            repo.toggleArchive(a)
+                            // Archiving finishes reading — return to the list.
+                            if (!wasArchived) onBack()
+                        }) {
                             Icon(
                                 if (a.archived) Icons.Filled.Unarchive else Icons.Filled.Archive,
                                 contentDescription = if (a.archived) "Unarchive" else "Archive"
