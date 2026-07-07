@@ -30,6 +30,7 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
@@ -46,8 +47,12 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
+import androidx.compose.material3.Surface
+import androidx.compose.runtime.collectAsState
+import androidx.compose.ui.unit.sp
 import com.readlater.app.BuildConfig
 import com.readlater.app.ReadLaterApp
+import com.readlater.app.tts.TtsService
 import kotlinx.coroutines.launch
 import java.util.Locale
 
@@ -368,13 +373,49 @@ fun SettingsScreen(onBack: () -> Unit) {
                 Text(if (updateAvailable) "Download update" else "Download latest APK")
             }
             Text(
-                text = "ReadLater is a self-hosted read-it-later client. Save articles with " +
+                text = "Earmark is a self-hosted read-it-later client. Save articles with " +
                     "the ReadLater Firefox extension (or email them in) and they sync here " +
                     "for offline reading, highlighting and listening. Sign in with your " +
                     "account above; create accounts on the server's /signup page.",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
+
+            HorizontalDivider()
+
+            // Live TTS event log — makes voice problems diagnosable.
+            var showLog by remember { mutableStateOf(false) }
+            val log by TtsService.debugLog.collectAsState()
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text("Voice diagnostics", style = MaterialTheme.typography.titleMedium, modifier = Modifier.weight(1f))
+                TextButton(onClick = { showLog = !showLog }) { Text(if (showLog) "Hide" else "Show") }
+            }
+            if (showLog) {
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    OutlinedButton(onClick = {
+                        val cm = context.getSystemService(android.content.Context.CLIPBOARD_SERVICE)
+                            as android.content.ClipboardManager
+                        cm.setPrimaryClip(android.content.ClipData.newPlainText("tts-log", log.joinToString("\n")))
+                        scope.launch { snackbarHostState.showSnackbar("Log copied") }
+                    }) { Text("Copy") }
+                    OutlinedButton(onClick = { TtsService.debugLog.value = emptyList() }) { Text("Clear") }
+                }
+                Surface(
+                    color = MaterialTheme.colorScheme.surfaceVariant,
+                    shape = MaterialTheme.shapes.small,
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text(
+                        text = if (log.isEmpty()) "No TTS events yet — press play on an article."
+                        else log.takeLast(60).joinToString("\n"),
+                        style = MaterialTheme.typography.bodySmall.copy(
+                            fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace,
+                            fontSize = 11.sp
+                        ),
+                        modifier = Modifier.padding(10.dp)
+                    )
+                }
+            }
         }
     }
 }

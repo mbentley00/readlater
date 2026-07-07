@@ -11,9 +11,7 @@ import android.content.pm.ServiceInfo
 import android.media.AudioAttributes
 import android.media.AudioFocusRequest
 import android.media.AudioManager
-import android.media.MediaPlayer
 import android.os.Build
-import android.os.Bundle
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
@@ -71,6 +69,15 @@ class TtsService : Service() {
 
         /** Current playback state, observable from anywhere. */
         val stateFlow = MutableStateFlow(TtsPlaybackState())
+
+        /** Rolling TTS event log shown under Settings → Voice diagnostics. */
+        val debugLog = MutableStateFlow<List<String>>(emptyList())
+
+        fun logDbg(msg: String) {
+            val ts = java.text.SimpleDateFormat("HH:mm:ss.SSS", java.util.Locale.US)
+                .format(java.util.Date())
+            debugLog.value = (debugLog.value + "$ts $msg").takeLast(150)
+        }
     }
 
     private val app get() = application as ReadLaterApp
@@ -138,34 +145,16 @@ class TtsService : Service() {
                     } else {
                         mediaButtonEvent.getParcelableExtra(Intent.EXTRA_KEY_EVENT)
                     }
-                    if (event != null) {
-                        when (event.keyCode) {
-                            KeyEvent.KEYCODE_HEADSETHOOK,
-                            KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE -> {
-                                if (event.action == KeyEvent.ACTION_DOWN && event.repeatCount == 0) {
-                                    registerHeadsetClick()
-                                }
-                                return true
-                            }
-                            KeyEvent.KEYCODE_MEDIA_NEXT -> {
-                                if (event.action == KeyEvent.ACTION_DOWN) handleForward30()
-                                return true
-                            }
-                            KeyEvent.KEYCODE_MEDIA_PREVIOUS -> {
-                                if (event.action == KeyEvent.ACTION_DOWN) handleHighlightCurrent()
-                                return true
-                            }
-                            // Some headsets send distinct PLAY / PAUSE codes
-                            // instead of PLAY_PAUSE — act on them immediately.
-                            KeyEvent.KEYCODE_MEDIA_PLAY -> {
-                                if (event.action == KeyEvent.ACTION_DOWN) handleResume()
-                                return true
-                            }
-                            KeyEvent.KEYCODE_MEDIA_PAUSE -> {
-                                if (event.action == KeyEvent.ACTION_DOWN) handlePause()
-                                return true
-                            }
+                    if (event != null && isOurMediaKey(event.keyCode)) {
+                        // Consume both DOWN and UP so the system doesn't also
+                        // route the key to another media app; act on DOWN only,
+                        // debounced against double-delivery (the cause of the
+                        // "pause then resume" glitch on Bluetooth earbuds).
+                        if (event.action == KeyEvent.ACTION_DOWN && event.repeatCount == 0) {
+                            logDbg("media button keyCode=${event.keyCode}")
+                            dispatchMediaKey(event.keyCode)
                         }
+                        return true
                     }
                     return super.onMediaButtonEvent(mediaButtonEvent)
                 }
@@ -210,6 +199,7 @@ class TtsService : Service() {
 
     private val focusListener = AudioManager.OnAudioFocusChangeListener { change ->
         mainHandler.post {
+            logDbg("audio focus change=$change")
             when (change) {
                 AudioManager.AUDIOFOCUS_LOSS,
                 AudioManager.AUDIOFOCUS_LOSS_TRANSIENT,
@@ -273,6 +263,7 @@ class TtsService : Service() {
     private fun handlePlay(intent: Intent) {
         val requestedId = intent.getStringExtra(EXTRA_ARTICLE_ID) ?: articleId
         val startParagraph = intent.getIntExtra(EXTRA_START_PARAGRAPH, -1)
+        logDbg("PLAY requested article=$requestedId start=$startParagraph")
         if (requestedId == null) {
             stopSelf()
             return
@@ -308,7 +299,7 @@ class TtsService : Service() {
             acquireWakeLock()
             requestAudioFocus()
             initTts() // re-checks the preferred engine; no-op when unchanged
-        if (ttsReady) speakCurrent()
+            if (ttsReady) speakCurrent()
         }
     }
 
@@ -318,12 +309,10 @@ class TtsService : Service() {
             return
         }
         if (!isPlaying) return
+        logDbg("PAUSE (idx=$currentIndex)")
         isPlaying = false
-        // Pause mid-paragraph; resume continues from the same spot.
-        if (player?.isPlaying == true) {
-            player?.pause()
-            pausedInParagraph = true
-        }
+        clearSynthCache() // cancel the in-flight utterance
+        tts?.stop()
         releaseWakeLock()
         // Pushing save: sync the paused position to the server right away.
         articleId?.let { app.repository.saveTtsPosition(it, currentIndex) }
@@ -338,21 +327,16 @@ class TtsService : Service() {
             return
         }
         if (isPlaying) return
+        logDbg("RESUME (idx=$currentIndex)")
         isPlaying = true
         acquireWakeLock()
         requestAudioFocus()
         publishState()
         updatePlaybackState()
         updateNotification()
-        // Resume mid-paragraph when possible; otherwise re-speak from the
-        // current paragraph (initTts also re-checks the preferred engine).
-        if (pausedInParagraph && player != null) {
-            pausedInParagraph = false
-            player?.start()
-            return
-        }
+        // Continue from the current sentence (initTts re-checks the engine).
         initTts()
-        if (ttsReady) speakCurrent()
+        if (ttsReady) resumeSpeaking()
     }
 
     private fun handleNext() {
@@ -404,25 +388,40 @@ class TtsService : Service() {
         return acc
     }
 
-    // -------------------------------------------------------- headset clicks
+    // -------------------------------------------------------- media buttons
 
     /** Estimated characters spoken per second at 1.0× rate (≈180 wpm). */
     private val baseCharsPerSecond = 15f
-    private var headsetClickCount = 0
-    private val headsetClickRunnable = Runnable {
-        when (headsetClickCount) {
-            1 -> if (isPlaying) handlePause() else handleResume()
-            2 -> handleForward30()
-            else -> if (headsetClickCount >= 3) handleHighlightCurrent()
-        }
-        headsetClickCount = 0
-    }
 
-    private fun registerHeadsetClick() {
-        headsetClickCount++
-        mainHandler.removeCallbacks(headsetClickRunnable)
-        if (headsetClickCount >= 3) headsetClickRunnable.run()
-        else mainHandler.postDelayed(headsetClickRunnable, 600)
+    private var lastButtonAt = 0L
+    private val buttonDebounceMs = 500L
+
+    private fun isOurMediaKey(code: Int) = code == KeyEvent.KEYCODE_HEADSETHOOK ||
+        code == KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE ||
+        code == KeyEvent.KEYCODE_MEDIA_PLAY ||
+        code == KeyEvent.KEYCODE_MEDIA_PAUSE ||
+        code == KeyEvent.KEYCODE_MEDIA_NEXT ||
+        code == KeyEvent.KEYCODE_MEDIA_PREVIOUS
+
+    /** Dispatch a media key with debounce so a single physical tap (which some
+     *  Bluetooth earbuds deliver more than once) doesn't toggle twice. On the
+     *  Pixel Buds a single tap is play/pause, double tap is NEXT (→ +30s), and
+     *  triple tap is PREVIOUS (→ highlight). */
+    private fun dispatchMediaKey(code: Int) {
+        val now = android.os.SystemClock.elapsedRealtime()
+        if (now - lastButtonAt < buttonDebounceMs) {
+            logDbg("  (debounced $code)")
+            return
+        }
+        lastButtonAt = now
+        when (code) {
+            KeyEvent.KEYCODE_HEADSETHOOK,
+            KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE -> if (isPlaying) handlePause() else handleResume()
+            KeyEvent.KEYCODE_MEDIA_PLAY -> if (!isPlaying) handleResume()
+            KeyEvent.KEYCODE_MEDIA_PAUSE -> if (isPlaying) handlePause()
+            KeyEvent.KEYCODE_MEDIA_NEXT -> handleForward30()
+            KeyEvent.KEYCODE_MEDIA_PREVIOUS -> handleHighlightCurrent()
+        }
     }
 
     /** Skip forward by roughly 30 seconds of estimated speech, paragraph-granular. */
@@ -510,20 +509,27 @@ class TtsService : Service() {
         }
         if (tts != null) return
         initializedEngine = preferred
+        logDbg("initTts engine=${preferred ?: "system default"} (pref='${chosen}' blocked=${engineBlockedThisSession != null})")
         initTtsWith(preferred)
     }
 
+    private var initGen = 0
+
     private fun initTtsWith(engine: String?) {
+        val myGen = ++initGen
+        logDbg("init engine=${engine ?: "system default"}")
         val listener = TextToSpeech.OnInitListener { status ->
             mainHandler.post {
+                if (myGen != initGen) return@post // superseded (e.g. watchdog restarted init)
                 if (status == TextToSpeech.SUCCESS) {
                     ttsReady = true
                     tts?.setAudioAttributes(playbackAudioAttributes)
                     tts?.setOnUtteranceProgressListener(utteranceListener)
                     tts?.let(::pickBestVoice)
-                    if (isPlaying) speakCurrent()
+                    logDbg("engine READY: ${initializedEngine ?: "system default"} voice=${runCatching { tts?.voice?.name }.getOrNull()}")
+                    if (isPlaying) resumeSpeaking()
                 } else if (engine != null) {
-                    // preferred engine failed to initialize — fall back to default
+                    logDbg("engine INIT FAILED status=$status: $engine — falling back")
                     Toast.makeText(
                         this@TtsService,
                         "Voice engine failed to start — using the system voice",
@@ -534,11 +540,29 @@ class TtsService : Service() {
                     initializedEngine = null
                     initTtsWith(null)
                 } else {
+                    logDbg("system engine init failed status=$status")
                     handleStop()
                 }
             }
         }
         tts = if (engine != null) TextToSpeech(this, listener, engine) else TextToSpeech(this, listener)
+        // Init watchdog: some engines never call onInit (hung model load) — that
+        // looked like a dead play button. Fall back if init is silent for 8s.
+        mainHandler.postDelayed({
+            if (myGen == initGen && !ttsReady) {
+                logDbg("INIT WATCHDOG: ${engine ?: "system"} never signalled init")
+                if (engine != null) {
+                    engineBlockedThisSession = engine
+                    runCatching { tts?.shutdown() }
+                    tts = null
+                    initializedEngine = null
+                    initTtsWith(null)
+                } else {
+                    Toast.makeText(this, "Text-to-speech isn't responding on this device", Toast.LENGTH_LONG).show()
+                    handleStop()
+                }
+            }
+        }, 8_000)
     }
 
     /**
@@ -572,66 +596,86 @@ class TtsService : Service() {
         }
     }
 
-    // The TTS engine only SYNTHESIZES; playback happens through a MediaPlayer
-    // in OUR process. Crucial for headset controls: Android routes media
-    // buttons to the app that owns the audio playback, and audio played by
-    // the engine's process (the default speak() path) credits the engine,
-    // not us — so buttons kept going to whatever music app played last.
-    private var player: MediaPlayer? = null
-    private val readyFiles = mutableSetOf<Int>()
-    private val synthesizing = mutableSetOf<Int>()
-    private var awaitingPlayIndex = -1
-    private var pausedInParagraph = false
+    // Playback uses the engine's own speak() path. An earlier design
+    // synthesized each paragraph to a file and played it via a MediaPlayer to
+    // influence media-button routing, but that produced NO audio for some
+    // engines/devices (sherpa and Google both) while speak() — the same path
+    // the Settings preview uses — works reliably. Audio focus + an active
+    // MediaSession give us the button routing instead.
+    private var utteranceGen = 0    // increments per utterance; stale callbacks ignored
+    private var audioStarted = false
 
-    private fun synthFile(idx: Int) = java.io.File(cacheDir, "tts-$idx.wav")
+    /** Invalidate any in-flight utterance so its callbacks are ignored. */
+    private fun clearSynthCache() {
+        utteranceGen++
+        audioStarted = false
+        cancelAudioWatchdog()
+    }
+    private fun discardPlayer() = clearSynthCache()
 
-    private fun discardPlayer() {
-        pausedInParagraph = false
-        player?.release()
-        player = null
+    // Each paragraph is spoken as a queue of sentences so pause/resume can
+    // continue from the current sentence rather than restarting the paragraph.
+    // utteranceId encodes "utt-<gen>-<sentenceIndex>".
+    private var sentences: List<String> = emptyList()
+    private var sentencesForIndex = -1
+    private var sentenceIdx = 0
+
+    private fun splitSentences(text: String): List<String> {
+        val out = ArrayList<String>()
+        val m = java.util.regex.Pattern
+            .compile("[^.!?]*[.!?]+[\"')\\]]*\\s*|[^.!?]+$")
+            .matcher(text)
+        while (m.find()) m.group().trim().takeIf { it.isNotEmpty() }?.let { out.add(it) }
+        return if (out.isEmpty()) listOf(text) else out
     }
 
-    private fun clearSynthCache() {
-        discardPlayer()
-        readyFiles.clear()
-        synthesizing.clear()
-        awaitingPlayIndex = -1
-        cacheDir.listFiles()?.filter { it.name.startsWith("tts-") }?.forEach { it.delete() }
+    private fun parseUtt(id: String?): Pair<Int, Int>? {
+        val parts = (id ?: return null).removePrefix("utt-").split("-")
+        if (parts.size != 2) return null
+        val g = parts[0].toIntOrNull() ?: return null
+        val s = parts[1].toIntOrNull() ?: return null
+        return g to s
     }
 
     private val utteranceListener = object : UtteranceProgressListener() {
-        override fun onStart(utteranceId: String?) = Unit
-
-        override fun onDone(utteranceId: String?) {
+        override fun onStart(utteranceId: String?) {
+            val (gen, si) = parseUtt(utteranceId) ?: return
             mainHandler.post {
-                val idx = utteranceId?.removePrefix("synth-")?.toIntOrNull() ?: return@post
-                synthesizing.remove(idx)
-                readyFiles.add(idx)
-                if (idx == awaitingPlayIndex && isPlaying) {
-                    watchdogGeneration++ // disarm
-                    awaitingPlayIndex = -1
-                    startPlayback(idx)
+                if (gen == utteranceGen) {
+                    audioStarted = true
+                    sentenceIdx = si
+                    cancelAudioWatchdog()
+                    logDbg("speaking gen=$gen idx=$currentIndex s=$si/${sentences.size}")
+                    updateNotification()
                 }
             }
         }
 
-        private fun synthFailed(utteranceId: String?) {
+        override fun onDone(utteranceId: String?) {
+            val (gen, si) = parseUtt(utteranceId) ?: return
             mainHandler.post {
-                val idx = utteranceId?.removePrefix("synth-")?.toIntOrNull() ?: return@post
-                synthesizing.remove(idx)
-                synthFile(idx).delete()
-                if (idx == awaitingPlayIndex && isPlaying) {
-                    watchdogGeneration++ // disarm
-                    awaitingPlayIndex = -1
+                if (gen == utteranceGen && isPlaying && si >= sentences.size - 1) {
+                    // last sentence of the paragraph finished → next paragraph
+                    logDbg("done gen=$gen idx=$currentIndex")
+                    advanceAndSpeak()
+                }
+            }
+        }
+
+        private fun failed(utteranceId: String?) {
+            val (gen, _) = parseUtt(utteranceId) ?: return
+            mainHandler.post {
+                if (gen == utteranceGen && isPlaying) {
+                    logDbg("utterance ERROR gen=$gen")
                     failEngineAndRetry("The voice engine reported an error")
                 }
             }
         }
 
-        override fun onError(utteranceId: String?, errorCode: Int) = synthFailed(utteranceId)
+        override fun onError(utteranceId: String?, errorCode: Int) = failed(utteranceId)
 
         @Deprecated("Deprecated in Java")
-        override fun onError(utteranceId: String?) = synthFailed(utteranceId)
+        override fun onError(utteranceId: String?) = failed(utteranceId)
     }
 
     private fun advanceAndSpeak() {
@@ -647,107 +691,87 @@ class TtsService : Service() {
         }
     }
 
+    /** Start the current paragraph from its first sentence. */
     private fun speakCurrent() {
+        val idx = nextSpeakable(currentIndex) ?: run { handleStop(); return }
+        currentIndex = idx
+        sentences = speakableText(blocks[idx])?.let { splitSentences(it) } ?: run { handleStop(); return }
+        sentencesForIndex = idx
+        speakFromSentence(0)
+    }
+
+    /** Resume: continue the current paragraph from the sentence we paused on. */
+    private fun resumeSpeaking() {
+        if (sentencesForIndex == currentIndex && sentenceIdx in sentences.indices) {
+            speakFromSentence(sentenceIdx)
+        } else {
+            speakCurrent()
+        }
+    }
+
+    private fun speakFromSentence(startSentence: Int) {
         val engine = tts
         if (engine == null || !ttsReady) {
-            initTts()
+            initTts() // onInit → resumeSpeaking once ready
             return
         }
-        val idx = nextSpeakable(currentIndex)
-        if (idx == null) {
-            handleStop()
-            return
+        audioStarted = false
+        sentenceIdx = startSentence.coerceIn(0, (sentences.size - 1).coerceAtLeast(0))
+        val gen = ++utteranceGen
+        engine.setSpeechRate(app.settings.ttsSpeechRate)
+        logDbg("speak gen=$gen idx=$currentIndex from s=$sentenceIdx/${sentences.size} engine=${initializedEngine ?: "system"}")
+        var queued = false
+        for (i in sentenceIdx until sentences.size) {
+            val mode = if (!queued) TextToSpeech.QUEUE_FLUSH else TextToSpeech.QUEUE_ADD
+            val res = engine.speak(sentences[i], mode, null, "utt-$gen-$i")
+            if (res != TextToSpeech.SUCCESS) {
+                logDbg("speak REJECTED idx=$currentIndex s=$i code=$res")
+                failEngineAndRetry("The voice engine rejected the request")
+                return
+            }
+            queued = true
         }
-        currentIndex = idx
-        pausedInParagraph = false
+        if (!queued) { advanceAndSpeak(); return }
+        armAudioWatchdog(gen)
         publishState()
         updatePlaybackState()
         updateNotification()
-        if (readyFiles.contains(idx) && synthFile(idx).exists()) {
-            startPlayback(idx)
-        } else {
-            awaitingPlayIndex = idx
-            synthesize(idx)
-        }
     }
 
-    private fun synthesize(idx: Int) {
-        // Never double-request: a second synthesizeToFile for the same path
-        // while the first is still running corrupts the output (this is why
-        // slower neural engines stopped after one paragraph).
-        if (synthesizing.contains(idx) || readyFiles.contains(idx)) return
-        val engine = tts ?: return
-        val text = blocks.getOrNull(idx)?.let { speakableText(it) } ?: return
-        synthesizing.add(idx)
-        engine.setSpeechRate(app.settings.ttsSpeechRate)
-        val queued = engine.synthesizeToFile(text, Bundle(), synthFile(idx), "synth-$idx")
-        if (queued != TextToSpeech.SUCCESS) {
-            synthesizing.remove(idx)
-            if (idx == awaitingPlayIndex) failEngineAndRetry("The voice engine rejected the request")
-        } else if (idx == awaitingPlayIndex) {
-            armSynthWatchdog(idx)
-        }
-    }
-
-    // If the engine never delivers audio (crashed, stuck loading its model),
-    // fall back to the system default voice instead of sitting silent forever.
-    private var watchdogGeneration = 0
-
-    private fun armSynthWatchdog(idx: Int) {
-        val generation = ++watchdogGeneration
+    // If audio never starts (engine stuck loading a model, or silently
+    // failing), fall back to the system voice instead of sitting silent.
+    private var audioWatchdogGen = 0
+    private fun cancelAudioWatchdog() { audioWatchdogGen++ }
+    private fun armAudioWatchdog(utterGen: Int) {
+        val w = ++audioWatchdogGen
         mainHandler.postDelayed({
-            if (generation == watchdogGeneration && isPlaying &&
-                awaitingPlayIndex == idx && !readyFiles.contains(idx)
-            ) {
+            if (w == audioWatchdogGen && isPlaying && utterGen == utteranceGen && !audioStarted) {
+                logDbg("WATCHDOG: no audio for gen=$utterGen")
                 failEngineAndRetry("The selected voice isn't responding")
             }
-        }, 30_000)
+        }, 12_000)
     }
 
     private fun failEngineAndRetry(reason: String) {
+        logDbg("fallback: $reason (was ${initializedEngine ?: "system default"})")
+        cancelAudioWatchdog()
         if (initializedEngine == null) {
-            // already on the system default — skip this paragraph instead
+            // already on the system default — skip this paragraph
             Toast.makeText(this, "$reason — skipping paragraph", Toast.LENGTH_LONG).show()
             advanceAndSpeak()
             return
         }
-        Toast.makeText(this, "$reason — falling back to the system voice", Toast.LENGTH_LONG).show()
+        Toast.makeText(this, "$reason — using the system voice", Toast.LENGTH_LONG).show()
         engineBlockedThisSession = initializedEngine
         tts?.stop()
         tts?.shutdown()
         tts = null
         ttsReady = false
-        synthesizing.clear()
-        initTts()
+        initTts() // re-inits with the system default, then speakCurrent
     }
 
     /** Engine that failed this session; skipped until the service restarts. */
     private var engineBlockedThisSession: String? = null
-
-    private fun startPlayback(idx: Int) {
-        player?.release()
-        player = MediaPlayer().apply {
-            setAudioAttributes(playbackAudioAttributes)
-            setDataSource(synthFile(idx).path)
-            setOnPreparedListener {
-                if (isPlaying) it.start() else pausedInParagraph = true
-                // synthesize the next paragraph while this one plays
-                nextSpeakable(idx + 1)?.let { n ->
-                    if (!readyFiles.contains(n) && n != awaitingPlayIndex) synthesize(n)
-                }
-            }
-            setOnCompletionListener {
-                synthFile(idx).delete()
-                readyFiles.remove(idx)
-                if (isPlaying) advanceAndSpeak()
-            }
-            setOnErrorListener { _, _, _ ->
-                if (isPlaying) advanceAndSpeak()
-                true
-            }
-            prepareAsync()
-        }
-    }
 
     private fun speakableText(block: Block): String? = when (block) {
         is Block.Paragraph -> block.text
@@ -880,13 +904,13 @@ class TtsService : Service() {
         }
         val pct = if (totalDurationMs > 0) (positionMs(currentIndex) * 100 / totalDurationMs).toInt() else 0
         val progressText = when {
-            isPlaying && awaitingPlayIndex >= 0 -> "Preparing voice…"
+            isPlaying && !audioStarted -> "Preparing voice…"
             blocks.isNotEmpty() -> "$pct% · ${articleSite.ifBlank { "Reading aloud" }}"
             else -> articleSite.ifBlank { "Reading aloud" }
         }
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setSmallIcon(R.drawable.ic_launcher_foreground)
-            .setContentTitle(articleTitle.ifBlank { "ReadLater" })
+            .setContentTitle(articleTitle.ifBlank { "Earmark" })
             .setContentText(progressText)
             .setContentIntent(contentIntent)
             .setOnlyAlertOnce(true)
@@ -910,7 +934,9 @@ class TtsService : Service() {
             .setStyle(
                 androidx.media.app.NotificationCompat.MediaStyle()
                     .setMediaSession(mediaSession?.sessionToken)
-                    .setShowActionsInCompactView(0, 1, 2)
+                    // Show play/pause, next, and STOP in the collapsed view so
+                    // the article can always be dismissed without expanding.
+                    .setShowActionsInCompactView(1, 2, 3)
             )
             .build()
     }

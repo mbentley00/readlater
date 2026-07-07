@@ -27,6 +27,7 @@ import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Star
 import androidx.compose.material.icons.filled.StarBorder
+import androidx.compose.material.icons.filled.SystemUpdate
 import androidx.compose.material.icons.filled.Unarchive
 import androidx.compose.material3.Card
 import androidx.compose.material3.CircularProgressIndicator
@@ -59,6 +60,7 @@ import androidx.compose.ui.unit.dp
 import android.content.Context
 import android.content.Intent
 import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.GraphicEq
 import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material3.Surface
@@ -187,7 +189,7 @@ fun ArticleListScreen(
         snackbarHost = { SnackbarHost(snackbarHostState) },
         topBar = {
             TopAppBar(
-                title = { Text("ReadLater") },
+                title = { Text("Earmark") },
                 actions = {
                     Box {
                         IconButton(onClick = { sortMenuOpen = true }) {
@@ -240,25 +242,32 @@ fun ArticleListScreen(
         bottomBar = {
             val playingId = ttsState.articleId
             if (playingId != null) {
-                Surface(tonalElevation = 6.dp) {
+                Surface(tonalElevation = 6.dp, color = MaterialTheme.colorScheme.secondaryContainer) {
                     Row(
                         verticalAlignment = Alignment.CenterVertically,
                         modifier = Modifier
                             .fillMaxWidth()
                             .clickable { onOpenArticle(playingId) }
-                            .padding(start = 16.dp, end = 4.dp, top = 4.dp, bottom = 4.dp)
+                            .padding(start = 14.dp, end = 4.dp, top = 4.dp, bottom = 4.dp)
                     ) {
+                        Icon(
+                            Icons.Filled.GraphicEq,
+                            contentDescription = null,
+                            tint = MaterialTheme.colorScheme.primary,
+                            modifier = Modifier.size(20.dp)
+                        )
+                        Spacer(modifier = Modifier.width(12.dp))
                         Column(modifier = Modifier.weight(1f)) {
                             Text(
-                                text = playingArticle?.title ?: "Playing…",
+                                text = if (ttsState.isPlaying) "NOW PLAYING" else "PAUSED",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.primary
+                            )
+                            Text(
+                                text = playingArticle?.title ?: "Loading…",
                                 style = MaterialTheme.typography.titleSmall,
                                 maxLines = 1,
                                 overflow = TextOverflow.Ellipsis
-                            )
-                            Text(
-                                text = if (ttsState.isPlaying) "Listening — tap to open" else "Paused — tap to open",
-                                style = MaterialTheme.typography.labelSmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
                         }
                         IconButton(onClick = {
@@ -270,7 +279,7 @@ fun ArticleListScreen(
                             )
                         }
                         IconButton(onClick = { sendTts(context, TtsService.ACTION_STOP) }) {
-                            Icon(Icons.Filled.Close, contentDescription = "Stop playback")
+                            Icon(Icons.Filled.Close, contentDescription = "Stop and dismiss")
                         }
                     }
                 }
@@ -278,6 +287,54 @@ fun ArticleListScreen(
         }
     ) { padding ->
         Column(modifier = Modifier.fillMaxSize().padding(padding)) {
+            // Update banner — checks the server's latest build on open.
+            var latest by remember { mutableStateOf<Pair<String, Int>?>(null) }
+            var updateDismissed by remember { mutableStateOf(false) }
+            LaunchedEffect(Unit) { latest = app.apiClient.latestAppVersion() }
+            val newer = latest?.second ?: 0
+            if (newer > com.readlater.app.BuildConfig.VERSION_CODE && !updateDismissed) {
+                Surface(color = MaterialTheme.colorScheme.primaryContainer) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable {
+                                runCatching {
+                                    context.startActivity(
+                                        Intent(
+                                            Intent.ACTION_VIEW,
+                                            android.net.Uri.parse(
+                                                "${app.settings.serverUrl.ifBlank { "https://readlater-mbent.fly.dev" }}/app.apk"
+                                            )
+                                        )
+                                    )
+                                }
+                            }
+                            .padding(start = 16.dp, end = 4.dp, top = 8.dp, bottom = 8.dp)
+                    ) {
+                        Icon(
+                            Icons.Filled.SystemUpdate,
+                            contentDescription = null,
+                            tint = MaterialTheme.colorScheme.onPrimaryContainer,
+                            modifier = Modifier.size(20.dp)
+                        )
+                        Spacer(modifier = Modifier.width(12.dp))
+                        Text(
+                            text = "Update available — v${latest?.first} · tap to download",
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.onPrimaryContainer,
+                            modifier = Modifier.weight(1f)
+                        )
+                        IconButton(onClick = { updateDismissed = true }) {
+                            Icon(
+                                Icons.Filled.Close,
+                                contentDescription = "Dismiss",
+                                tint = MaterialTheme.colorScheme.onPrimaryContainer
+                            )
+                        }
+                    }
+                }
+            }
             Row(
                 modifier = Modifier
                     .padding(horizontal = 16.dp, vertical = 4.dp)

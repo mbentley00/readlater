@@ -4,14 +4,21 @@
     android:height="108dp"
     android:viewportWidth="108"
     android:viewportHeight="108">
-    <!-- Simple page/book shape -->
+    <!-- Earmark: a dog-eared page. Kept inside the adaptive-icon safe zone. -->
+    <!-- soft drop shadow -->
     <path
-        android:fillColor="#FFF8F4"
-        android:pathData="M36,28 h30 l8,8 v44 a4,4 0 0 1 -4,4 h-34 a4,4 0 0 1 -4,-4 v-48 a4,4 0 0 1 4,-4 z" />
+        android:fillColor="#00000022"
+        android:pathData="M42,32 h22 l12,12 v34 a4,4 0 0 1 -4,4 h-30 a4,4 0 0 1 -4,-4 v-42 a4,4 0 0 1 4,-4 z" />
+    <!-- page body (cream) with the top-right corner turned down -->
     <path
-        android:fillColor="#E8D5C0"
-        android:pathData="M66,28 l8,8 h-8 z" />
+        android:fillColor="#FBF4EA"
+        android:pathData="M40,30 h22 l12,12 v34 a4,4 0 0 1 -4,4 h-30 a4,4 0 0 1 -4,-4 v-42 a4,4 0 0 1 4,-4 z" />
+    <!-- the folded corner (the 'ear'), showing the page's underside -->
     <path
-        android:fillColor="#8A5100"
-        android:pathData="M40,44 h28 v3 h-28 z M40,52 h28 v3 h-28 z M40,60 h28 v3 h-28 z M40,68 h18 v3 h-18 z" />
+        android:fillColor="#E3CDAF"
+        android:pathData="M62,30 v12 h12 z" />
+    <!-- text lines -->
+    <path
+        android:fillColor="#C05A34"
+        android:pathData="M44,52 h26 v3.4 h-26 z M44,60 h26 v3.4 h-26 z M44,68 h16 v3.4 h-16 z" />
 </vector>
