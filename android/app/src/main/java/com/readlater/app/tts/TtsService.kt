@@ -612,6 +612,7 @@ class TtsService : Service() {
     // usable file, we fall back to speak() for the session (audio still plays,
     // just without reliable headset routing).
     private var player: MediaPlayer? = null
+    private var playerFd: android.os.ParcelFileDescriptor? = null
     private var preparedIdx = -1
     private val readyFiles = mutableSetOf<Int>()
     private val synthesizing = mutableSetOf<Int>()
@@ -627,7 +628,9 @@ class TtsService : Service() {
 
     private fun releasePlayer() {
         runCatching { player?.release() }
+        runCatching { playerFd?.close() }
         player = null
+        playerFd = null
         preparedIdx = -1
     }
 
@@ -779,9 +782,16 @@ class TtsService : Service() {
     private fun startFilePlayback(idx: Int, fromMs: Int) {
         releasePlayer()
         try {
+            // Hand MediaPlayer a FileDescriptor we open — the media service runs
+            // in a separate process (mediaserver) that CANNOT open our private
+            // cache files by path, so setDataSource(path) silently hangs.
+            val fd = android.os.ParcelFileDescriptor.open(
+                synthFile(idx), android.os.ParcelFileDescriptor.MODE_READ_ONLY
+            )
+            playerFd = fd
             player = MediaPlayer().apply {
                 setAudioAttributes(playbackAudioAttributes)
-                setDataSource(synthFile(idx).path)
+                setDataSource(fd.fileDescriptor)
                 setOnPreparedListener { mp ->
                     preparedIdx = idx
                     if (fromMs > 0) runCatching { mp.seekTo(fromMs) }
