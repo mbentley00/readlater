@@ -556,6 +556,74 @@ const server = http.createServer(async (req, res) => {
       }
     }
 
+    // ---- save by URL: fetch the page server-side, create a quick article, and
+    // upgrade its content via the LLM in the background. Used by Android share.
+    if (req.method === 'POST' && parts[1] === 'save-url' && parts.length === 2) {
+      const b = parseBody(await readBody(req), req.headers['content-type']);
+      let artUrl = sanitizeString(b.url, 4000);
+      // share sheets sometimes hand over "Title https://..." — pull the URL out
+      const found = artUrl && artUrl.match(/https?:\/\/[^\s]+/i);
+      if (found) artUrl = found[0];
+      if (!artUrl || !/^https?:\/\//i.test(artUrl)) return json(res, 400, { error: 'a http(s) url is required' });
+
+      const existing = store.articleByUrl(user.id, artUrl);
+      if (existing) return json(res, 200, { ...pubArticleMeta(existing), alreadySaved: true });
+
+      let pageHtml = '';
+      try {
+        const resp = await fetch(artUrl, {
+          headers: { 'User-Agent': 'Mozilla/5.0 (compatible; EarmarkBot/1.0)', Accept: 'text/html' },
+          redirect: 'follow',
+          signal: AbortSignal.timeout(20000),
+        });
+        if (!resp.ok) return json(res, 502, { error: `page returned ${resp.status}` });
+        pageHtml = (await resp.text()).slice(0, 3 * 1024 * 1024);
+      } catch (e) {
+        return json(res, 502, { error: 'could not fetch the page' });
+      }
+
+      const titleMatch = pageHtml.match(/<meta[^>]+property=["']og:title["'][^>]+content=["']([^"']+)["']/i)
+        || pageHtml.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
+      const title = titleMatch ? sanitizeString(titleMatch[1].replace(/\s+/g, ' ').trim(), 500) : artUrl;
+      const bodyText = pageHtml
+        .replace(/<(script|style|head|noscript|svg|template)\b[\s\S]*?<\/\1\s*>/gi, ' ')
+        .replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
+
+      const now = Date.now();
+      const a = {
+        id: newId(), userId: user.id, url: artUrl, savedAt: now,
+        archived: false, favorite: false, readParagraph: 0,
+        title,
+        byline: null,
+        siteName: hostOf(artUrl),
+        excerpt: sanitizeString(bodyText, 300),
+        html: `<p>${escapeText(bodyText.slice(0, 200000))}</p>`,
+        textContent: bodyText.slice(0, 200000),
+        updatedAt: now,
+      };
+      store.insertArticle(a);
+      enqueueTts(a.id, user.id);
+
+      // Upgrade to a clean extraction in the background (same as the rescue path).
+      if (llm.enabled()) {
+        llm.extractArticle({ url: artUrl, title, pageHtml })
+          .then((better) => {
+            if (!better || !better.textContent) return;
+            const current = store.getArticle(a.id, user.id);
+            if (!current || better.textContent.length <= (current.textContent || '').length) return;
+            store.updateArticleContent(a.id, {
+              title: current.title, byline: current.byline, siteName: current.siteName,
+              excerpt: better.textContent.slice(0, 300),
+              html: better.html, textContent: better.textContent, updatedAt: Date.now(),
+            });
+            enqueueTts(a.id, user.id, true); // re-synthesize the good text
+            console.log(`save-url upgraded ${a.id} (${(current.textContent || '').length} → ${better.textContent.length})`);
+          })
+          .catch((e) => console.error(`save-url LLM upgrade failed for ${a.id}: ${e.message}`));
+      }
+      return json(res, 201, pubArticleMeta(store.getArticle(a.id, user.id)));
+    }
+
     // ---- single article
     if (parts[1] === 'articles' && parts.length === 3) {
       const a = store.getArticle(parts[2], user.id);

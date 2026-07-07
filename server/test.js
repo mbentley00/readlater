@@ -113,6 +113,15 @@ async function main() {
   const mockLlm = await startMockAnthropic(MOCK_LLM_PORT);
   const MOCK_TTS_PORT = PORT + 2;
   const mockTts = await startMockTts(MOCK_TTS_PORT);
+  const MOCK_PAGE_PORT = PORT + 3;
+  const mockPage = await new Promise((resolve) => {
+    const s = http.createServer((req, res) => {
+      res.writeHead(200, { 'Content-Type': 'text/html' });
+      res.end('<html><head><title>Shared Page Title</title></head><body><nav>menu</nav>' +
+        '<article><p>The shared article body text goes here.</p></article></body></html>');
+    });
+    s.listen(MOCK_PAGE_PORT, '127.0.0.1', () => resolve(s));
+  });
 
   // pre-seed an old-format db (no users) to test legacy migration
   fs.writeFileSync(path.join(DATA_DIR, 'db.json'), JSON.stringify({
@@ -447,6 +456,21 @@ async function main() {
     assert.strictEqual(r.status, 201, 'session cookie can create highlights');
     await api('DELETE', `/api/highlights/${r.body.id}`);
 
+    // ---- save by URL (Android share) -------------------------------------
+    r = await api('POST', '/api/save-url', { url: `Check this out http://127.0.0.1:${MOCK_PAGE_PORT}/post` });
+    assert.strictEqual(r.status, 201, 'save-url creates an article');
+    assert.strictEqual(r.body.title, 'Shared Page Title', 'title pulled from the page');
+    assert.strictEqual(r.body.url, `http://127.0.0.1:${MOCK_PAGE_PORT}/post`, 'URL extracted from shared text');
+    const savedUrlId = r.body.id;
+    r = await api('GET', `/api/articles/${savedUrlId}`);
+    assert.ok((r.body.textContent || '').includes('shared article body'), 'page text captured');
+    // idempotent: sharing the same URL again returns the existing article
+    r = await api('POST', '/api/save-url', { url: `http://127.0.0.1:${MOCK_PAGE_PORT}/post` });
+    assert.strictEqual(r.status, 200);
+    assert.ok(r.body.alreadySaved, 're-sharing a URL is idempotent');
+    r = await api('POST', '/api/save-url', { url: 'not a url' });
+    assert.strictEqual(r.status, 400, 'non-URL rejected');
+
     // ---- server TTS (Kokoro) ---------------------------------------------
     // Saving an article pre-computes audio; metadata carries per-paragraph
     // offsets and the WAV streams back.
@@ -621,6 +645,7 @@ async function main() {
   } finally {
     mockLlm.close();
     mockTts.close();
+    mockPage.close();
     const exited = new Promise((resolve) => proc.on('exit', resolve));
     proc.kill('SIGTERM');
     await exited;
