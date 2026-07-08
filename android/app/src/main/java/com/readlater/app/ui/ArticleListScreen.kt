@@ -18,6 +18,7 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.Sort
 import androidx.compose.material.icons.filled.Archive
@@ -159,6 +160,10 @@ fun ArticleListScreen(
     // Stable shuffle so RANDOM doesn't reshuffle on every recomposition; a new
     // seed (re-tapping Random) gives a fresh order.
     var shuffleSeed by remember { mutableStateOf(0L) }
+
+    // Jump back to the top whenever the sort order changes (incl. re-rolling Random).
+    val listState = rememberLazyListState()
+    LaunchedEffect(sortMode, shuffleSeed) { listState.scrollToItem(0) }
 
     val articles = remember(unsorted, sortMode, selectedView, hlCounts, searchQuery, searchActive, shuffleSeed) {
         val counts = hlCounts.associate { it.articleId to it.n }
@@ -458,7 +463,7 @@ fun ArticleListScreen(
                     }
                 }
             } else {
-                LazyColumn(contentPadding = PaddingValues(bottom = 24.dp)) {
+                LazyColumn(state = listState, contentPadding = PaddingValues(bottom = 24.dp)) {
                     itemsIndexed(articles, key = { _, a -> a.id }) { i, article ->
                         if (i > 0) HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f))
                         ArticleCard(
