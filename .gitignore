@@ -12,6 +12,8 @@ android/*.iml
 # packaged extension
 firefox-extension/*.zip
 firefox-extension/*.xpi
+firefox-extension/signed/
+firefox-extension/web-ext-artifacts/
 
 # server dependencies
 server/node_modules/
