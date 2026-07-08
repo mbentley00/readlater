@@ -633,7 +633,8 @@ fun ReaderScreen(articleId: String, onBack: () -> Unit, onOpenArticle: (String) 
         }
     }
 
-    // Resume chooser: manual scroll position vs listening position.
+    // Resume chooser: manual scroll position vs listening position, and whether
+    // resuming the listening position should start playing or just position there.
     resumeChoice?.let { (read, tts) ->
         val total = blocks.size.coerceAtLeast(1)
         val readPct = ((read + 1) * 100 / total).coerceIn(1, 100)
@@ -641,21 +642,41 @@ fun ReaderScreen(articleId: String, onBack: () -> Unit, onOpenArticle: (String) 
         AlertDialog(
             onDismissRequest = { resumeChoice = null },
             title = { Text("Resume where?") },
-            text = { Text("Your reading and listening positions differ.") },
-            confirmButton = {
-                TextButton(onClick = {
-                    resumeChoice = null
-                    scope.launch { listState.scrollToItem(read) }
-                }) { Text("Reading · $readPct%") }
+            text = {
+                Column {
+                    Text("Your reading and listening positions differ.")
+                    Spacer(modifier = Modifier.height(12.dp))
+                    TextButton(
+                        modifier = Modifier.fillMaxWidth(),
+                        onClick = {
+                            resumeChoice = null
+                            scope.launch { listState.scrollToItem(read) }
+                        }
+                    ) { Text("Reading position · $readPct%") }
+                    TextButton(
+                        modifier = Modifier.fillMaxWidth(),
+                        onClick = {
+                            resumeChoice = null
+                            followTts = true
+                            // Position at the listening spot, paused — press play to start here.
+                            repo.saveTtsPosition(articleId, tts)
+                            scope.launch { listState.scrollToItem(tts) }
+                        }
+                    ) { Text("Listening position · $ttsPct% (paused)") }
+                    TextButton(
+                        modifier = Modifier.fillMaxWidth(),
+                        onClick = {
+                            resumeChoice = null
+                            followTts = true
+                            sendTtsCommand(context, TtsService.ACTION_PLAY, articleId, tts)
+                            scope.launch { listState.scrollToItem(tts) }
+                        }
+                    ) { Text("Listening position · $ttsPct% (play)") }
+                }
             },
+            confirmButton = {},
             dismissButton = {
-                TextButton(onClick = {
-                    resumeChoice = null
-                    followTts = true
-                    // Resuming the listening position starts playback from there.
-                    sendTtsCommand(context, TtsService.ACTION_PLAY, articleId, tts)
-                    scope.launch { listState.scrollToItem(tts) }
-                }) { Text("Listening · $ttsPct%") }
+                TextButton(onClick = { resumeChoice = null }) { Text("Cancel") }
             }
         )
     }
