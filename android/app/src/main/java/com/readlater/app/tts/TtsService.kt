@@ -351,7 +351,16 @@ class TtsService : Service() {
         cancelAudioWatchdog()
         if (!usingSpeakFallback && audioTrack != null) {
             // remember the exact position so resume continues mid-sentence
-            resumePositionMs = trackPositionMs()
+            if (deviceStreamMode) {
+                val head = (audioTrack?.playbackHeadPosition?.toLong() ?: 0L) and 0xFFFFFFFFL
+                val b = synchronized(deviceBoundaries) { deviceBoundaries.lastOrNull { it.first <= head } }
+                if (b != null) {
+                    currentIndex = b.second
+                    resumePositionMs = b.third + ((head - b.first) * 1000 / trackSampleRate).toInt()
+                } else resumePositionMs = 0
+            } else {
+                resumePositionMs = trackPositionMs()
+            }
             releasePlayer()
         } else {
             tts?.stop() // fallback speak(): position is lost, resume re-speaks
@@ -664,6 +673,16 @@ class TtsService : Service() {
     private var audioStarted = false
     private var playToken = 0
 
+    // --- Continuous device playback: consecutive paragraph WAVs are streamed
+    // through ONE AudioTrack (no per-paragraph track recreation, which was the
+    // source of the gaps on short paragraphs). deviceBoundaries maps each
+    // paragraph's start frame on the track timeline so the highlight follows the
+    // real play head and pause/resume can locate the current paragraph + offset.
+    private var deviceStreamMode = false
+    private val deviceBoundaries = mutableListOf<Triple<Long, Int, Int>>() // startFrame, blockIdx, fromMs
+    @Volatile private var deviceAudibleBaseFrame = 0L
+    @Volatile private var deviceAudibleFromMs = 0
+
     private fun synthFile(idx: Int) = java.io.File(cacheDir, "tts-$idx.wav")
 
     // --- Server voice (Kokoro): one downloaded WAV for the whole article,
@@ -738,6 +757,7 @@ class TtsService : Service() {
 
     private fun releasePlayer() {
         playThreadGen++            // signal any streaming thread to stop
+        deviceStreamMode = false
         val t = audioTrack
         audioTrack = null
         playThread = null
@@ -951,21 +971,31 @@ class TtsService : Service() {
         }
     } catch (e: Exception) { logDbg("WAV parse err: ${e.message}"); null }
 
+    /**
+     * Play from [idx] onward through ONE continuous AudioTrack, feeding
+     * consecutive paragraph WAVs into it back-to-back. This removes the gap that
+     * used to appear between paragraphs (each previously got its own AudioTrack,
+     * and the teardown/setup was audible — worst on short paragraphs). The
+     * highlight follows the real play head via [deviceBoundaries]; the neural
+     * (sherpa) engine gets a short silence between paragraphs, the system voice
+     * plays gaplessly. The first paragraph's file must already be synthesized
+     * (the caller guarantees this); later ones are awaited from the prefetch.
+     */
     private fun startFilePlayback(idx: Int, fromMs: Int) {
         releasePlayer()
-        val file = synthFile(idx)
-        val wav = parseWav(file) ?: run { logDbg("bad WAV idx=$idx"); beginSpeakFallback("unparseable wav"); return }
+        val file0 = synthFile(idx)
+        val wav0 = parseWav(file0) ?: run { logDbg("bad WAV idx=$idx"); beginSpeakFallback("unparseable wav"); return }
         try {
-            val channelMask = if (wav.channels >= 2) android.media.AudioFormat.CHANNEL_OUT_STEREO
+            val channelMask = if (wav0.channels >= 2) android.media.AudioFormat.CHANNEL_OUT_STEREO
                 else android.media.AudioFormat.CHANNEL_OUT_MONO
             val minBuf = android.media.AudioTrack.getMinBufferSize(
-                wav.sampleRate, channelMask, android.media.AudioFormat.ENCODING_PCM_16BIT
+                wav0.sampleRate, channelMask, android.media.AudioFormat.ENCODING_PCM_16BIT
             ).coerceAtLeast(64 * 1024)
             val track = android.media.AudioTrack.Builder()
                 .setAudioAttributes(playbackAudioAttributes)
                 .setAudioFormat(
                     android.media.AudioFormat.Builder()
-                        .setSampleRate(wav.sampleRate)
+                        .setSampleRate(wav0.sampleRate)
                         .setChannelMask(channelMask)
                         .setEncoding(android.media.AudioFormat.ENCODING_PCM_16BIT)
                         .build()
@@ -974,68 +1004,134 @@ class TtsService : Service() {
                 .setTransferMode(android.media.AudioTrack.MODE_STREAM)
                 .build()
             audioTrack = track
-            trackSampleRate = wav.sampleRate
-            trackChannels = wav.channels
+            trackSampleRate = wav0.sampleRate
+            trackChannels = wav0.channels
             trackStartMs = fromMs
             trackSpeed = 1.0f // device audio is already synthesized at the set rate
             preparedIdx = idx
+            currentIndex = idx
             audioStarted = true
+            deviceStreamMode = true
+            synchronized(deviceBoundaries) { deviceBoundaries.clear() }
             cancelAudioWatchdog()
             track.play()
-            logDbg("playing (AudioTrack) idx=$idx sr=${wav.sampleRate} ch=${wav.channels} from=${fromMs}ms")
-            prefetchAhead(idx) // keep synthesis ahead of playback (short paragraphs)
+            logDbg("playing (stream) idx=$idx sr=${wav0.sampleRate} ch=${wav0.channels} from=${fromMs}ms")
+            prefetchAhead(idx)
             publishState(); updatePlaybackState(); updateNotification()
 
-            val frameBytes = wav.channels * 2
-            val startByte = wav.dataOffset + (fromMs.toLong() * wav.sampleRate / 1000 * frameBytes)
-                .coerceIn(0L, wav.dataLen)
+            val silenceMs = if (initializedEngine == sherpaEngine) KALDI_PARAGRAPH_GAP_MS else 0L
             val myGen = ++playThreadGen
             playThread = Thread {
                 try {
-                    var bytesWritten = 0L
-                    java.io.RandomAccessFile(file, "r").use { raf ->
-                        raf.seek(startByte)
-                        val buf = ByteArray(16 * 1024)
-                        var remaining = wav.dataOffset + wav.dataLen - startByte
-                        while (myGen == playThreadGen && remaining > 0) {
-                            val toRead = minOf(buf.size.toLong(), remaining).toInt()
-                            val n = raf.read(buf, 0, toRead)
-                            if (n <= 0) break
-                            var off = 0
-                            while (off < n && myGen == playThreadGen) {
-                                val w = track.write(buf, off, n - off)
-                                if (w <= 0) { off = -1; break } // error / track stopped
-                                off += w
-                                bytesWritten += w
+                    var para = idx
+                    var firstPara = true
+                    var writtenFrames = 0L
+                    var lastHi = -1
+                    val toDelete = ArrayDeque<Int>() // delete with a lag so resume keeps the audible file
+                    while (myGen == playThreadGen) {
+                        val f = synthFile(para)
+                        // wait for this paragraph's audio (prefetch usually has it ready)
+                        var waited = 0
+                        while (myGen == playThreadGen &&
+                            !(readyFiles.contains(para) && f.exists() && f.length() > 128)) {
+                            mainHandler.post { if (!synthesizing.contains(para) && !readyFiles.contains(para)) synthesize(para) }
+                            Thread.sleep(30); waited += 30
+                            if (waited > 15000) { // synthesis stalled — fall back to system speak
+                                mainHandler.post { if (myGen == playThreadGen && isPlaying) beginSpeakFallback("synth stall idx=$para") }
+                                return@Thread
                             }
-                            if (off < 0) break
-                            remaining -= n
                         }
-                    }
-                    // Drain against the frames we ACTUALLY wrote (the header's
-                    // declared length could exceed the real PCM), with a hard
-                    // deadline so a stalled playback head can never hang the
-                    // article on a paragraph — that was cutting articles short.
-                    val framesToDrain = bytesWritten / frameBytes
-                    val deadline = System.currentTimeMillis() +
-                        (framesToDrain * 1000L / trackSampleRate) + 2000
-                    while (myGen == playThreadGen &&
-                        (track.playbackHeadPosition.toLong() and 0xFFFFFFFFL) < framesToDrain &&
-                        System.currentTimeMillis() < deadline
-                    ) Thread.sleep(40)
-                    if (myGen == playThreadGen) mainHandler.post {
-                        if (myGen == playThreadGen && isPlaying && preparedIdx == idx) {
-                            logDbg("completed idx=$idx (${bytesWritten}B)")
-                            synthFile(idx).delete(); readyFiles.remove(idx)
-                            preparedIdx = -1; resumePositionMs = 0
-                            advanceAndSpeak()
+                        if (myGen != playThreadGen) break
+                        val wav = parseWav(f) ?: run {
+                            mainHandler.post { if (myGen == playThreadGen && isPlaying) beginSpeakFallback("bad wav idx=$para") }
+                            return@Thread
                         }
+                        val frameBytes = wav.channels * 2
+                        val fromForPara = if (firstPara) fromMs else 0
+                        synchronized(deviceBoundaries) { deviceBoundaries.add(Triple(writtenFrames, para, fromForPara)) }
+                        val curPara = para
+                        mainHandler.post { if (myGen == playThreadGen && isPlaying) prefetchAhead(curPara) }
+
+                        val startByte = wav.dataOffset + (fromForPara.toLong() * wav.sampleRate / 1000 * frameBytes)
+                            .coerceIn(0L, wav.dataLen)
+                        java.io.RandomAccessFile(f, "r").use { raf ->
+                            raf.seek(startByte)
+                            val buf = ByteArray(16 * 1024)
+                            var remaining = wav.dataOffset + wav.dataLen - startByte
+                            while (myGen == playThreadGen && remaining > 0) {
+                                val toRead = minOf(buf.size.toLong(), remaining).toInt()
+                                val n = raf.read(buf, 0, toRead)
+                                if (n <= 0) break
+                                var off = 0
+                                while (off < n && myGen == playThreadGen) {
+                                    val w = track.write(buf, off, n - off)
+                                    if (w <= 0) { off = -1; break }
+                                    off += w
+                                    writtenFrames += w / frameBytes
+                                }
+                                if (off < 0) break
+                                remaining -= n
+                                // move the highlight to whatever paragraph is actually audible
+                                val head = track.playbackHeadPosition.toLong() and 0xFFFFFFFFL
+                                val b = synchronized(deviceBoundaries) { deviceBoundaries.lastOrNull { it.first <= head } }
+                                if (b != null && b.second != lastHi) {
+                                    lastHi = b.second
+                                    deviceAudibleBaseFrame = b.first
+                                    deviceAudibleFromMs = b.third
+                                    mainHandler.post {
+                                        if (myGen == playThreadGen && isPlaying && deviceStreamMode) {
+                                            currentIndex = b.second
+                                            preparedIdx = b.second
+                                            articleId?.let { app.repository.saveTtsPositionLocal(it, b.second) }
+                                            publishState(); updateNotification()
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        firstPara = false
+                        toDelete.addLast(curPara)
+                        while (toDelete.size > 2) { // keep the last two behind the writer for resume
+                            val old = toDelete.removeFirst()
+                            mainHandler.post { synthFile(old).delete(); readyFiles.remove(old) }
+                        }
+
+                        val next = nextSpeakable(para + 1)
+                        if (next == null) {
+                            val deadline = System.currentTimeMillis() +
+                                (writtenFrames * 1000L / trackSampleRate) + 2000
+                            while (myGen == playThreadGen &&
+                                (track.playbackHeadPosition.toLong() and 0xFFFFFFFFL) < writtenFrames &&
+                                System.currentTimeMillis() < deadline
+                            ) Thread.sleep(40)
+                            if (myGen == playThreadGen) mainHandler.post {
+                                if (myGen == playThreadGen && isPlaying && deviceStreamMode) {
+                                    logDbg("stream complete at idx=$para (${writtenFrames} frames)")
+                                    currentIndex = 0
+                                    handleStop()
+                                }
+                            }
+                            return@Thread
+                        }
+                        // neural engine: a short beat between paragraphs (gapless otherwise)
+                        if (silenceMs > 0 && myGen == playThreadGen) {
+                            var silFrames = silenceMs * wav.sampleRate / 1000
+                            val sil = ByteArray(8 * 1024)
+                            while (silFrames > 0 && myGen == playThreadGen) {
+                                val want = minOf(sil.size.toLong(), silFrames * frameBytes).toInt()
+                                val w = track.write(sil, 0, want)
+                                if (w <= 0) break
+                                writtenFrames += w / frameBytes
+                                silFrames -= w / frameBytes
+                            }
+                        }
+                        para = next
                     }
                 } catch (e: Exception) {
                     mainHandler.post {
                         if (myGen == playThreadGen) {
-                            logDbg("AudioTrack ERROR idx=$idx: ${e.message}")
-                            if (isPlaying) beginSpeakFallback("audiotrack error")
+                            logDbg("stream ERROR: ${e.message}")
+                            if (isPlaying) beginSpeakFallback("stream error")
                         }
                     }
                 }

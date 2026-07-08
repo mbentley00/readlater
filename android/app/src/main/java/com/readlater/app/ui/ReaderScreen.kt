@@ -40,6 +40,7 @@ import androidx.compose.material.icons.filled.PushPin
 import androidx.compose.material.icons.filled.Remove
 import androidx.compose.material.icons.filled.SkipNext
 import androidx.compose.material.icons.filled.SkipPrevious
+import androidx.compose.material.icons.filled.Stop
 import androidx.compose.material.icons.filled.Star
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Close
@@ -468,6 +469,12 @@ fun ReaderScreen(articleId: String, onBack: () -> Unit, onOpenArticle: (String) 
                 }
                 IconButton(onClick = { sendTtsCommand(context, TtsService.ACTION_NEXT) }) {
                     Icon(Icons.Filled.SkipNext, contentDescription = "Next paragraph")
+                }
+                // Stop playback entirely and dismiss the player (only while active).
+                if (isTtsThisArticle) {
+                    IconButton(onClick = { sendTtsCommand(context, TtsService.ACTION_STOP) }) {
+                        Icon(Icons.Filled.Stop, contentDescription = "Stop")
+                    }
                 }
                 // Jump the view back to the reading position and resume following.
                 IconButton(onClick = {
