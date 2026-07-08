@@ -8,10 +8,21 @@ import kotlinx.coroutines.flow.Flow
 @Dao
 interface ArticleDao {
 
-    @Query("SELECT * FROM articles WHERE archived = :archived ORDER BY savedAt DESC")
+    // List flows deliberately DON'T load the (large) html column — the list and
+    // view filters never use it, and loading every inbox body (tens of MB) is
+    // what made selecting a view slow. The reader fetches html separately by id.
+    @Query(
+        "SELECT id, url, title, byline, siteName, excerpt, NULL AS html, savedAt, updatedAt, " +
+            "archived, favorite, readParagraph, dirty, wordCount, paragraphCount, ttsParagraph, " +
+            "imageUrl, publishedAt FROM articles WHERE archived = :archived ORDER BY savedAt DESC"
+    )
     fun articlesByArchived(archived: Boolean): Flow<List<ArticleEntity>>
 
-    @Query("SELECT * FROM articles ORDER BY savedAt DESC")
+    @Query(
+        "SELECT id, url, title, byline, siteName, excerpt, NULL AS html, savedAt, updatedAt, " +
+            "archived, favorite, readParagraph, dirty, wordCount, paragraphCount, ttsParagraph, " +
+            "imageUrl, publishedAt FROM articles ORDER BY savedAt DESC"
+    )
     fun allArticlesFlow(): Flow<List<ArticleEntity>>
 
     @Query("SELECT * FROM articles WHERE id = :id")

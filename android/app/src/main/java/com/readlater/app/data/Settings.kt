@@ -77,6 +77,12 @@ class Settings(context: Context) {
             prefs.edit().putString(KEY_TTS_VOICE, value).apply()
         }
 
+    /** Cached saved-view definitions (JSON) so the chips render instantly on
+     *  open while a fresh copy is fetched from the server in the background. */
+    var cachedViewsJson: String
+        get() = prefs.getString(KEY_CACHED_VIEWS, "").orEmpty()
+        set(value) { prefs.edit().putString(KEY_CACHED_VIEWS, value).apply() }
+
     /** updatedAt watermark of the last successful sync (for delta pulls). */
     var lastSyncAt: Long
         get() = prefs.getLong(KEY_LAST_SYNC, 0L)
@@ -96,6 +102,7 @@ class Settings(context: Context) {
         const val KEY_TOKEN = "token"
         const val KEY_TTS_RATE = "tts_speech_rate"
         const val KEY_SERVER_RATE = "server_speech_rate"
+        const val KEY_CACHED_VIEWS = "cached_views_json"
         const val KEY_LIST_SORT = "list_sort"
         const val KEY_LAST_ARTICLE = "last_article_id"
         const val KEY_TTS_ENGINE = "tts_engine"

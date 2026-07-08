@@ -31,11 +31,45 @@ class Repository(
 
     fun highlightCounts(): Flow<List<HighlightCount>> = highlightDao.countsByArticle()
 
-    suspend fun fetchViews(): List<RemoteView> = api.listViews()
+    suspend fun fetchViews(): List<RemoteView> = api.listViews().also {
+        settings.cachedViewsJson = viewsToJson(it)
+    }
+
+    /** Locally cached views — shown instantly while [fetchViews] refreshes. */
+    fun cachedViews(): List<RemoteView> = jsonToViews(settings.cachedViewsJson)
 
     suspend fun createView(name: String, view: RemoteView): RemoteView = api.createView(name, view)
 
     suspend fun deleteView(id: String) = api.deleteView(id)
+
+    private fun viewsToJson(views: List<RemoteView>): String {
+        val arr = org.json.JSONArray()
+        views.forEach { v ->
+            arr.put(org.json.JSONObject().apply {
+                put("id", v.id); put("name", v.name); put("q", v.q); put("domain", v.domain)
+                put("highlighted", v.highlighted); put("minWords", v.minWords)
+                put("maxWords", v.maxWords); put("minHighlights", v.minHighlights)
+                put("includeArchived", v.includeArchived)
+            })
+        }
+        return arr.toString()
+    }
+
+    private fun jsonToViews(s: String): List<RemoteView> {
+        if (s.isBlank()) return emptyList()
+        return runCatching {
+            val arr = org.json.JSONArray(s)
+            (0 until arr.length()).map { i ->
+                val o = arr.getJSONObject(i)
+                RemoteView(
+                    id = o.getString("id"), name = o.optString("name"), q = o.optString("q"),
+                    domain = o.optString("domain"), highlighted = o.optBoolean("highlighted"),
+                    minWords = o.optInt("minWords"), maxWords = o.optInt("maxWords"),
+                    minHighlights = o.optInt("minHighlights"), includeArchived = o.optBoolean("includeArchived")
+                )
+            }
+        }.getOrDefault(emptyList())
+    }
 
     fun article(id: String): Flow<ArticleEntity?> = articleDao.articleFlow(id)
 

@@ -150,7 +150,7 @@ fun ArticleListScreen(
 
     var showArchived by remember { mutableStateOf(false) }
     var selectedView by remember { mutableStateOf<RemoteView?>(null) }
-    var views by remember { mutableStateOf<List<RemoteView>>(emptyList()) }
+    var views by remember { mutableStateOf(repo.cachedViews()) }
     var searchActive by remember { mutableStateOf(false) }
     var searchQuery by remember { mutableStateOf("") }
 
