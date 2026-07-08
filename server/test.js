@@ -117,7 +117,8 @@ async function main() {
   const mockPage = await new Promise((resolve) => {
     const s = http.createServer((req, res) => {
       res.writeHead(200, { 'Content-Type': 'text/html' });
-      res.end('<html><head><title>Shared Page Title</title></head><body><nav>menu</nav>' +
+      res.end('<html><head><title>Shared Page Title</title>' +
+        '<meta property="og:image" content="/thumb.jpg"></head><body><nav>menu</nav>' +
         '<article><p>The shared article body text goes here.</p></article></body></html>');
     });
     s.listen(MOCK_PAGE_PORT, '127.0.0.1', () => resolve(s));
@@ -470,6 +471,7 @@ async function main() {
     }
     assert.ok(filled, 'title pulled from the page in the background');
     assert.ok((filled.textContent || '').includes('shared article body'), 'page text captured');
+    assert.strictEqual(filled.imageUrl, `http://127.0.0.1:${MOCK_PAGE_PORT}/thumb.jpg`, 'og:image resolved to absolute url');
     // idempotent: sharing the same URL again returns the existing article
     r = await api('POST', '/api/save-url', { url: `http://127.0.0.1:${MOCK_PAGE_PORT}/post` });
     assert.strictEqual(r.status, 200);

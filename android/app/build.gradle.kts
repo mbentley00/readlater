@@ -21,8 +21,8 @@ android {
         applicationId = "com.readlater.app"
         minSdk = 26
         targetSdk = 34
-        versionCode = 28
-        versionName = "3.7"
+        versionCode = 29
+        versionName = "3.8"
     }
 
     signingConfigs {
@@ -83,6 +83,7 @@ dependencies {
     implementation("androidx.activity:activity-compose:1.9.2")
     implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.8.5")
     implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.8.5")
+    implementation("io.coil-kt:coil-compose:2.6.0") // article thumbnails
     implementation("androidx.navigation:navigation-compose:2.8.0")
 
     implementation("androidx.room:room-runtime:2.6.1")

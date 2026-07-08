@@ -26,7 +26,9 @@ data class ArticleEntity(
     /** Block count from HtmlParser, set when the body is cached (0 = unknown). */
     @ColumnInfo(defaultValue = "0") val paragraphCount: Int = 0,
     /** Listening position (TTS), tracked separately from the manual scroll position. */
-    @ColumnInfo(defaultValue = "0") val ttsParagraph: Int = 0
+    @ColumnInfo(defaultValue = "0") val ttsParagraph: Int = 0,
+    /** Thumbnail image URL (og:image), null if none. */
+    val imageUrl: String? = null
 )
 
 @Entity(tableName = "highlights")

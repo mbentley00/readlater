@@ -207,12 +207,16 @@
 
   // Returned by the IIFE → becomes the script's completion value,
   // which browser.tabs.executeScript hands back to background.js.
+  let image = meta('og:image') || meta('og:image:url') || meta('twitter:image') || null;
+  if (image) { try { image = new URL(image, location.href).href.slice(0, 2000); } catch (e) { image = null; } }
+
   return {
     url: (meta('og:url') || location.href).split('#')[0],
     title: (title || location.href).trim().slice(0, 500),
     byline: byline ? byline.trim().replace(/\s+/g, ' ').slice(0, 200) : null,
     siteName: (best.siteName || meta('og:site_name') || location.hostname).trim().slice(0, 200),
     excerpt: (best.excerpt || meta('og:description') || meta('description') || textContent.slice(0, 300)).trim().slice(0, 500),
+    image,
     html: best.html,
     textContent: textContent.slice(0, 200000),
     savedAt: Date.now(),

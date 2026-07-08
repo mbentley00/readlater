@@ -24,6 +24,13 @@ private val MIGRATION_2_3 = object : Migration(2, 3) {
     }
 }
 
+/** v3 → v4: thumbnail image URL for the article list. */
+private val MIGRATION_3_4 = object : Migration(3, 4) {
+    override fun migrate(db: SupportSQLiteDatabase) {
+        db.execSQL("ALTER TABLE articles ADD COLUMN imageUrl TEXT")
+    }
+}
+
 /**
  * Application class doubling as a tiny manual DI container.
  * All singletons are created lazily on first use.
@@ -32,7 +39,7 @@ class ReadLaterApp : Application() {
 
     val database: AppDatabase by lazy {
         Room.databaseBuilder(this, AppDatabase::class.java, "readlater.db")
-            .addMigrations(MIGRATION_1_2, MIGRATION_2_3)
+            .addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4)
             .fallbackToDestructiveMigration()
             .build()
     }

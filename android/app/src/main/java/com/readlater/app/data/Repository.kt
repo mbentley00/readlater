@@ -103,7 +103,8 @@ class Repository(
                     ttsParagraph = r.ttsParagraph,
                     dirty = false,
                     wordCount = r.wordCount,
-                    paragraphCount = local?.paragraphCount ?: 0
+                    paragraphCount = local?.paragraphCount ?: 0,
+                    imageUrl = r.imageUrl
                 )
                 if (local == null || local.copy(html = null, paragraphCount = 0) !=
                     merged.copy(html = null, paragraphCount = 0)

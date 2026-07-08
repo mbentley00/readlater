@@ -58,6 +58,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.foundation.background
 import androidx.compose.foundation.shape.CircleShape
@@ -566,44 +567,62 @@ private fun ArticleCard(
 
         Spacer(modifier = Modifier.height(3.dp))
 
-        // title (bold), with an unread dot and a favorite star
         Row(verticalAlignment = Alignment.Top) {
-            if (unread) {
-                Box(
-                    modifier = Modifier
-                        .padding(top = 8.dp, end = 8.dp)
-                        .size(8.dp)
-                        .background(MaterialTheme.colorScheme.primary, CircleShape)
-                )
-            }
-            Text(
-                text = article.title.ifBlank { article.url },
-                style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.SemiBold),
-                maxLines = 2,
-                overflow = TextOverflow.Ellipsis,
-                modifier = Modifier.weight(1f)
-            )
-            if (article.favorite) {
-                Icon(
-                    Icons.Filled.Star, contentDescription = "Favorite",
-                    tint = MaterialTheme.colorScheme.tertiary,
-                    modifier = Modifier.padding(start = 6.dp, top = 3.dp).size(16.dp)
-                )
-            }
-        }
+            Column(modifier = Modifier.weight(1f)) {
+                // title (bold), with an unread dot and a favorite star
+                Row(verticalAlignment = Alignment.Top) {
+                    if (unread) {
+                        Box(
+                            modifier = Modifier
+                                .padding(top = 8.dp, end = 8.dp)
+                                .size(8.dp)
+                                .background(MaterialTheme.colorScheme.primary, CircleShape)
+                        )
+                    }
+                    Text(
+                        text = article.title.ifBlank { article.url },
+                        style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.SemiBold),
+                        maxLines = 2,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.weight(1f)
+                    )
+                    if (article.favorite) {
+                        Icon(
+                            Icons.Filled.Star, contentDescription = "Favorite",
+                            tint = MaterialTheme.colorScheme.tertiary,
+                            modifier = Modifier.padding(start = 6.dp, top = 3.dp).size(16.dp)
+                        )
+                    }
+                }
 
-        // date · excerpt
-        val date = cardDate(article.savedAt)
-        val excerpt = article.excerpt?.takeIf { it.isNotBlank() }
-        if (date.isNotBlank() || excerpt != null) {
-            Spacer(modifier = Modifier.height(4.dp))
-            Text(
-                text = listOfNotNull(date.ifBlank { null }, excerpt).joinToString(" · "),
-                style = MaterialTheme.typography.bodyMedium,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                maxLines = 3,
-                overflow = TextOverflow.Ellipsis
-            )
+                // date · excerpt
+                val date = cardDate(article.savedAt)
+                val excerpt = article.excerpt?.takeIf { it.isNotBlank() && it != "Fetching…" }
+                if (date.isNotBlank() || excerpt != null) {
+                    Spacer(modifier = Modifier.height(4.dp))
+                    Text(
+                        text = listOfNotNull(date.ifBlank { null }, excerpt).joinToString(" · "),
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 3,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                }
+            }
+
+            // thumbnail (og:image), Readwise-style
+            article.imageUrl?.takeIf { it.isNotBlank() }?.let { img ->
+                Spacer(modifier = Modifier.width(12.dp))
+                coil.compose.AsyncImage(
+                    model = img,
+                    contentDescription = null,
+                    contentScale = androidx.compose.ui.layout.ContentScale.Crop,
+                    modifier = Modifier
+                        .size(84.dp)
+                        .clip(androidx.compose.foundation.shape.RoundedCornerShape(8.dp))
+                        .background(MaterialTheme.colorScheme.surfaceVariant)
+                )
+            }
         }
 
         // byline · reading time / progress

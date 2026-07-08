@@ -27,6 +27,17 @@ async function savePage(tabId) {
     return { ok: false, error: 'not configured' };
   }
 
+  const setBadge = (text, color) => {
+    const a = browser.browserAction || browser.action;
+    if (!a) return;
+    try { a.setBadgeBackgroundColor({ color: color || '#3d6b52', tabId }); } catch (e) {}
+    try { a.setBadgeText({ text, tabId }); } catch (e) {}
+    if (!text) return;
+    setTimeout(() => { try { a.setBadgeText({ text: '', tabId }); } catch (e) {} }, 2500);
+  };
+  // Immediate feedback so a slow/cold server doesn't feel like nothing happened.
+  setBadge('…');
+
   let article;
   try {
     // Readability first (same sandbox); extractor.js uses it when present.
@@ -40,10 +51,12 @@ async function savePage(tabId) {
     });
     article = results && results[0];
   } catch (e) {
+    setBadge('!', '#b3261e');
     notify('Earmark: cannot read this page', String(e.message || e));
     return { ok: false, error: `This page cannot be captured (${e.message || e})` };
   }
   if (!article || !article.html) {
+    setBadge('!', '#b3261e');
     notify('Earmark: nothing to save', 'Could not find article content on this page.');
     return { ok: false, error: 'no article content found' };
   }
@@ -61,9 +74,11 @@ async function savePage(tabId) {
       const body = await res.text();
       throw new Error(`server replied ${res.status}: ${body.slice(0, 200)}`);
     }
+    setBadge('✓');
     notify('Saved to Earmark', article.title);
     return { ok: true, title: article.title };
   } catch (e) {
+    setBadge('!', '#b3261e');
     notify('Earmark: save failed', String(e.message || e));
     return { ok: false, error: String(e.message || e) };
   }

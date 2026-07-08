@@ -25,6 +25,7 @@ data class RemoteArticle(
     val readParagraph: Int,
     val ttsParagraph: Int,
     val wordCount: Int,
+    val imageUrl: String?,
     val html: String?
 )
 
@@ -292,6 +293,7 @@ class ApiClient(private val settings: Settings) {
         readParagraph = o.optInt("readParagraph", 0),
         ttsParagraph = o.optInt("ttsParagraph", 0),
         wordCount = o.optInt("wordCount", 0),
+        imageUrl = o.stringOrNull("imageUrl"),
         html = o.stringOrNull("html")
     )
 

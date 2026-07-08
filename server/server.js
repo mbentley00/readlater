@@ -130,6 +130,14 @@ async function pumpTts() {
   ttsRunning = false;
 }
 
+/** Pull an og:image / twitter:image from page HTML, resolved to an absolute URL. */
+function ogImage(pageHtml, baseUrl) {
+  const m = pageHtml.match(/<meta[^>]+(?:property|name)=["'](?:og:image(?::url)?|twitter:image)["'][^>]+content=["']([^"']+)["']/i)
+    || pageHtml.match(/<meta[^>]+content=["']([^"']+)["'][^>]+(?:property|name)=["'](?:og:image(?::url)?|twitter:image)["']/i);
+  if (!m) return null;
+  try { return new URL(m[1].trim(), baseUrl).href.slice(0, 2000); } catch { return null; }
+}
+
 // Background page fetch + extraction for save-by-URL, so the client isn't kept
 // waiting on a slow page. Updates the placeholder article in place.
 async function fillSavedUrl(articleId, userId, artUrl) {
@@ -154,10 +162,11 @@ async function fillSavedUrl(articleId, userId, artUrl) {
   const titleMatch = pageHtml.match(/<meta[^>]+property=["']og:title["'][^>]+content=["']([^"']+)["']/i)
     || pageHtml.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
   const title = titleMatch ? sanitizeString(titleMatch[1].replace(/\s+/g, ' ').trim(), 500) : (hostOf(artUrl) || artUrl);
+  const imageUrl = ogImage(pageHtml, artUrl);
   const bodyText = pageHtml
     .replace(/<(script|style|head|noscript|svg|template)\b[\s\S]*?<\/\1\s*>/gi, ' ')
     .replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
-  if (!setContent({ title, excerpt: sanitizeString(bodyText, 300), html: `<p>${escapeText(bodyText.slice(0, 200000))}</p>`, textContent: bodyText.slice(0, 200000) })) return;
+  if (!setContent({ title, imageUrl, excerpt: sanitizeString(bodyText, 300), html: `<p>${escapeText(bodyText.slice(0, 200000))}</p>`, textContent: bodyText.slice(0, 200000) })) return;
   enqueueTts(articleId, userId);
 
   if (llm.enabled()) {
@@ -572,6 +581,7 @@ const server = http.createServer(async (req, res) => {
         const html = typeof b.html === 'string' ? b.html : '';
         if (!artUrl || !html) return json(res, 400, { error: 'url and html are required' });
         const now = Date.now();
+        const image = sanitizeString(b.image, 2000);
         const fields = {
           title: sanitizeString(b.title) || artUrl,
           byline: sanitizeString(b.byline),
@@ -579,6 +589,7 @@ const server = http.createServer(async (req, res) => {
           excerpt: sanitizeString(b.excerpt),
           html,
           textContent: typeof b.textContent === 'string' ? b.textContent : null,
+          imageUrl: image && /^https?:\/\//i.test(image) ? image : null,
           updatedAt: now,
         };
         let a = store.articleByUrl(user.id, artUrl);
