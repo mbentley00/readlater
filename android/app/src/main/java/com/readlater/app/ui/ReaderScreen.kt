@@ -325,24 +325,36 @@ fun ReaderScreen(articleId: String, onBack: () -> Unit, onOpenArticle: (String) 
                 return@Scaffold
             }
             TopAppBar(
+                expandedHeight = 84.dp,
                 title = {
+                    val a = article
                     Column {
                         Text(
-                            text = article?.title.orEmpty(),
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis
+                            text = a?.title.orEmpty(),
+                            maxLines = 2,
+                            overflow = TextOverflow.Ellipsis,
+                            style = MaterialTheme.typography.titleMedium,
+                            lineHeight = MaterialTheme.typography.titleMedium.fontSize * 1.15f
                         )
-                        if (blocks.isNotEmpty()) {
+                        if (a != null) {
+                            val publisher = a.siteName?.takeIf { it.isNotBlank() }
+                                ?: runCatching { Uri.parse(a.url).host?.removePrefix("www.") }.getOrNull().orEmpty()
                             val pct = (readProgress * 100).toInt()
-                            val wordsLeft = ((article?.wordCount ?: 0) * (1 - readProgress)).toInt()
-                            val minutesLeft = if (wordsLeft > 0) (wordsLeft / 225.0).let {
-                                kotlin.math.max(1, kotlin.math.round(it).toInt())
-                            } else 0
-                            Text(
-                                text = if (minutesLeft > 0 && pct < 100) "$pct% · $minutesLeft min left" else "$pct%",
-                                style = MaterialTheme.typography.labelSmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant
-                            )
+                            val wordsLeft = (a.wordCount * (1 - readProgress)).toInt()
+                            val minutesLeft = if (wordsLeft > 0)
+                                kotlin.math.max(1, kotlin.math.round(wordsLeft / 225.0).toInt()) else 0
+                            val prog = if (blocks.isNotEmpty())
+                                (if (minutesLeft > 0 && pct < 100) "$pct% · $minutesLeft min left" else "$pct%") else ""
+                            val sub = listOf(publisher, prog).filter { it.isNotBlank() }.joinToString(" · ")
+                            if (sub.isNotBlank()) {
+                                Text(
+                                    text = sub,
+                                    style = MaterialTheme.typography.labelMedium,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                            }
                         }
                     }
                 },
@@ -357,14 +369,6 @@ fun ReaderScreen(articleId: String, onBack: () -> Unit, onOpenArticle: (String) 
                         Icon(Icons.Filled.Search, contentDescription = "Find in article")
                     }
                     if (a != null) {
-                        IconButton(onClick = { repo.toggleFavorite(a) }) {
-                            Icon(
-                                if (a.favorite) Icons.Filled.Star else Icons.Filled.StarBorder,
-                                contentDescription = if (a.favorite) "Unfavorite" else "Favorite",
-                                tint = if (a.favorite) MaterialTheme.colorScheme.tertiary
-                                else LocalContentColor.current
-                            )
-                        }
                         // Archive & play next: archive this one, open the next
                         // inbox article, and auto-start playing it.
                         if (!a.archived) {
