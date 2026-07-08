@@ -25,11 +25,19 @@ class Settings(context: Context) {
             prefs.edit().putString(KEY_TOKEN, value.trim()).apply()
         }
 
-    /** Text-to-speech speech rate (0.5x .. 2.0x). */
+    /** Device (on-device engine) speech rate (0.5x .. 2.0x). */
     var ttsSpeechRate: Float
         get() = prefs.getFloat(KEY_TTS_RATE, 1.0f)
         set(value) {
             prefs.edit().putFloat(KEY_TTS_RATE, value.coerceIn(0.5f, 2.0f)).apply()
+        }
+
+    /** Server (Kokoro) voice speech rate, tracked separately from the device
+     *  voice since the two engines sound best at different speeds. */
+    var serverSpeechRate: Float
+        get() = prefs.getFloat(KEY_SERVER_RATE, 1.0f)
+        set(value) {
+            prefs.edit().putFloat(KEY_SERVER_RATE, value.coerceIn(0.5f, 2.0f)).apply()
         }
 
     /** Article list sort order (name of a SortMode enum value). */
@@ -87,6 +95,7 @@ class Settings(context: Context) {
         const val KEY_SERVER_URL = "server_url"
         const val KEY_TOKEN = "token"
         const val KEY_TTS_RATE = "tts_speech_rate"
+        const val KEY_SERVER_RATE = "server_speech_rate"
         const val KEY_LIST_SORT = "list_sort"
         const val KEY_LAST_ARTICLE = "last_article_id"
         const val KEY_TTS_ENGINE = "tts_engine"

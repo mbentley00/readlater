@@ -226,7 +226,13 @@ fun ReaderScreen(articleId: String, onBack: () -> Unit, onOpenArticle: (String) 
         }
     }
 
-    var speechRate by remember { mutableStateOf(settings.ttsSpeechRate) }
+    // Device and server voices have independent speeds. The bottom-bar control
+    // shows/adjusts whichever is currently in use (server when it's playing or
+    // preferred, device otherwise).
+    var deviceRate by remember { mutableStateOf(settings.ttsSpeechRate) }
+    var serverRate by remember { mutableStateOf(settings.serverSpeechRate) }
+    val serverActive = if (isTtsThisArticle) ttsState.serverVoice else settings.useServerVoice
+    val speechRate = if (serverActive) serverRate else deviceRate
     var sheetTarget by remember { mutableStateOf<SheetTarget?>(null) }
     var menuOpen by remember { mutableStateOf(false) }
 
@@ -245,8 +251,8 @@ fun ReaderScreen(articleId: String, onBack: () -> Unit, onOpenArticle: (String) 
     fun changeRate(delta: Float) {
         val newRate = (speechRate + delta).coerceIn(0.5f, 2.0f)
         if (newRate == speechRate) return
-        speechRate = newRate
-        settings.ttsSpeechRate = newRate
+        if (serverActive) { serverRate = newRate; settings.serverSpeechRate = newRate }
+        else { deviceRate = newRate; settings.ttsSpeechRate = newRate }
         // Restart the current paragraph so the new rate takes effect immediately.
         if (isTtsThisArticle && ttsState.isPlaying) {
             sendTtsCommand(context, TtsService.ACTION_PLAY, articleId, ttsState.paragraphIndex)

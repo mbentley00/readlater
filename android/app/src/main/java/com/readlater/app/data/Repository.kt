@@ -80,7 +80,15 @@ class Repository(
             //    with a safety overlap so clock skew can't drop updates).
             val since = if (full) 0L else (settings.lastSyncAt - 10 * 60 * 1000L).coerceAtLeast(0L)
             val remoteArticles = api.listArticles(since)
-            val localById = articleDao.getAll().associateBy { it.id }
+            // A delta sync only touches the articles it returned, so load just
+            // those local rows (getAll pulls all ~24k every time — including the
+            // cached inbox bodies — which is needlessly slow). Full syncs need
+            // the complete set for deletion detection below.
+            val localById = if (full) {
+                articleDao.getAll().associateBy { it.id }
+            } else {
+                articleDao.getByIds(remoteArticles.map { it.id }).associateBy { it.id }
+            }
             val needsBody = mutableListOf<String>()
             val changed = mutableListOf<ArticleEntity>()
 

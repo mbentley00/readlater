@@ -44,7 +44,9 @@ data class TtsPlaybackState(
     val paragraphIndex: Int = 0,
     val isPlaying: Boolean = false,
     /** Playing but no audio yet — checking the server / synthesizing / downloading. */
-    val preparing: Boolean = false
+    val preparing: Boolean = false,
+    /** True when the current audio is the server (Kokoro) voice, false for the device voice. */
+    val serverVoice: Boolean = false
 )
 
 /**
@@ -1230,7 +1232,7 @@ class TtsService : Service() {
             trackStartMs = fromMs
             audioStarted = true
             cancelAudioWatchdog()
-            applyTrackSpeed(track, app.settings.ttsSpeechRate)
+            applyTrackSpeed(track, app.settings.serverSpeechRate)
             track.play()
             logDbg("playing (server) from=${fromMs}ms speed=$trackSpeed")
             publishState(); updatePlaybackState(); updateNotification()
@@ -1354,7 +1356,7 @@ class TtsService : Service() {
                 trackSampleRate = sampleRate
                 trackChannels = channels
                 val frameBytes = channels * 2
-                val speed = app.settings.ttsSpeechRate
+                val speed = app.settings.serverSpeechRate
                 applyTrackSpeed(track, speed)
                 track.play()
                 mainHandler.post {
@@ -1540,7 +1542,7 @@ class TtsService : Service() {
     // ------------------------------------------------------------------ state
 
     private fun publishState() {
-        stateFlow.value = TtsPlaybackState(articleId, currentIndex, isPlaying, isPlaying && !audioStarted)
+        stateFlow.value = TtsPlaybackState(articleId, currentIndex, isPlaying, isPlaying && !audioStarted, serverMode)
     }
 
     private fun updatePlaybackState() {

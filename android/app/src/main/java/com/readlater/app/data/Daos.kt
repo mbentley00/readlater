@@ -31,6 +31,9 @@ interface ArticleDao {
     @Query("SELECT * FROM articles")
     suspend fun getAll(): List<ArticleEntity>
 
+    @Query("SELECT * FROM articles WHERE id IN (:ids)")
+    suspend fun getByIds(ids: List<String>): List<ArticleEntity>
+
     @Query("SELECT * FROM articles WHERE dirty = 1")
     suspend fun getDirty(): List<ArticleEntity>
 

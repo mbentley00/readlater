@@ -77,6 +77,7 @@ fun SettingsScreen(onBack: () -> Unit) {
     var password by remember { mutableStateOf("") }
     var token by remember { mutableStateOf(settings.token) }
     var rate by remember { mutableStateOf(settings.ttsSpeechRate) }
+    var serverRate by remember { mutableStateOf(settings.serverSpeechRate) }
     var busy by remember { mutableStateOf(false) }
     var testResult by remember { mutableStateOf<String?>(null) }
 
@@ -372,32 +373,16 @@ fun SettingsScreen(onBack: () -> Unit) {
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
 
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Text(
-                    text = "Speech rate",
-                    style = MaterialTheme.typography.bodyLarge,
-                    modifier = Modifier.weight(1f)
-                )
-                IconButton(
-                    enabled = rate > 0.5f,
-                    onClick = {
-                        rate = (((rate - 0.05f) * 100f).toInt() / 100f).coerceAtLeast(0.5f)
-                        settings.ttsSpeechRate = rate
-                    }
-                ) {
-                    Icon(Icons.Filled.Remove, contentDescription = "Slower")
-                }
-                Text(String.format(Locale.US, "%.2f×", rate))
-                IconButton(
-                    enabled = rate < 2.0f,
-                    onClick = {
-                        rate = (((rate + 0.05f) * 100f).toInt() / 100f).coerceAtMost(2.0f)
-                        settings.ttsSpeechRate = rate
-                    }
-                ) {
-                    Icon(Icons.Filled.Add, contentDescription = "Faster")
-                }
-            }
+            SpeedRow(
+                label = "Device voice speed",
+                value = rate,
+                onChange = { rate = it; settings.ttsSpeechRate = it }
+            )
+            SpeedRow(
+                label = "Server voice speed",
+                value = serverRate,
+                onChange = { serverRate = it; settings.serverSpeechRate = it }
+            )
 
             HorizontalDivider()
 
@@ -506,5 +491,22 @@ fun SettingsScreen(onBack: () -> Unit) {
                 }
             }
         }
+    }
+}
+
+/** A "label  −  1.00×  +" speed stepper (0.5x..2.0x in 0.05 steps). */
+@Composable
+private fun SpeedRow(label: String, value: Float, onChange: (Float) -> Unit) {
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        Text(text = label, style = MaterialTheme.typography.bodyLarge, modifier = Modifier.weight(1f))
+        IconButton(
+            enabled = value > 0.5f,
+            onClick = { onChange((((value - 0.05f) * 100f).toInt() / 100f).coerceAtLeast(0.5f)) }
+        ) { Icon(Icons.Filled.Remove, contentDescription = "Slower") }
+        Text(String.format(Locale.US, "%.2f×", value))
+        IconButton(
+            enabled = value < 2.0f,
+            onClick = { onChange((((value + 0.05f) * 100f).toInt() / 100f).coerceAtMost(2.0f)) }
+        ) { Icon(Icons.Filled.Add, contentDescription = "Faster") }
     }
 }

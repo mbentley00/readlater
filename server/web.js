@@ -419,6 +419,23 @@ function readerPage(ctx, user, article) {
 
   const script = `
 const ARTICLE = ${JSON.stringify(article.id)};
+const ORIGINAL_URL = ${JSON.stringify(article.url || '')};
+
+// Keyboard shortcuts: o = open the original, e = archive and go back.
+document.addEventListener('keydown', (e) => {
+  if (e.metaKey || e.ctrlKey || e.altKey) return;
+  const t = e.target;
+  if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.tagName === 'SELECT' || t.isContentEditable)) return;
+  if (e.key === 'o' && ORIGINAL_URL) {
+    window.open(ORIGINAL_URL, '_blank', 'noopener');
+  } else if (e.key === 'e') {
+    e.preventDefault();
+    fetch('/api/articles/' + ARTICLE, {
+      method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ archived: true }),
+    }).then(() => { location.href = '/'; });
+  }
+});
 
 // mark existing highlights in the rendered article (best-effort text match),
 // tagging each mark with its highlight id so the side panel can jump to it.
