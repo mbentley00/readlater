@@ -59,6 +59,9 @@ CREATE TABLE IF NOT EXISTS articles (
 CREATE UNIQUE INDEX IF NOT EXISTS articles_user_url ON articles(userId, url);
 CREATE INDEX IF NOT EXISTS articles_user_saved ON articles(userId, savedAt DESC);
 CREATE INDEX IF NOT EXISTS articles_user_domain ON articles(userId, domain);
+-- delta sync filters on updatedAt; without this it scans every row (each holding
+-- large inline html/textContent), making a "1 new article" sync take ~15s+.
+CREATE INDEX IF NOT EXISTS articles_user_updated ON articles(userId, updatedAt);
 
 CREATE TABLE IF NOT EXISTS highlights (
   id TEXT PRIMARY KEY,
