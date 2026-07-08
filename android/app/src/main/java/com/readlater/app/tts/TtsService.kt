@@ -459,8 +459,8 @@ class TtsService : Service() {
 
     /** Dispatch a media key with debounce so a single physical tap (which some
      *  Bluetooth earbuds deliver more than once) doesn't toggle twice. On the
-     *  Pixel Buds a single tap is play/pause, double tap is NEXT (→ +30s), and
-     *  triple tap is PREVIOUS (→ highlight). */
+     *  Pixel Buds a single tap is play/pause, double tap is NEXT (→ highlight),
+     *  and triple tap is PREVIOUS (→ archive and play the next article). */
     private fun dispatchMediaKey(code: Int) {
         val now = android.os.SystemClock.elapsedRealtime()
         if (now - lastButtonAt < buttonDebounceMs) {
@@ -473,8 +473,8 @@ class TtsService : Service() {
             KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE -> if (isPlaying) handlePause() else handleResume()
             KeyEvent.KEYCODE_MEDIA_PLAY -> if (!isPlaying) handleResume()
             KeyEvent.KEYCODE_MEDIA_PAUSE -> if (isPlaying) handlePause()
-            KeyEvent.KEYCODE_MEDIA_NEXT -> handleForward30()
-            KeyEvent.KEYCODE_MEDIA_PREVIOUS -> handleHighlightCurrent()
+            KeyEvent.KEYCODE_MEDIA_NEXT -> handleHighlightCurrent()
+            KeyEvent.KEYCODE_MEDIA_PREVIOUS -> handleArchiveAndNext()
         }
     }
 
@@ -499,12 +499,34 @@ class TtsService : Service() {
         }
     }
 
-    /** Save the currently spoken paragraph as a highlight (triple headset click). */
+    /** Save the currently spoken paragraph as a highlight (double headset tap). */
     private fun handleHighlightCurrent() {
         val id = articleId ?: return
         val text = blocks.getOrNull(currentIndex)?.let { speakableText(it) } ?: return
         app.repository.addHighlight(id, text, null, currentIndex)
         Toast.makeText(this, "Paragraph highlighted", Toast.LENGTH_SHORT).show()
+    }
+
+    /** Archive the current article and advance to the next inbox article, playing
+     *  it (triple headset tap). */
+    private fun handleArchiveAndNext() {
+        val id = articleId ?: return
+        scope.launch {
+            val current = withContext(Dispatchers.IO) { app.database.articleDao().getById(id) } ?: return@launch
+            val next = app.repository.nextInboxArticle(current)
+            if (!current.archived) app.repository.toggleArchive(current)
+            Toast.makeText(this@TtsService, "Archived", Toast.LENGTH_SHORT).show()
+            if (next != null) {
+                handlePlay(
+                    Intent(this@TtsService, TtsService::class.java)
+                        .setAction(ACTION_PLAY)
+                        .putExtra(EXTRA_ARTICLE_ID, next.id)
+                        .putExtra(EXTRA_START_PARAGRAPH, 0)
+                )
+            } else {
+                handleStop()
+            }
+        }
     }
 
     /** Move the listening position without changing play/pause state —
