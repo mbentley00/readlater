@@ -622,6 +622,32 @@ async function handle(ctx, req, res, url) {
   const user = ctx.getSessionUser(req);
   const nonce = crypto.randomBytes(16).toString('base64url');
 
+  // ---- Firefox extension self-distribution (PUBLIC — Firefox's auto-updater
+  // sends no session cookie). The signed .xpi and the update manifest it polls.
+  if (route === 'GET /extension.xpi') {
+    if (!ctx.EXT_XPI_FILE || !fs.existsSync(ctx.EXT_XPI_FILE)) { res.writeHead(404); return res.end('no extension uploaded'); }
+    const stat = fs.statSync(ctx.EXT_XPI_FILE);
+    res.writeHead(200, {
+      'Content-Type': 'application/x-xpinstall',
+      'Content-Length': stat.size,
+      'Content-Disposition': 'attachment; filename="earmark.xpi"',
+    });
+    return fs.createReadStream(ctx.EXT_XPI_FILE).pipe(res);
+  }
+  if (route === 'GET /extension/updates.json') {
+    let meta = {};
+    try { meta = JSON.parse(fs.readFileSync(ctx.EXT_META_FILE, 'utf8')); } catch (e) {}
+    const base = `https://${req.headers.host}`;
+    const updates = meta && meta.version ? [{
+      version: meta.version,
+      update_link: `${base}/extension.xpi`,
+      ...(meta.sha256 ? { update_hash: `sha256:${meta.sha256}` } : {}),
+    }] : [];
+    const body = JSON.stringify({ addons: { 'readlater@selfhosted.local': { updates } } });
+    res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Content-Length': Buffer.byteLength(body) });
+    return res.end(body);
+  }
+
   // ---- account routes
   if (route === 'GET /login' || route === 'GET /signup') {
     if (user) return redirect(res, '/');

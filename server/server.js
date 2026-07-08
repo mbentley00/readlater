@@ -36,6 +36,8 @@ const DATA_DIR = process.env.READLATER_DATA_DIR || path.join(__dirname, 'data');
 const TOKEN_FILE = path.join(DATA_DIR, 'token.txt');
 const APK_FILE = path.join(DATA_DIR, 'app.apk');
 const APK_META_FILE = path.join(DATA_DIR, 'app-apk.json');
+const EXT_XPI_FILE = path.join(DATA_DIR, 'earmark.xpi'); // signed Firefox extension
+const EXT_META_FILE = path.join(DATA_DIR, 'earmark-xpi.json');
 const MAX_BODY = 10 * 1024 * 1024; // 10 MB per request
 const ALLOW_SIGNUP = process.env.READLATER_ALLOW_SIGNUP !== '0';
 const SESSION_TTL = 30 * 24 * 60 * 60 * 1000; // 30 days
@@ -383,7 +385,7 @@ const ctx = {
   createUser, verifyPassword, findUserByName, newEmailAlias,
   createSession, sessionCookie, getSessionUser, destroySession,
   searchArticles, countArticles, hostOf,
-  ALLOW_SIGNUP, INBOUND_DOMAIN, APK_FILE,
+  ALLOW_SIGNUP, INBOUND_DOMAIN, APK_FILE, EXT_XPI_FILE, EXT_META_FILE,
 };
 
 const server = http.createServer(async (req, res) => {
@@ -558,6 +560,35 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'GET' && parts[1] === 'app-version' && parts.length === 2) {
       if (!fs.existsSync(APK_META_FILE)) return json(res, 404, { error: 'no app uploaded' });
       return json(res, 200, JSON.parse(fs.readFileSync(APK_META_FILE, 'utf8')));
+    }
+
+    // ---- Firefox extension hosting: POST uploads a Mozilla-signed .xpi; the
+    // server then serves it at GET /extension.xpi and advertises it in the
+    // update manifest at GET /extension/updates.json so Firefox auto-updates.
+    if (req.method === 'POST' && parts[1] === 'extension.xpi' && parts.length === 2) {
+      const tmp = EXT_XPI_FILE + '.tmp';
+      const out = fs.createWriteStream(tmp);
+      let size = 0;
+      const hash = crypto.createHash('sha256');
+      await new Promise((resolve, reject) => {
+        req.on('data', (c) => {
+          size += c.length; hash.update(c);
+          if (size > 50 * 1024 * 1024) { reject(new Error('xpi too large')); req.destroy(); }
+        });
+        req.on('error', reject);
+        out.on('error', reject);
+        out.on('finish', resolve);
+        req.pipe(out);
+      });
+      fs.renameSync(tmp, EXT_XPI_FILE);
+      const meta = {
+        version: sanitizeString(url.searchParams.get('version'), 32) || null,
+        sha256: hash.digest('hex'),
+        size,
+        uploadedAt: Date.now(),
+      };
+      fs.writeFileSync(EXT_META_FILE, JSON.stringify(meta));
+      return json(res, 201, { ok: true, size, version: meta.version });
     }
 
     // ---- current account
