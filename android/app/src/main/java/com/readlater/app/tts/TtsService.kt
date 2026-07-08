@@ -924,7 +924,7 @@ class TtsService : Service() {
     private fun synthesize(idx: Int) {
         if (idx < 0 || synthesizing.contains(idx) || readyFiles.contains(idx)) return
         val engine = tts ?: return
-        val text = speakableText(blocks.getOrNull(idx) ?: return) ?: return
+        val text = synthTextFor(idx) ?: return
         synthesizing.add(idx)
         engine.setSpeechRate(app.settings.ttsSpeechRate)
         logDbg("synth queue idx=$idx (${text.length} chars) engine=${initializedEngine ?: "system"}")
@@ -1464,7 +1464,7 @@ class TtsService : Service() {
 
     private fun speakFallback(idx: Int) {
         val engine = tts ?: return
-        val text = speakableText(blocks.getOrNull(idx) ?: return) ?: run { advanceAndSpeak(); return }
+        val text = synthTextFor(idx) ?: run { advanceAndSpeak(); return }
         currentIndex = idx
         audioStarted = false
         playToken++
@@ -1519,6 +1519,24 @@ class TtsService : Service() {
         is Block.Heading -> block.text
         is Block.Quote -> block.text
         is Block.ImageBlock -> null
+    }
+
+    /** Spoken preamble: title, author, publisher — announced before the article. */
+    private fun articleIntro(): String {
+        val parts = mutableListOf<String>()
+        articleTitle.trim().takeIf { it.isNotBlank() }?.let { parts.add(it.trimEnd('.', ' ') + ".") }
+        articleByline.trim().takeIf { it.isNotBlank() }?.let {
+            parts.add(if (it.startsWith("by ", ignoreCase = true)) "$it." else "By $it.")
+        }
+        articleSite.trim().takeIf { it.isNotBlank() }?.let { parts.add("From $it.") }
+        return parts.joinToString(" ")
+    }
+
+    /** Text to synthesize for [idx]; the first spoken block gets the intro prepended. */
+    private fun synthTextFor(idx: Int): String? {
+        val base = speakableText(blocks.getOrNull(idx) ?: return null) ?: return null
+        val intro = articleIntro()
+        return if (idx == speakableBlocks.firstOrNull() && intro.isNotBlank()) "$intro\n\n$base" else base
     }
 
     private fun nextSpeakable(from: Int): Int? {

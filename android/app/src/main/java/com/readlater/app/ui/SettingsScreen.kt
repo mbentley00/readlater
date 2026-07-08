@@ -27,6 +27,7 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.Slider
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
@@ -57,6 +58,7 @@ import com.readlater.app.ReadLaterApp
 import com.readlater.app.tts.TtsService
 import kotlinx.coroutines.launch
 import java.util.Locale
+import kotlin.math.roundToInt
 
 /** Pre-filled default so a fresh install only needs username + password. */
 private const val DEFAULT_SERVER_URL = "https://readlater-mbent.fly.dev"
@@ -494,19 +496,19 @@ fun SettingsScreen(onBack: () -> Unit) {
     }
 }
 
-/** A "label  −  1.00×  +" speed stepper (0.5x..2.0x in 0.05 steps). */
+/** A labelled speed slider (0.5x..2.0x in 0.05 steps). */
 @Composable
 private fun SpeedRow(label: String, value: Float, onChange: (Float) -> Unit) {
-    Row(verticalAlignment = Alignment.CenterVertically) {
-        Text(text = label, style = MaterialTheme.typography.bodyLarge, modifier = Modifier.weight(1f))
-        IconButton(
-            enabled = value > 0.5f,
-            onClick = { onChange((((value - 0.05f) * 100f).toInt() / 100f).coerceAtLeast(0.5f)) }
-        ) { Icon(Icons.Filled.Remove, contentDescription = "Slower") }
-        Text(String.format(Locale.US, "%.2f×", value))
-        IconButton(
-            enabled = value < 2.0f,
-            onClick = { onChange((((value + 0.05f) * 100f).toInt() / 100f).coerceAtMost(2.0f)) }
-        ) { Icon(Icons.Filled.Add, contentDescription = "Faster") }
+    Column {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text(text = label, style = MaterialTheme.typography.bodyLarge, modifier = Modifier.weight(1f))
+            Text(String.format(Locale.US, "%.2f×", value), style = MaterialTheme.typography.labelLarge)
+        }
+        Slider(
+            value = value,
+            onValueChange = { onChange((it * 20f).roundToInt() / 20f) },
+            valueRange = 0.5f..2.0f,
+            steps = 29
+        )
     }
 }

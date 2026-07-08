@@ -7,7 +7,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev
-COPY server.js web.js db.js llm.js pdf.js tts.js ./
+COPY server.js web.js db.js llm.js pdf.js tts.js extract.js ./
 ENV READLATER_DATA_DIR=/data \
     PORT=8090
 EXPOSE 8090

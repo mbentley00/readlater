@@ -40,6 +40,7 @@ import androidx.compose.material.icons.filled.PushPin
 import androidx.compose.material.icons.filled.Remove
 import androidx.compose.material.icons.filled.SkipNext
 import androidx.compose.material.icons.filled.SkipPrevious
+import androidx.compose.material.icons.filled.Speed
 import androidx.compose.material.icons.filled.Stop
 import androidx.compose.material.icons.filled.Star
 import androidx.compose.material.icons.filled.Search
@@ -62,6 +63,7 @@ import androidx.compose.material3.LocalContentColor
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.Slider
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
@@ -105,6 +107,7 @@ import kotlinx.coroutines.flow.debounce
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.launch
 import java.util.Locale
+import kotlin.math.roundToInt
 
 /** What the reader's bottom sheet is currently showing. */
 private sealed class SheetTarget {
@@ -248,8 +251,8 @@ fun ReaderScreen(articleId: String, onBack: () -> Unit, onOpenArticle: (String) 
         }
     }
 
-    fun changeRate(delta: Float) {
-        val newRate = (speechRate + delta).coerceIn(0.5f, 2.0f)
+    fun setRate(rate: Float) {
+        val newRate = rate.coerceIn(0.5f, 2.0f)
         if (newRate == speechRate) return
         if (serverActive) { serverRate = newRate; settings.serverSpeechRate = newRate }
         else { deviceRate = newRate; settings.ttsSpeechRate = newRate }
@@ -385,10 +388,14 @@ fun ReaderScreen(articleId: String, onBack: () -> Unit, onOpenArticle: (String) 
                             }
                         }
                         // Plain archive: archive/unarchive and return to the list.
+                        // If this article is the one playing, stop playback too.
                         IconButton(onClick = {
                             val wasArchived = a.archived
                             repo.toggleArchive(a)
-                            if (!wasArchived) onBack()
+                            if (!wasArchived) {
+                                if (isTtsThisArticle) sendTtsCommand(context, TtsService.ACTION_STOP)
+                                onBack()
+                            }
                         }) {
                             Icon(
                                 if (a.archived) Icons.Filled.Unarchive else Icons.Filled.Archive,
@@ -518,15 +525,31 @@ fun ReaderScreen(articleId: String, onBack: () -> Unit, onOpenArticle: (String) 
                     Icon(Icons.Filled.PushPin, contentDescription = "Set reading position to here")
                 }
                 Spacer(modifier = Modifier.weight(1f))
-                IconButton(onClick = { changeRate(-0.05f) }, enabled = speechRate > 0.5f) {
-                    Icon(Icons.Filled.Remove, contentDescription = "Slower")
-                }
-                Text(
-                    text = String.format(Locale.US, "%.2f×", speechRate),
-                    style = MaterialTheme.typography.labelLarge
-                )
-                IconButton(onClick = { changeRate(0.05f) }, enabled = speechRate < 2.0f) {
-                    Icon(Icons.Filled.Add, contentDescription = "Faster")
+                // Speed: a button showing the current rate opens a slider popup.
+                var speedMenu by remember { mutableStateOf(false) }
+                var pendingRate by remember { mutableStateOf(speechRate) }
+                Box {
+                    TextButton(onClick = { pendingRate = speechRate; speedMenu = true }) {
+                        Icon(Icons.Filled.Speed, contentDescription = null, modifier = Modifier.size(18.dp))
+                        Spacer(modifier = Modifier.width(4.dp))
+                        Text(String.format(Locale.US, "%.2f×", speechRate), style = MaterialTheme.typography.labelLarge)
+                    }
+                    DropdownMenu(expanded = speedMenu, onDismissRequest = { speedMenu = false }) {
+                        Column(modifier = Modifier.width(260.dp).padding(horizontal = 16.dp, vertical = 8.dp)) {
+                            Text(
+                                text = (if (serverActive) "Server voice" else "Device voice") +
+                                    " · " + String.format(Locale.US, "%.2f×", pendingRate),
+                                style = MaterialTheme.typography.labelLarge
+                            )
+                            Slider(
+                                value = pendingRate,
+                                onValueChange = { pendingRate = (it * 20f).roundToInt() / 20f },
+                                onValueChangeFinished = { setRate(pendingRate) },
+                                valueRange = 0.5f..2.0f,
+                                steps = 29
+                            )
+                        }
+                    }
                 }
             }
         }

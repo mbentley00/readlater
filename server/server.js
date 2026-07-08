@@ -28,6 +28,7 @@ const crypto = require('crypto');
 const web = require('./web');
 const { open, hostOf } = require('./db');
 const llm = require('./llm');
+const { extractReadable } = require('./extract');
 const pdf = require('./pdf');
 const tts = require('./tts');
 
@@ -173,19 +174,41 @@ async function fillSavedUrl(articleId, userId, artUrl) {
 
   const titleMatch = pageHtml.match(/<meta[^>]+property=["']og:title["'][^>]+content=["']([^"']+)["']/i)
     || pageHtml.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
-  const title = titleMatch ? sanitizeString(titleMatch[1].replace(/\s+/g, ' ').trim(), 500) : (hostOf(artUrl) || artUrl);
+  const metaTitle = titleMatch ? sanitizeString(titleMatch[1].replace(/\s+/g, ' ').trim(), 500) : (hostOf(artUrl) || artUrl);
   const imageUrl = ogImage(pageHtml, artUrl);
   const publishedAt = pagePublishedAt(pageHtml);
-  const bodyText = pageHtml
-    .replace(/<(script|style|head|noscript|svg|template)\b[\s\S]*?<\/\1\s*>/gi, ' ')
-    .replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
-  if (!setContent({ title, imageUrl, publishedAt, excerpt: sanitizeString(bodyText, 300), html: `<p>${escapeText(bodyText.slice(0, 200000))}</p>`, textContent: bodyText.slice(0, 200000) })) return;
+
+  // Readability first (strips nav/ads/newsletter cruft); fall back to a crude
+  // full-text dump only when it can't find a real article.
+  const readable = extractReadable(pageHtml, artUrl);
+  let title, fields;
+  if (readable && readable.textContent.length >= 250) {
+    title = readable.title || metaTitle;
+    fields = {
+      title, byline: readable.byline, siteName: readable.siteName || hostOf(artUrl),
+      imageUrl, publishedAt, excerpt: readable.excerpt,
+      html: readable.html, textContent: readable.textContent,
+    };
+  } else {
+    title = metaTitle;
+    const bodyText = pageHtml
+      .replace(/<(script|style|head|noscript|svg|template)\b[\s\S]*?<\/\1\s*>/gi, ' ')
+      .replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
+    fields = {
+      title, imageUrl, publishedAt, excerpt: sanitizeString(bodyText, 300),
+      html: `<p>${escapeText(bodyText.slice(0, 200000))}</p>`, textContent: bodyText.slice(0, 200000),
+    };
+  }
+  if (!setContent(fields)) return;
   enqueueTts(articleId, userId);
 
-  if (llm.enabled()) {
+  // LLM rescue only when extraction was weak (Readability failed or thin) — no
+  // point paying for it when Readability already produced a clean article.
+  const weak = !readable || readable.textContent.length < 600;
+  if (weak && llm.enabled()) {
     llm.extractArticle({ url: artUrl, title, pageHtml })
       .then((better) => {
-        if (!better || !better.textContent) return;
+        if (!better || !better.textContent || better.textContent.length < 400) return;
         const cur = store.getArticle(articleId, userId);
         if (!cur || better.textContent.length <= (cur.textContent || '').length) return;
         store.updateArticleContent(articleId, {
@@ -194,7 +217,7 @@ async function fillSavedUrl(articleId, userId, artUrl) {
           html: better.html, textContent: better.textContent, updatedAt: Date.now(),
         });
         enqueueTts(articleId, userId, true);
-        console.log(`save-url upgraded ${articleId} (${(cur.textContent || '').length} → ${better.textContent.length})`);
+        console.log(`save-url LLM-upgraded ${articleId} (${(cur.textContent || '').length} → ${better.textContent.length})`);
       })
       .catch((e) => console.error(`save-url LLM upgrade failed for ${articleId}: ${e.message}`));
   }

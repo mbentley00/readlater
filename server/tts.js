@@ -139,9 +139,25 @@ async function synthChunk(text) {
  * paragraphOffsetsMs } where paragraphOffsetsMs[i] is the start time of
  * paragraph i (paragraphOffsetsMs.length === number of spoken paragraphs).
  */
+/** Spoken preamble: title, author, publisher — announced before the article. */
+function articleIntro(article) {
+  const parts = [];
+  const title = String(article.title || '').trim();
+  const byline = String(article.byline || '').trim();
+  const site = String(article.siteName || '').trim();
+  if (title) parts.push(title.replace(/[.\s]+$/, '') + '.');
+  if (byline) parts.push(/^by\s/i.test(byline) ? `${byline}.` : `By ${byline}.`);
+  if (site) parts.push(`From ${site}.`);
+  return parts.join(' ');
+}
+
 async function synthesizeArticle(article) {
   const paragraphs = paragraphsOf(article);
   if (!paragraphs.length) throw new Error('no speakable text');
+  // Announce the article: prepend the intro to the first paragraph (keeps the
+  // paragraph count 1:1 with the reader so highlight/position mapping holds).
+  const intro = articleIntro(article);
+  if (intro) paragraphs[0] = `${intro} ${paragraphs[0]}`;
   const c = cfg();
   const pcmParts = [];
   const paragraphOffsetsMs = [];
