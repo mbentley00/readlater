@@ -21,3 +21,6 @@ server/node_modules/
 # Android release signing
 android/keystore.properties
 android/*.keystore
+
+# Kotlin compiler scratch
+android/.kotlin/
