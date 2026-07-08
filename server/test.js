@@ -456,14 +456,20 @@ async function main() {
     assert.strictEqual(r.status, 201, 'session cookie can create highlights');
     await api('DELETE', `/api/highlights/${r.body.id}`);
 
-    // ---- save by URL (Android share) -------------------------------------
+    // ---- save by URL (Android share): responds fast, fills in the background --
     r = await api('POST', '/api/save-url', { url: `Check this out http://127.0.0.1:${MOCK_PAGE_PORT}/post` });
-    assert.strictEqual(r.status, 201, 'save-url creates an article');
-    assert.strictEqual(r.body.title, 'Shared Page Title', 'title pulled from the page');
+    assert.strictEqual(r.status, 201, 'save-url creates a placeholder article immediately');
     assert.strictEqual(r.body.url, `http://127.0.0.1:${MOCK_PAGE_PORT}/post`, 'URL extracted from shared text');
     const savedUrlId = r.body.id;
-    r = await api('GET', `/api/articles/${savedUrlId}`);
-    assert.ok((r.body.textContent || '').includes('shared article body'), 'page text captured');
+    // background fetch fills the real title + text shortly after
+    let filled = null;
+    for (let i = 0; i < 50; i++) {
+      r = await api('GET', `/api/articles/${savedUrlId}`);
+      if (r.body.title === 'Shared Page Title') { filled = r.body; break; }
+      await new Promise((res2) => setTimeout(res2, 100));
+    }
+    assert.ok(filled, 'title pulled from the page in the background');
+    assert.ok((filled.textContent || '').includes('shared article body'), 'page text captured');
     // idempotent: sharing the same URL again returns the existing article
     r = await api('POST', '/api/save-url', { url: `http://127.0.0.1:${MOCK_PAGE_PORT}/post` });
     assert.strictEqual(r.status, 200);

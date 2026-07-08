@@ -9,6 +9,7 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
@@ -16,6 +17,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.Sort
 import androidx.compose.material.icons.filled.Archive
@@ -36,6 +38,7 @@ import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.Icon
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
@@ -56,6 +59,10 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.graphics.Color
+import androidx.compose.foundation.background
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.sp
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import android.content.Context
@@ -450,11 +457,9 @@ fun ArticleListScreen(
                     }
                 }
             } else {
-                LazyColumn(
-                    contentPadding = PaddingValues(16.dp),
-                    verticalArrangement = Arrangement.spacedBy(12.dp)
-                ) {
-                    items(articles, key = { it.id }) { article ->
+                LazyColumn(contentPadding = PaddingValues(bottom = 24.dp)) {
+                    itemsIndexed(articles, key = { _, a -> a.id }) { i, article ->
+                        if (i > 0) HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f))
                         ArticleCard(
                             article = article,
                             onOpen = { onOpenArticle(article.id) },
@@ -469,6 +474,40 @@ fun ArticleListScreen(
     }
 }
 
+/** Uppercase source label like Readwise (domain / EMAIL / PDF). */
+private fun sourceLabel(article: ArticleEntity): String = when {
+    article.url.startsWith("email:") -> "EMAIL"
+    article.url.startsWith("pdf:") -> "PDF"
+    else -> runCatching { Uri.parse(article.url).host }.getOrNull()
+        ?.removePrefix("www.")?.uppercase()
+        ?: article.siteName?.uppercase() ?: ""
+}
+
+private val cardDateFmt = java.text.SimpleDateFormat("MMM d", java.util.Locale.US)
+private val cardDateYearFmt = java.text.SimpleDateFormat("MMM d, yyyy", java.util.Locale.US)
+private fun cardDate(ms: Long): String {
+    if (ms <= 0) return ""
+    val cal = java.util.Calendar.getInstance()
+    val thisYear = cal.get(java.util.Calendar.YEAR)
+    cal.timeInMillis = ms
+    return (if (cal.get(java.util.Calendar.YEAR) == thisYear) cardDateFmt else cardDateYearFmt).format(java.util.Date(ms))
+}
+
+/** Byline · reading time / progress, Readwise-style footer. */
+private fun cardFooter(article: ArticleEntity): String {
+    val parts = mutableListOf<String>()
+    article.byline?.takeIf { it.isNotBlank() }?.let { parts.add(it) }
+    if (article.readParagraph > 0 && article.paragraphCount > 0) {
+        val frac = ((article.readParagraph + 1).toFloat() / article.paragraphCount).coerceIn(0.01f, 1f)
+        val left = readingMinutes((article.wordCount * (1 - frac)).toInt())
+        parts.add("${(frac * 100).roundToInt()}%" + if (left > 0 && frac < 1f) " · $left min left" else "")
+    } else {
+        val minutes = readingMinutes(article.wordCount)
+        if (minutes > 0) parts.add("$minutes min")
+    }
+    return parts.joinToString(" · ")
+}
+
 @Composable
 private fun ArticleCard(
     article: ArticleEntity,
@@ -478,119 +517,105 @@ private fun ArticleCard(
     onDelete: () -> Unit
 ) {
     var menuOpen by remember { mutableStateOf(false) }
+    val unread = article.readParagraph == 0 && article.ttsParagraph == 0
 
-    Card(modifier = Modifier.fillMaxWidth().clickable(onClick = onOpen)) {
-        Column(modifier = Modifier.padding(start = 16.dp, top = 12.dp, bottom = 12.dp, end = 4.dp)) {
-            Row(verticalAlignment = Alignment.Top) {
-                Column(modifier = Modifier.weight(1f)) {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        if (article.favorite) {
-                            Icon(
-                                Icons.Filled.Star,
-                                contentDescription = "Favorite",
-                                tint = MaterialTheme.colorScheme.tertiary,
-                                modifier = Modifier.size(16.dp)
-                            )
-                            Spacer(modifier = Modifier.width(4.dp))
-                        }
-                        Text(
-                            text = article.title.ifBlank { article.url },
-                            style = MaterialTheme.typography.titleMedium,
-                            maxLines = 2,
-                            overflow = TextOverflow.Ellipsis
-                        )
-                    }
-                    val site = article.siteName
-                        ?: runCatching { Uri.parse(article.url).host }.getOrNull().orEmpty()
-                    val time = DateUtils.getRelativeTimeSpanString(article.savedAt).toString()
-                    val minutes = readingMinutes(article.wordCount)
-                    Text(
-                        text = listOf(site, time, if (minutes > 0) "$minutes min read" else "")
-                            .filter { it.isNotBlank() }
-                            .joinToString(" • "),
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable(onClick = onOpen)
+            .padding(horizontal = 16.dp, vertical = 14.dp)
+    ) {
+        // source (uppercase domain) + overflow menu
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text(
+                text = sourceLabel(article),
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                letterSpacing = 0.6.sp,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.weight(1f)
+            )
+            Box {
+                IconButton(onClick = { menuOpen = true }, modifier = Modifier.size(28.dp)) {
+                    Icon(
+                        Icons.Filled.MoreVert, contentDescription = "More actions",
+                        modifier = Modifier.size(20.dp),
+                        tint = MaterialTheme.colorScheme.onSurfaceVariant
                     )
                 }
-                Box {
-                    IconButton(onClick = { menuOpen = true }) {
-                        Icon(Icons.Filled.MoreVert, contentDescription = "More actions")
-                    }
-                    DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
-                        DropdownMenuItem(
-                            text = { Text(if (article.archived) "Unarchive" else "Archive") },
-                            leadingIcon = {
-                                Icon(
-                                    if (article.archived) Icons.Filled.Unarchive else Icons.Filled.Archive,
-                                    contentDescription = null
-                                )
-                            },
-                            onClick = {
-                                menuOpen = false
-                                onToggleArchive()
-                            }
-                        )
-                        DropdownMenuItem(
-                            text = { Text(if (article.favorite) "Unfavorite" else "Favorite") },
-                            leadingIcon = {
-                                Icon(
-                                    if (article.favorite) Icons.Filled.Star else Icons.Filled.StarBorder,
-                                    contentDescription = null
-                                )
-                            },
-                            onClick = {
-                                menuOpen = false
-                                onToggleFavorite()
-                            }
-                        )
-                        DropdownMenuItem(
-                            text = { Text("Delete") },
-                            leadingIcon = { Icon(Icons.Filled.Delete, contentDescription = null) },
-                            onClick = {
-                                menuOpen = false
-                                onDelete()
-                            }
-                        )
-                    }
-                }
-            }
-
-            article.excerpt?.takeIf { it.isNotBlank() }?.let { excerpt ->
-                Text(
-                    text = excerpt,
-                    style = MaterialTheme.typography.bodyMedium,
-                    maxLines = 2,
-                    overflow = TextOverflow.Ellipsis,
-                    modifier = Modifier.padding(top = 6.dp, end = 12.dp)
-                )
-            }
-
-            if (article.readParagraph > 0) {
-                val fraction = if (article.paragraphCount > 0) {
-                    ((article.readParagraph + 1).toFloat() / article.paragraphCount).coerceIn(0.01f, 1f)
-                } else null
-                val label = if (fraction != null) {
-                    val minutesLeft = readingMinutes((article.wordCount * (1 - fraction)).toInt())
-                    "${(fraction * 100).roundToInt()}% read" +
-                        if (minutesLeft > 0 && fraction < 1f) " — $minutesLeft min left" else ""
-                } else {
-                    "In progress — paragraph ${article.readParagraph + 1}"
-                }
-                Text(
-                    text = label,
-                    style = MaterialTheme.typography.labelSmall,
-                    color = MaterialTheme.colorScheme.primary,
-                    modifier = Modifier.padding(top = 6.dp)
-                )
-                if (fraction != null) {
-                    LinearProgressIndicator(
-                        progress = { fraction },
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(top = 4.dp, end = 12.dp)
+                DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
+                    DropdownMenuItem(
+                        text = { Text(if (article.archived) "Unarchive" else "Archive") },
+                        leadingIcon = { Icon(if (article.archived) Icons.Filled.Unarchive else Icons.Filled.Archive, null) },
+                        onClick = { menuOpen = false; onToggleArchive() }
+                    )
+                    DropdownMenuItem(
+                        text = { Text(if (article.favorite) "Unfavorite" else "Favorite") },
+                        leadingIcon = { Icon(if (article.favorite) Icons.Filled.Star else Icons.Filled.StarBorder, null) },
+                        onClick = { menuOpen = false; onToggleFavorite() }
+                    )
+                    DropdownMenuItem(
+                        text = { Text("Delete") },
+                        leadingIcon = { Icon(Icons.Filled.Delete, null) },
+                        onClick = { menuOpen = false; onDelete() }
                     )
                 }
             }
+        }
+
+        Spacer(modifier = Modifier.height(3.dp))
+
+        // title (bold), with an unread dot and a favorite star
+        Row(verticalAlignment = Alignment.Top) {
+            if (unread) {
+                Box(
+                    modifier = Modifier
+                        .padding(top = 8.dp, end = 8.dp)
+                        .size(8.dp)
+                        .background(MaterialTheme.colorScheme.primary, CircleShape)
+                )
+            }
+            Text(
+                text = article.title.ifBlank { article.url },
+                style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.SemiBold),
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.weight(1f)
+            )
+            if (article.favorite) {
+                Icon(
+                    Icons.Filled.Star, contentDescription = "Favorite",
+                    tint = MaterialTheme.colorScheme.tertiary,
+                    modifier = Modifier.padding(start = 6.dp, top = 3.dp).size(16.dp)
+                )
+            }
+        }
+
+        // date · excerpt
+        val date = cardDate(article.savedAt)
+        val excerpt = article.excerpt?.takeIf { it.isNotBlank() }
+        if (date.isNotBlank() || excerpt != null) {
+            Spacer(modifier = Modifier.height(4.dp))
+            Text(
+                text = listOfNotNull(date.ifBlank { null }, excerpt).joinToString(" · "),
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                maxLines = 3,
+                overflow = TextOverflow.Ellipsis
+            )
+        }
+
+        // byline · reading time / progress
+        val footer = cardFooter(article)
+        if (footer.isNotBlank()) {
+            Spacer(modifier = Modifier.height(6.dp))
+            Text(
+                text = footer,
+                style = MaterialTheme.typography.labelMedium,
+                color = if (article.readParagraph > 0) MaterialTheme.colorScheme.primary
+                else MaterialTheme.colorScheme.onSurfaceVariant
+            )
         }
     }
 }
