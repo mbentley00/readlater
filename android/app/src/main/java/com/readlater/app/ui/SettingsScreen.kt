@@ -6,6 +6,7 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.rememberScrollState
@@ -295,12 +296,15 @@ fun SettingsScreen(onBack: () -> Unit) {
 
             var engineMenuOpen by remember { mutableStateOf(false) }
             Row(verticalAlignment = Alignment.CenterVertically) {
-                Text("Engine", style = MaterialTheme.typography.bodyLarge, modifier = Modifier.weight(1f))
-                Box {
-                    OutlinedButton(onClick = { engineMenuOpen = true }) {
+                Text("Engine", style = MaterialTheme.typography.bodyLarge, modifier = Modifier.width(64.dp))
+                Box(modifier = Modifier.weight(1f)) {
+                    OutlinedButton(onClick = { engineMenuOpen = true }, modifier = Modifier.fillMaxWidth()) {
                         Text(
-                            engines.firstOrNull { it.name == resolvedEngine }?.label
-                                ?: if (enginePref.isBlank()) "Auto" else enginePref
+                            text = engines.firstOrNull { it.name == resolvedEngine }?.label
+                                ?: if (enginePref.isBlank()) "Auto" else enginePref,
+                            maxLines = 1,
+                            overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
+                            modifier = Modifier.fillMaxWidth()
                         )
                     }
                     DropdownMenu(expanded = engineMenuOpen, onDismissRequest = { engineMenuOpen = false }) {
@@ -322,10 +326,15 @@ fun SettingsScreen(onBack: () -> Unit) {
 
             var voiceMenuOpen by remember { mutableStateOf(false) }
             Row(verticalAlignment = Alignment.CenterVertically) {
-                Text("Voice", style = MaterialTheme.typography.bodyLarge, modifier = Modifier.weight(1f))
-                Box {
-                    OutlinedButton(onClick = { voiceMenuOpen = true }) {
-                        Text(if (voicePref.isBlank()) "Auto (best quality)" else voicePref, maxLines = 1)
+                Text("Voice", style = MaterialTheme.typography.bodyLarge, modifier = Modifier.width(64.dp))
+                Box(modifier = Modifier.weight(1f)) {
+                    OutlinedButton(onClick = { voiceMenuOpen = true }, modifier = Modifier.fillMaxWidth()) {
+                        Text(
+                            text = if (voicePref.isBlank()) "Auto (best quality)" else voicePref,
+                            maxLines = 1,
+                            overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
+                            modifier = Modifier.fillMaxWidth()
+                        )
                     }
                     DropdownMenu(expanded = voiceMenuOpen, onDismissRequest = { voiceMenuOpen = false }) {
                         DropdownMenuItem(text = { Text("Auto (best quality)") }, onClick = {
@@ -372,7 +381,7 @@ fun SettingsScreen(onBack: () -> Unit) {
                 IconButton(
                     enabled = rate > 0.5f,
                     onClick = {
-                        rate = (rate - 0.25f).coerceAtLeast(0.5f)
+                        rate = (((rate - 0.05f) * 100f).toInt() / 100f).coerceAtLeast(0.5f)
                         settings.ttsSpeechRate = rate
                     }
                 ) {
@@ -382,7 +391,7 @@ fun SettingsScreen(onBack: () -> Unit) {
                 IconButton(
                     enabled = rate < 2.0f,
                     onClick = {
-                        rate = (rate + 0.25f).coerceAtMost(2.0f)
+                        rate = (((rate + 0.05f) * 100f).toInt() / 100f).coerceAtMost(2.0f)
                         settings.ttsSpeechRate = rate
                     }
                 ) {

@@ -130,6 +130,16 @@ async function pumpTts() {
   ttsRunning = false;
 }
 
+/** Pull an original publish date (ms) from the page's metadata, if present. */
+function pagePublishedAt(pageHtml) {
+  const m = pageHtml.match(/<meta[^>]+(?:property|name|itemprop)=["'](?:article:published_time|datePublished|publishdate|date|dc\.date(?:\.issued)?)["'][^>]+content=["']([^"']+)["']/i)
+    || pageHtml.match(/<meta[^>]+content=["']([^"']+)["'][^>]+(?:property|name|itemprop)=["'](?:article:published_time|datePublished)["']/i)
+    || pageHtml.match(/<time[^>]+datetime=["']([^"']+)["']/i);
+  if (!m) return null;
+  const t = Date.parse(m[1].trim());
+  return Number.isFinite(t) && t > 0 && t < Date.now() + 86400000 ? t : null;
+}
+
 /** Pull an og:image / twitter:image from page HTML, resolved to an absolute URL. */
 function ogImage(pageHtml, baseUrl) {
   const m = pageHtml.match(/<meta[^>]+(?:property|name)=["'](?:og:image(?::url)?|twitter:image)["'][^>]+content=["']([^"']+)["']/i)
@@ -163,10 +173,11 @@ async function fillSavedUrl(articleId, userId, artUrl) {
     || pageHtml.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
   const title = titleMatch ? sanitizeString(titleMatch[1].replace(/\s+/g, ' ').trim(), 500) : (hostOf(artUrl) || artUrl);
   const imageUrl = ogImage(pageHtml, artUrl);
+  const publishedAt = pagePublishedAt(pageHtml);
   const bodyText = pageHtml
     .replace(/<(script|style|head|noscript|svg|template)\b[\s\S]*?<\/\1\s*>/gi, ' ')
     .replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
-  if (!setContent({ title, imageUrl, excerpt: sanitizeString(bodyText, 300), html: `<p>${escapeText(bodyText.slice(0, 200000))}</p>`, textContent: bodyText.slice(0, 200000) })) return;
+  if (!setContent({ title, imageUrl, publishedAt, excerpt: sanitizeString(bodyText, 300), html: `<p>${escapeText(bodyText.slice(0, 200000))}</p>`, textContent: bodyText.slice(0, 200000) })) return;
   enqueueTts(articleId, userId);
 
   if (llm.enabled()) {
@@ -582,6 +593,8 @@ const server = http.createServer(async (req, res) => {
         if (!artUrl || !html) return json(res, 400, { error: 'url and html are required' });
         const now = Date.now();
         const image = sanitizeString(b.image, 2000);
+        const pub = typeof b.publishedAt === 'number' ? b.publishedAt
+          : (b.publishedAt ? Date.parse(String(b.publishedAt)) : NaN);
         const fields = {
           title: sanitizeString(b.title) || artUrl,
           byline: sanitizeString(b.byline),
@@ -590,6 +603,7 @@ const server = http.createServer(async (req, res) => {
           html,
           textContent: typeof b.textContent === 'string' ? b.textContent : null,
           imageUrl: image && /^https?:\/\//i.test(image) ? image : null,
+          publishedAt: Number.isFinite(pub) && pub > 0 && pub < now + 86400000 ? pub : null,
           updatedAt: now,
         };
         let a = store.articleByUrl(user.id, artUrl);

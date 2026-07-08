@@ -210,6 +210,12 @@
   let image = meta('og:image') || meta('og:image:url') || meta('twitter:image') || null;
   if (image) { try { image = new URL(image, location.href).href.slice(0, 2000); } catch (e) { image = null; } }
 
+  // Original publish date from metadata / a <time datetime>.
+  let published = meta('article:published_time') || meta('datePublished') ||
+    (document.querySelector('meta[itemprop="datePublished"]') || {}).content ||
+    (document.querySelector('time[datetime]') || {}).getAttribute?.('datetime') || null;
+  if (published) { const t = Date.parse(published); published = (t > 0 && t < Date.now() + 86400000) ? t : null; }
+
   return {
     url: (meta('og:url') || location.href).split('#')[0],
     title: (title || location.href).trim().slice(0, 500),
@@ -217,6 +223,7 @@
     siteName: (best.siteName || meta('og:site_name') || location.hostname).trim().slice(0, 200),
     excerpt: (best.excerpt || meta('og:description') || meta('description') || textContent.slice(0, 300)).trim().slice(0, 500),
     image,
+    publishedAt: published,
     html: best.html,
     textContent: textContent.slice(0, 200000),
     savedAt: Date.now(),

@@ -1,7 +1,7 @@
 {
   "manifest_version": 2,
   "name": "Earmark — Save to your reader",
-  "version": "1.0.4",
+  "version": "1.0.5",
   "description": "Save the current page — exactly as rendered in your browser — to your self-hosted Earmark server for reading in the Android app.",
   "icons": {
     "48": "icons/icon.svg",

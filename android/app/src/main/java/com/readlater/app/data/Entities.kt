@@ -28,7 +28,9 @@ data class ArticleEntity(
     /** Listening position (TTS), tracked separately from the manual scroll position. */
     @ColumnInfo(defaultValue = "0") val ttsParagraph: Int = 0,
     /** Thumbnail image URL (og:image), null if none. */
-    val imageUrl: String? = null
+    val imageUrl: String? = null,
+    /** Original publish date (ms), null if the page didn't expose one. */
+    val publishedAt: Long? = null
 )
 
 @Entity(tableName = "highlights")

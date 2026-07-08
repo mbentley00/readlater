@@ -102,6 +102,11 @@ class TtsService : Service() {
     private var articleId: String? = null
     private var articleTitle = ""
     private var articleSite = ""
+    private var articleByline = ""
+
+    /** Author · publisher for the lock-screen subtitle. */
+    private fun articleSubtitle(): String =
+        listOf(articleByline, articleSite).filter { it.isNotBlank() }.joinToString(" · ")
     private var blocks: List<Block> = emptyList()
     private var currentIndex = 0
     private var isPlaying = false
@@ -297,7 +302,9 @@ class TtsService : Service() {
             // while listening, reopening returns to this article.
             app.settings.lastArticleId = article.id
             articleTitle = article.title
-            articleSite = article.siteName.orEmpty()
+            articleSite = article.siteName?.takeIf { it.isNotBlank() }
+                ?: runCatching { android.net.Uri.parse(article.url).host?.removePrefix("www.") }.getOrNull().orEmpty()
+            articleByline = article.byline.orEmpty()
             blocks = HtmlParser.parse(html)
             if (blocks.isEmpty()) {
                 handleStop()
@@ -1463,7 +1470,7 @@ class TtsService : Service() {
         mediaSession?.setMetadata(
             MediaMetadataCompat.Builder()
                 .putString(MediaMetadataCompat.METADATA_KEY_TITLE, articleTitle)
-                .putString(MediaMetadataCompat.METADATA_KEY_ARTIST, articleSite)
+                .putString(MediaMetadataCompat.METADATA_KEY_ARTIST, articleSubtitle())
                 .putLong(MediaMetadataCompat.METADATA_KEY_DURATION, totalDurationMs)
                 .build()
         )
@@ -1551,8 +1558,8 @@ class TtsService : Service() {
         val pct = if (totalDurationMs > 0) (positionMs(currentIndex) * 100 / totalDurationMs).toInt() else 0
         val progressText = when {
             isPlaying && !audioStarted -> "Preparing voice…"
-            blocks.isNotEmpty() -> "$pct% · ${articleSite.ifBlank { "Reading aloud" }}"
-            else -> articleSite.ifBlank { "Reading aloud" }
+            blocks.isNotEmpty() -> articleSubtitle().ifBlank { "$pct%" }.let { if (it == "$pct%") it else "$pct% · $it" }
+            else -> articleSubtitle().ifBlank { "Reading aloud" }
         }
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setSmallIcon(R.drawable.ic_launcher_foreground)

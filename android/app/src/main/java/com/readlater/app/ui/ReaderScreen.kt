@@ -27,6 +27,7 @@ import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.automirrored.filled.PlaylistPlay
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Archive
 import androidx.compose.material.icons.filled.Delete
@@ -354,29 +355,33 @@ fun ReaderScreen(articleId: String, onBack: () -> Unit, onOpenArticle: (String) 
                                 else LocalContentColor.current
                             )
                         }
+                        // Archive & play next: archive this one, open the next
+                        // inbox article, and auto-start playing it.
+                        if (!a.archived) {
+                            IconButton(onClick = {
+                                scope.launch {
+                                    val next = repo.nextInboxArticle(a)
+                                    repo.toggleArchive(a)
+                                    if (next != null) {
+                                        sendTtsCommand(context, TtsService.ACTION_PLAY, next.id, 0)
+                                        onOpenArticle(next.id)
+                                    } else {
+                                        sendTtsCommand(context, TtsService.ACTION_STOP)
+                                        onBack()
+                                    }
+                                }
+                            }) {
+                                Icon(
+                                    Icons.AutoMirrored.Filled.PlaylistPlay,
+                                    contentDescription = "Archive and play next"
+                                )
+                            }
+                        }
+                        // Plain archive: archive/unarchive and return to the list.
                         IconButton(onClick = {
                             val wasArchived = a.archived
-                            val ttsOnThis = isTtsThisArticle
                             repo.toggleArchive(a)
-                            // Archiving finishes reading — return to the list. If
-                            // this article was the one being read aloud, advance
-                            // the listening queue to the next inbox article.
-                            if (!wasArchived) {
-                                if (ttsOnThis) {
-                                    scope.launch {
-                                        val next = repo.nextInboxArticle(a)
-                                        if (next != null) {
-                                            sendTtsCommand(context, TtsService.ACTION_PLAY, next.id, 0)
-                                            onOpenArticle(next.id) // open the next article's reader
-                                        } else {
-                                            sendTtsCommand(context, TtsService.ACTION_STOP)
-                                            onBack()
-                                        }
-                                    }
-                                } else {
-                                    onBack()
-                                }
-                            }
+                            if (!wasArchived) onBack()
                         }) {
                             Icon(
                                 if (a.archived) Icons.Filled.Unarchive else Icons.Filled.Archive,
@@ -500,14 +505,14 @@ fun ReaderScreen(articleId: String, onBack: () -> Unit, onOpenArticle: (String) 
                     Icon(Icons.Filled.PushPin, contentDescription = "Set reading position to here")
                 }
                 Spacer(modifier = Modifier.weight(1f))
-                IconButton(onClick = { changeRate(-0.25f) }, enabled = speechRate > 0.5f) {
+                IconButton(onClick = { changeRate(-0.05f) }, enabled = speechRate > 0.5f) {
                     Icon(Icons.Filled.Remove, contentDescription = "Slower")
                 }
                 Text(
                     text = String.format(Locale.US, "%.2f×", speechRate),
                     style = MaterialTheme.typography.labelLarge
                 )
-                IconButton(onClick = { changeRate(0.25f) }, enabled = speechRate < 2.0f) {
+                IconButton(onClick = { changeRate(0.05f) }, enabled = speechRate < 2.0f) {
                     Icon(Icons.Filled.Add, contentDescription = "Faster")
                 }
             }
@@ -563,6 +568,9 @@ fun ReaderScreen(articleId: String, onBack: () -> Unit, onOpenArticle: (String) 
                     modifier = Modifier.weight(1f).fillMaxWidth(),
                     contentPadding = PaddingValues(horizontal = 20.dp, vertical = 16.dp)
                 ) {
+                    item(key = "__header__") {
+                        article?.let { ArticleHeader(it) }
+                    }
                     itemsIndexed(blocks) { index, block ->
                         BlockItem(
                             block = block,
@@ -643,6 +651,44 @@ fun ReaderScreen(articleId: String, onBack: () -> Unit, onOpenArticle: (String) 
 
 @OptIn(ExperimentalFoundationApi::class)
 /** Plain speakable/searchable text of a block ("" for images without alt). */
+private val headerDateFmt = java.text.SimpleDateFormat("MMM d, yyyy", java.util.Locale.US)
+
+/** Title + byline metadata shown above the article body. */
+@Composable
+private fun ArticleHeader(article: com.readlater.app.data.ArticleEntity) {
+    Column(modifier = Modifier.fillMaxWidth().padding(bottom = 18.dp)) {
+        Text(
+            text = article.title.ifBlank { article.url },
+            style = MaterialTheme.typography.headlineSmall,
+            fontWeight = androidx.compose.ui.text.font.FontWeight.Bold,
+            lineHeight = MaterialTheme.typography.headlineSmall.fontSize * 1.15f
+        )
+        val publisher = article.siteName?.takeIf { it.isNotBlank() }
+            ?: runCatching { Uri.parse(article.url).host?.removePrefix("www.") }.getOrNull()
+        val dateMs = article.publishedAt ?: article.savedAt.takeIf { it > 0 }
+        val date = dateMs?.let {
+            (if (article.publishedAt == null) "Saved " else "") + headerDateFmt.format(java.util.Date(it))
+        }
+        val minutes = readingMinutes(article.wordCount)
+        val meta = listOfNotNull(
+            article.byline?.takeIf { it.isNotBlank() },
+            publisher,
+            date,
+            if (minutes > 0) "$minutes min read" else null
+        ).joinToString(" · ")
+        if (meta.isNotBlank()) {
+            Spacer(modifier = Modifier.height(10.dp))
+            Text(
+                text = meta,
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+        }
+        Spacer(modifier = Modifier.height(14.dp))
+        androidx.compose.material3.HorizontalDivider()
+    }
+}
+
 private fun blockPlainText(block: Block): String = when (block) {
     is Block.Paragraph -> block.text
     is Block.Heading -> block.text

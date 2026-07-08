@@ -31,6 +31,13 @@ private val MIGRATION_3_4 = object : Migration(3, 4) {
     }
 }
 
+/** v4 → v5: original publish date. */
+private val MIGRATION_4_5 = object : Migration(4, 5) {
+    override fun migrate(db: SupportSQLiteDatabase) {
+        db.execSQL("ALTER TABLE articles ADD COLUMN publishedAt INTEGER")
+    }
+}
+
 /**
  * Application class doubling as a tiny manual DI container.
  * All singletons are created lazily on first use.
@@ -39,7 +46,7 @@ class ReadLaterApp : Application() {
 
     val database: AppDatabase by lazy {
         Room.databaseBuilder(this, AppDatabase::class.java, "readlater.db")
-            .addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4)
+            .addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5)
             .fallbackToDestructiveMigration()
             .build()
     }

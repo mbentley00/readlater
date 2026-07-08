@@ -104,7 +104,8 @@ class Repository(
                     dirty = false,
                     wordCount = r.wordCount,
                     paragraphCount = local?.paragraphCount ?: 0,
-                    imageUrl = r.imageUrl
+                    imageUrl = r.imageUrl,
+                    publishedAt = r.publishedAt
                 )
                 if (local == null || local.copy(html = null, paragraphCount = 0) !=
                     merged.copy(html = null, paragraphCount = 0)

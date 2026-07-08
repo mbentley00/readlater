@@ -221,6 +221,10 @@ function open(dataDir) {
   if (!articleCols.includes('imageUrl')) {
     sqlite.exec("ALTER TABLE articles ADD COLUMN imageUrl TEXT");
   }
+  // original publish date (ms), when the page exposes one
+  if (!articleCols.includes('publishedAt')) {
+    sqlite.exec("ALTER TABLE articles ADD COLUMN publishedAt INTEGER");
+  }
   // one-time recompute after the script/style-stripping fix (imported
   // articles were over-counted by embedded JSON-LD / scripts).
   if (sqlite.pragma('user_version', { simple: true }) < 2) {
@@ -267,15 +271,16 @@ function open(dataDir) {
     articleByUrl: (userId, url) =>
       rowArticle(prep('abu', 'SELECT * FROM articles WHERE userId = ? AND url = ?').get(userId, url)),
     insertArticle: (a) => prep('ai', `INSERT INTO articles
-      (id, userId, url, domain, savedAt, archived, favorite, readParagraph, title, byline, siteName, excerpt, html, textContent, imageUrl, wordCount, updatedAt)
-      VALUES (@id, @userId, @url, @domain, @savedAt, @archived, @favorite, @readParagraph, @title, @byline, @siteName, @excerpt, @html, @textContent, @imageUrl, @wordCount, @updatedAt)`)
-      .run({ imageUrl: null, ...a, domain: hostOf(a.url), archived: a.archived ? 1 : 0, favorite: a.favorite ? 1 : 0, wordCount: articleWordCount(a) }),
-    // Update content; only overwrites imageUrl when a new one is provided.
+      (id, userId, url, domain, savedAt, archived, favorite, readParagraph, title, byline, siteName, excerpt, html, textContent, imageUrl, publishedAt, wordCount, updatedAt)
+      VALUES (@id, @userId, @url, @domain, @savedAt, @archived, @favorite, @readParagraph, @title, @byline, @siteName, @excerpt, @html, @textContent, @imageUrl, @publishedAt, @wordCount, @updatedAt)`)
+      .run({ imageUrl: null, publishedAt: null, ...a, domain: hostOf(a.url), archived: a.archived ? 1 : 0, favorite: a.favorite ? 1 : 0, wordCount: articleWordCount(a) }),
+    // Update content; only overwrites imageUrl/publishedAt when new ones are provided.
     updateArticleContent: (id, f) => prep('auc', `UPDATE articles SET
       title = @title, byline = @byline, siteName = @siteName, excerpt = @excerpt,
       html = @html, textContent = @textContent, imageUrl = COALESCE(@imageUrl, imageUrl),
+      publishedAt = COALESCE(@publishedAt, publishedAt),
       wordCount = @wordCount, updatedAt = @updatedAt WHERE id = @id`)
-      .run({ imageUrl: null, ...f, id, wordCount: articleWordCount(f) }),
+      .run({ imageUrl: null, publishedAt: null, ...f, id, wordCount: articleWordCount(f) }),
     patchArticle: (id, { archived, favorite, readParagraph, ttsParagraph, updatedAt }) =>
       prep('ap', `UPDATE articles SET
         archived = COALESCE(@archived, archived),
@@ -309,7 +314,7 @@ function open(dataDir) {
       const { where, args } = buildArticleWhere(userId, filters);
       const order = ARTICLE_SORTS[filters.sort] || ARTICLE_SORTS.newest;
       let sql = `SELECT a.id, a.userId, a.url, a.domain, a.savedAt, a.archived, a.favorite, a.readParagraph,
-          a.ttsParagraph, a.title, a.byline, a.siteName, a.excerpt, a.imageUrl, a.wordCount, a.updatedAt
+          a.ttsParagraph, a.title, a.byline, a.siteName, a.excerpt, a.imageUrl, a.publishedAt, a.wordCount, a.updatedAt
         FROM articles a WHERE ${where.join(' AND ')} ORDER BY ${order}`;
       const lim = Number(filters.limit) || 0;
       if (lim > 0) {
