@@ -33,6 +33,10 @@ class Repository(
 
     suspend fun fetchViews(): List<RemoteView> = api.listViews()
 
+    suspend fun createView(name: String, view: RemoteView): RemoteView = api.createView(name, view)
+
+    suspend fun deleteView(id: String) = api.deleteView(id)
+
     fun article(id: String): Flow<ArticleEntity?> = articleDao.articleFlow(id)
 
     /** The next inbox article to auto-play after finishing/archiving this one. */

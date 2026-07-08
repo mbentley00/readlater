@@ -137,6 +137,36 @@ class ApiClient(private val settings: Settings) {
     }
 
     /** GET /api/views — the user's saved filter views. */
+    /** POST /api/views — create a saved view (filter set) and return it. */
+    suspend fun createView(name: String, view: RemoteView): RemoteView {
+        val filters = JSONObject().apply {
+            if (view.q.isNotBlank()) put("q", view.q)
+            if (view.domain.isNotBlank()) put("domain", view.domain)
+            if (view.highlighted) put("highlighted", true)
+            if (view.minWords > 0) put("minWords", view.minWords)
+            if (view.maxWords > 0) put("maxWords", view.maxWords)
+            if (view.minHighlights > 0) put("minHighlights", view.minHighlights)
+            if (view.includeArchived) put("includeArchived", true)
+        }
+        val json = JSONObject().apply { put("name", name); put("filters", filters) }
+        val body = execute(builder("/api/views").post(json.toString().toRequestBody(jsonMediaType)).build())
+        val o = JSONObject(body)
+        val f = o.optJSONObject("filters") ?: JSONObject()
+        return RemoteView(
+            id = o.getString("id"), name = o.optString("name"),
+            q = f.optString("q"), domain = f.optString("domain"),
+            highlighted = f.optBoolean("highlighted", false),
+            minWords = f.optInt("minWords", 0), maxWords = f.optInt("maxWords", 0),
+            minHighlights = f.optInt("minHighlights", 0),
+            includeArchived = f.optBoolean("includeArchived", false)
+        )
+    }
+
+    /** DELETE /api/views/{id} */
+    suspend fun deleteView(id: String) {
+        execute(builder("/api/views/$id").delete().build())
+    }
+
     suspend fun listViews(): List<RemoteView> {
         val body = execute(builder("/api/views").get().build())
         val arr = JSONObject(body).getJSONArray("views")

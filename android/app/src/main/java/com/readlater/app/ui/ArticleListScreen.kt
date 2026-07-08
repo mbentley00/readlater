@@ -21,6 +21,7 @@ import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.Sort
+import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Archive
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Delete
@@ -32,6 +33,11 @@ import androidx.compose.material.icons.filled.Star
 import androidx.compose.material.icons.filled.StarBorder
 import androidx.compose.material.icons.filled.SystemUpdate
 import androidx.compose.material.icons.filled.Unarchive
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.AssistChip
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.Switch
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.Card
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DropdownMenu
@@ -58,6 +64,7 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
@@ -81,7 +88,9 @@ import com.readlater.app.ReadLaterApp
 import com.readlater.app.data.ArticleEntity
 import com.readlater.app.data.RemoteView
 import com.readlater.app.tts.TtsService
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.ui.platform.LocalContext
 import kotlinx.coroutines.flow.flowOf
@@ -164,6 +173,14 @@ fun ArticleListScreen(
     // Jump back to the top whenever the sort order changes (incl. re-rolling Random).
     val listState = rememberLazyListState()
     LaunchedEffect(sortMode, shuffleSeed) { listState.scrollToItem(0) }
+
+    var showViewsDialog by remember { mutableStateOf(false) }
+    // Publishers present in the loaded library, most common first (quick-picks).
+    val topDomains = remember(unsorted) {
+        unsorted.mapNotNull {
+            runCatching { Uri.parse(it.url).host }.getOrNull()?.removePrefix("www.")?.takeIf { d -> d.isNotBlank() }
+        }.groupingBy { it }.eachCount().entries.sortedByDescending { it.value }.take(15).map { it.key }
+    }
 
     val articles = remember(unsorted, sortMode, selectedView, hlCounts, searchQuery, searchActive, shuffleSeed) {
         val counts = hlCounts.associate { it.articleId to it.n }
@@ -440,6 +457,39 @@ fun ArticleListScreen(
                         label = { Text(v.name) }
                     )
                 }
+                FilterChip(
+                    selected = false,
+                    onClick = { showViewsDialog = true },
+                    label = { Text("View") },
+                    leadingIcon = { Icon(Icons.Filled.Add, contentDescription = "New view", modifier = Modifier.size(18.dp)) }
+                )
+            }
+
+            if (showViewsDialog) {
+                ViewsDialog(
+                    views = views,
+                    topDomains = topDomains,
+                    onDismiss = { showViewsDialog = false },
+                    onCreate = { name, view ->
+                        scope.launch {
+                            runCatching { repo.createView(name, view) }
+                                .onSuccess { created ->
+                                    runCatching { views = repo.fetchViews() }
+                                    selectedView = views.firstOrNull { it.id == created.id } ?: created
+                                    showArchived = false
+                                    showViewsDialog = false
+                                }
+                                .onFailure { scope.launch { snackbarHostState.showSnackbar("Couldn't create view (offline?)") } }
+                        }
+                    },
+                    onDelete = { v ->
+                        scope.launch {
+                            runCatching { repo.deleteView(v.id) }
+                            if (selectedView?.id == v.id) selectedView = null
+                            runCatching { views = repo.fetchViews() }
+                        }
+                    }
+                )
             }
 
             if (articles.isEmpty()) {
@@ -642,4 +692,107 @@ private fun ArticleCard(
             )
         }
     }
+}
+
+/** Create a saved view (filter set) and manage existing ones. */
+@Composable
+private fun ViewsDialog(
+    views: List<RemoteView>,
+    topDomains: List<String>,
+    onDismiss: () -> Unit,
+    onCreate: (String, RemoteView) -> Unit,
+    onDelete: (RemoteView) -> Unit
+) {
+    var name by remember { mutableStateOf("") }
+    var domain by remember { mutableStateOf("") }
+    var minWords by remember { mutableStateOf("") }
+    var maxWords by remember { mutableStateOf("") }
+    var highlighted by remember { mutableStateOf(false) }
+    var includeArchived by remember { mutableStateOf(false) }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Saved views") },
+        text = {
+            Column(modifier = Modifier.verticalScroll(rememberScrollState())) {
+                if (views.isNotEmpty()) {
+                    Text("Your views", style = MaterialTheme.typography.labelLarge)
+                    views.forEach { v ->
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Text(v.name, modifier = Modifier.weight(1f))
+                            IconButton(onClick = { onDelete(v) }) {
+                                Icon(Icons.Filled.Delete, contentDescription = "Delete view")
+                            }
+                        }
+                    }
+                    HorizontalDivider(modifier = Modifier.padding(vertical = 10.dp))
+                }
+                Text("New view", style = MaterialTheme.typography.labelLarge)
+                Spacer(modifier = Modifier.height(8.dp))
+                OutlinedTextField(
+                    value = name, onValueChange = { name = it },
+                    label = { Text("Name") }, singleLine = true, modifier = Modifier.fillMaxWidth()
+                )
+                Spacer(modifier = Modifier.height(8.dp))
+                OutlinedTextField(
+                    value = domain, onValueChange = { domain = it },
+                    label = { Text("Publisher / domain") }, placeholder = { Text("e.g. slate.com") },
+                    singleLine = true, modifier = Modifier.fillMaxWidth()
+                )
+                if (topDomains.isNotEmpty()) {
+                    Row(
+                        modifier = Modifier.horizontalScroll(rememberScrollState()).padding(top = 6.dp),
+                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        topDomains.forEach { d ->
+                            AssistChip(onClick = { domain = d }, label = { Text(d) })
+                        }
+                    }
+                }
+                Spacer(modifier = Modifier.height(8.dp))
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    OutlinedTextField(
+                        value = minWords, onValueChange = { s -> minWords = s.filter { it.isDigit() } },
+                        label = { Text("Min words") }, singleLine = true,
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                        modifier = Modifier.weight(1f)
+                    )
+                    OutlinedTextField(
+                        value = maxWords, onValueChange = { s -> maxWords = s.filter { it.isDigit() } },
+                        label = { Text("Max words") }, singleLine = true,
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                        modifier = Modifier.weight(1f)
+                    )
+                }
+                Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.padding(top = 4.dp)) {
+                    Switch(checked = highlighted, onCheckedChange = { highlighted = it })
+                    Spacer(modifier = Modifier.width(8.dp)); Text("Only highlighted")
+                }
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Switch(checked = includeArchived, onCheckedChange = { includeArchived = it })
+                    Spacer(modifier = Modifier.width(8.dp)); Text("Include archived")
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(
+                enabled = name.isNotBlank(),
+                onClick = {
+                    onCreate(
+                        name.trim(),
+                        RemoteView(
+                            id = "", name = name.trim(), q = "",
+                            domain = domain.trim().removePrefix("www."),
+                            highlighted = highlighted,
+                            minWords = minWords.toIntOrNull() ?: 0,
+                            maxWords = maxWords.toIntOrNull() ?: 0,
+                            minHighlights = 0,
+                            includeArchived = includeArchived
+                        )
+                    )
+                }
+            ) { Text("Create") }
+        },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Close") } }
+    )
 }
