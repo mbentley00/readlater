@@ -46,7 +46,9 @@ data class TtsPlaybackState(
     /** Playing but no audio yet — checking the server / synthesizing / downloading. */
     val preparing: Boolean = false,
     /** True when the current audio is the server (Kokoro) voice, false for the device voice. */
-    val serverVoice: Boolean = false
+    val serverVoice: Boolean = false,
+    /** elapsedRealtime() at which the sleep timer will pause playback; 0 = no timer. */
+    val sleepTimerEndsAt: Long = 0L
 )
 
 /**
@@ -64,9 +66,11 @@ class TtsService : Service() {
         const val ACTION_PREV = "com.readlater.app.tts.action.PREV"
         const val ACTION_STOP = "com.readlater.app.tts.action.STOP"
         const val ACTION_SET_POSITION = "com.readlater.app.tts.action.SET_POSITION"
+        const val ACTION_SET_SLEEP_TIMER = "com.readlater.app.tts.action.SET_SLEEP_TIMER"
 
         const val EXTRA_ARTICLE_ID = "articleId"
         const val EXTRA_START_PARAGRAPH = "startParagraph"
+        const val EXTRA_SLEEP_MINUTES = "sleepMinutes"
 
         private const val CHANNEL_ID = "tts_playback"
         private const val NOTIFICATION_ID = 1001
@@ -199,6 +203,7 @@ class TtsService : Service() {
             ACTION_PREV -> handlePrev()
             ACTION_STOP -> handleStop()
             ACTION_SET_POSITION -> handleSetPosition(intent)
+            ACTION_SET_SLEEP_TIMER -> handleSetSleepTimer(intent.getIntExtra(EXTRA_SLEEP_MINUTES, 0))
             // System-delivered media buttons (MediaButtonReceiver in the
             // manifest) route into the session callback.
             Intent.ACTION_MEDIA_BUTTON -> MediaButtonReceiver.handleIntent(mediaSession, intent)
@@ -544,9 +549,32 @@ class TtsService : Service() {
         }
     }
 
+    // ---- sleep timer: pause playback after N minutes (0 = cancel).
+    private var sleepTimerEndsAt = 0L
+    private val sleepRunnable = Runnable {
+        sleepTimerEndsAt = 0L
+        if (isPlaying) handlePause()
+        Toast.makeText(this, "Sleep timer — paused", Toast.LENGTH_SHORT).show()
+        publishState()
+    }
+    private fun handleSetSleepTimer(minutes: Int) {
+        mainHandler.removeCallbacks(sleepRunnable)
+        if (minutes > 0) {
+            sleepTimerEndsAt = android.os.SystemClock.elapsedRealtime() + minutes * 60_000L
+            mainHandler.postDelayed(sleepRunnable, minutes * 60_000L)
+            Toast.makeText(this, "Sleep timer set for $minutes min", Toast.LENGTH_SHORT).show()
+        } else {
+            sleepTimerEndsAt = 0L
+            Toast.makeText(this, "Sleep timer off", Toast.LENGTH_SHORT).show()
+        }
+        publishState()
+    }
+
     private fun handleStop() {
         isPlaying = false
         tts?.stop()
+        mainHandler.removeCallbacks(sleepRunnable)
+        sleepTimerEndsAt = 0L
         clearSynthCache()
         releaseWakeLock()
         abandonAudioFocus()
@@ -1582,7 +1610,7 @@ class TtsService : Service() {
     // ------------------------------------------------------------------ state
 
     private fun publishState() {
-        stateFlow.value = TtsPlaybackState(articleId, currentIndex, isPlaying, isPlaying && !audioStarted, serverMode)
+        stateFlow.value = TtsPlaybackState(articleId, currentIndex, isPlaying, isPlaying && !audioStarted, serverMode, sleepTimerEndsAt)
     }
 
     private fun updatePlaybackState() {

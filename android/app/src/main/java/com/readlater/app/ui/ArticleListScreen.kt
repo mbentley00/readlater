@@ -61,6 +61,7 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -167,12 +168,20 @@ fun ArticleListScreen(
     }
     var sortMenuOpen by remember { mutableStateOf(false) }
     // Stable shuffle so RANDOM doesn't reshuffle on every recomposition; a new
-    // seed (re-tapping Random) gives a fresh order.
-    var shuffleSeed by remember { mutableStateOf(0L) }
+    // seed (re-tapping Random) gives a fresh order. Saveable so the order — and
+    // the scroll position — survive navigating into an article and back.
+    var shuffleSeed by rememberSaveable { mutableStateOf(0L) }
 
-    // Jump back to the top whenever the sort order changes (incl. re-rolling Random).
+    // Jump to the top only when the sort actually CHANGES — not when returning
+    // to the list (that re-enters composition and would otherwise reset the
+    // scroll position the user was at).
     val listState = rememberLazyListState()
-    LaunchedEffect(sortMode, shuffleSeed) { listState.scrollToItem(0) }
+    var lastSortKey by rememberSaveable { mutableStateOf("") }
+    LaunchedEffect(sortMode, shuffleSeed) {
+        val key = "${sortMode.name}:$shuffleSeed"
+        if (lastSortKey.isEmpty()) { lastSortKey = key } // first composition — leave position
+        else if (key != lastSortKey) { lastSortKey = key; listState.scrollToItem(0) }
+    }
 
     var showViewsDialog by remember { mutableStateOf(false) }
     // Publishers present in the loaded library, most common first (quick-picks).

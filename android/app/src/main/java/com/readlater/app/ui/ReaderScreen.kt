@@ -30,6 +30,7 @@ import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.PlaylistPlay
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Archive
+import androidx.compose.material.icons.filled.Bedtime
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.MyLocation
@@ -238,6 +239,7 @@ fun ReaderScreen(articleId: String, onBack: () -> Unit, onOpenArticle: (String) 
     val speechRate = if (serverActive) serverRate else deviceRate
     var sheetTarget by remember { mutableStateOf<SheetTarget?>(null) }
     var menuOpen by remember { mutableStateOf(false) }
+    var sleepDialog by remember { mutableStateOf(false) }
 
     // How far through the article the bottom of the viewport is (0..1).
     val readProgress by remember {
@@ -429,6 +431,18 @@ fun ReaderScreen(articleId: String, onBack: () -> Unit, onOpenArticle: (String) 
                                             // No browser available — ignore.
                                         }
                                     }
+                                )
+                                DropdownMenuItem(
+                                    text = {
+                                        val ends = ttsState.sleepTimerEndsAt
+                                        val mins = if (ends > 0)
+                                            (((ends - android.os.SystemClock.elapsedRealtime()) / 60000L) + 1).toInt().coerceAtLeast(0) else 0
+                                        Text(if (mins > 0) "Sleep timer · ${mins}m" else "Sleep timer")
+                                    },
+                                    leadingIcon = {
+                                        Icon(Icons.Filled.Bedtime, contentDescription = null)
+                                    },
+                                    onClick = { menuOpen = false; sleepDialog = true }
                                 )
                                 DropdownMenuItem(
                                     text = { Text("Delete") },
@@ -682,6 +696,40 @@ fun ReaderScreen(articleId: String, onBack: () -> Unit, onOpenArticle: (String) 
             dismissButton = {
                 TextButton(onClick = { resumeChoice = null }) { Text("Cancel") }
             }
+        )
+    }
+
+    if (sleepDialog) {
+        fun setSleep(minutes: Int) {
+            sleepDialog = false
+            context.startService(
+                Intent(context, TtsService::class.java)
+                    .setAction(TtsService.ACTION_SET_SLEEP_TIMER)
+                    .putExtra(TtsService.EXTRA_SLEEP_MINUTES, minutes)
+            )
+        }
+        val active = ttsState.sleepTimerEndsAt > android.os.SystemClock.elapsedRealtime()
+        AlertDialog(
+            onDismissRequest = { sleepDialog = false },
+            title = { Text("Sleep timer") },
+            text = {
+                Column {
+                    Text("Pause playback after:")
+                    Spacer(modifier = Modifier.height(8.dp))
+                    listOf(15, 30, 45, 60).forEach { m ->
+                        TextButton(onClick = { setSleep(m) }, modifier = Modifier.fillMaxWidth()) {
+                            Text("$m minutes")
+                        }
+                    }
+                    if (active) {
+                        TextButton(onClick = { setSleep(0) }, modifier = Modifier.fillMaxWidth()) {
+                            Text("Turn off")
+                        }
+                    }
+                }
+            },
+            confirmButton = {},
+            dismissButton = { TextButton(onClick = { sleepDialog = false }) { Text("Cancel") } }
         )
     }
 
