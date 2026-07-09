@@ -149,9 +149,12 @@ fun ArticleListScreen(
     val scope = rememberCoroutineScope()
     val snackbarHostState = remember { SnackbarHostState() }
 
-    var showArchived by remember { mutableStateOf(false) }
-    var selectedView by remember { mutableStateOf<RemoteView?>(null) }
+    // Saveable so the current tab/view survives opening an article and coming
+    // back (e.g. after archiving) — otherwise you'd be kicked to the inbox.
+    var showArchived by rememberSaveable { mutableStateOf(false) }
+    var selectedViewId by rememberSaveable { mutableStateOf<String?>(null) }
     var views by remember { mutableStateOf(repo.cachedViews()) }
+    val selectedView = remember(views, selectedViewId) { views.firstOrNull { it.id == selectedViewId } }
     var searchActive by remember { mutableStateOf(false) }
     var searchQuery by remember { mutableStateOf("") }
 
@@ -449,19 +452,19 @@ fun ArticleListScreen(
             ) {
                 FilterChip(
                     selected = !showArchived && selectedView == null,
-                    onClick = { showArchived = false; selectedView = null },
+                    onClick = { showArchived = false; selectedViewId = null },
                     label = { Text("Inbox") }
                 )
                 FilterChip(
                     selected = showArchived && selectedView == null,
-                    onClick = { showArchived = true; selectedView = null },
+                    onClick = { showArchived = true; selectedViewId = null },
                     label = { Text("Archive") }
                 )
                 views.forEach { v ->
                     FilterChip(
                         selected = selectedView?.id == v.id,
                         onClick = {
-                            selectedView = if (selectedView?.id == v.id) null else v
+                            selectedViewId = if (selectedViewId == v.id) null else v.id
                         },
                         label = { Text(v.name) }
                     )
@@ -484,7 +487,7 @@ fun ArticleListScreen(
                             runCatching { repo.createView(name, view) }
                                 .onSuccess { created ->
                                     runCatching { views = repo.fetchViews() }
-                                    selectedView = views.firstOrNull { it.id == created.id } ?: created
+                                    selectedViewId = created.id
                                     showArchived = false
                                     showViewsDialog = false
                                 }
@@ -494,7 +497,7 @@ fun ArticleListScreen(
                     onDelete = { v ->
                         scope.launch {
                             runCatching { repo.deleteView(v.id) }
-                            if (selectedView?.id == v.id) selectedView = null
+                            if (selectedViewId == v.id) selectedViewId = null
                             runCatching { views = repo.fetchViews() }
                         }
                     }

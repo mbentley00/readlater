@@ -82,6 +82,10 @@ class TtsService : Service() {
          *  voice — its delivery runs paragraphs together, so a beat helps. */
         private const val KALDI_PARAGRAPH_GAP_MS = 500L
 
+        /** Beat inserted between paragraphs for the system (e.g. Google) voice,
+         *  which otherwise runs paragraphs together with no pause. */
+        private const val DEVICE_PARAGRAPH_GAP_MS = 500L
+
         /** Current playback state, observable from anywhere. */
         val stateFlow = MutableStateFlow(TtsPlaybackState())
 
@@ -1071,7 +1075,7 @@ class TtsService : Service() {
             prefetchAhead(idx)
             publishState(); updatePlaybackState(); updateNotification()
 
-            val silenceMs = if (initializedEngine == sherpaEngine) KALDI_PARAGRAPH_GAP_MS else 0L
+            val silenceMs = if (initializedEngine == sherpaEngine) KALDI_PARAGRAPH_GAP_MS else DEVICE_PARAGRAPH_GAP_MS
             val myGen = ++playThreadGen
             playThread = Thread {
                 try {

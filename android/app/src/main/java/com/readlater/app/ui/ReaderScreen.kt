@@ -167,6 +167,17 @@ fun ReaderScreen(articleId: String, onBack: () -> Unit, onOpenArticle: (String) 
         }
     }
 
+    // If a headphone triple-tap archived THIS article and moved playback to the
+    // next one while the app was away, follow it — otherwise you come back to
+    // the stale, now-archived article with playback happening elsewhere.
+    LaunchedEffect(article?.archived, ttsState.articleId, ttsState.isPlaying) {
+        val a = article
+        val playing = ttsState.articleId
+        if (a != null && a.archived && ttsState.isPlaying && playing != null && playing != articleId) {
+            onOpenArticle(playing)
+        }
+    }
+
     // Whether the view auto-follows the spoken paragraph. On by default;
     // switched off as soon as the user scrolls by hand, back on via the
     // follow button or by (re)starting playback.

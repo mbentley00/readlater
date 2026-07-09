@@ -26,9 +26,9 @@ const cfg = () => ({
 
 const enabled = () => !!cfg().key;
 
-// Post-process Kokoro's audio to tame its over-long pauses. Tunable via env;
-// disable entirely with TTS_CAP_SILENCE=0.
-const CAP_SILENCE = process.env.TTS_CAP_SILENCE !== '0';
+// Post-process to shorten Kokoro's over-long pauses. OFF by default — the
+// silenceremove approach clipped word onsets/tails; opt in with TTS_CAP_SILENCE=1.
+const CAP_SILENCE = process.env.TTS_CAP_SILENCE === '1';
 const SIL_THRESHOLD = process.env.TTS_SILENCE_THRESHOLD || '-40dB';
 const SIL_DURATION = process.env.TTS_SILENCE_DURATION || '0.30'; // trim pauses longer than this (s)
 const SIL_KEEP = process.env.TTS_SILENCE_KEEP || '0.20';         // ...down toward this (s)
