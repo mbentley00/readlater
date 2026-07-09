@@ -1453,7 +1453,10 @@ class TtsService : Service() {
                                 off += w; bytesWritten += w
                             }
                             if (off < 0) break
-                            val blk = blockForMs((info.presentationTimeUs / 1000).toInt())
+                            // Track the ACTUAL playback head (trackPositionMs), not the
+                            // decoder's presentation time — the decoder writes ~0.5-1s
+                            // ahead of playback, which made the highlight skip ahead early.
+                            val blk = blockForMs(trackPositionMs())
                             if (blk != lastBlock) {
                                 lastBlock = blk
                                 mainHandler.post {

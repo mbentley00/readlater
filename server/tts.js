@@ -26,6 +26,28 @@ const cfg = () => ({
 
 const enabled = () => !!cfg().key;
 
+// Post-process Kokoro's audio to tame its over-long pauses. Tunable via env;
+// disable entirely with TTS_CAP_SILENCE=0.
+const CAP_SILENCE = process.env.TTS_CAP_SILENCE !== '0';
+const SIL_THRESHOLD = process.env.TTS_SILENCE_THRESHOLD || '-40dB';
+const SIL_DURATION = process.env.TTS_SILENCE_DURATION || '0.30'; // trim pauses longer than this (s)
+const SIL_KEEP = process.env.TTS_SILENCE_KEEP || '0.20';         // ...down toward this (s)
+
+/** Normalize text so Kokoro doesn't read a full-stop pause inside names and
+ *  titles — e.g. the "D." in "John D. Rockefeller" or "Dr." / "Mr.". Sentence
+ *  periods and initialisms like "U.S." are left intact. */
+function normalizeForTts(text) {
+  let t = String(text);
+  // Middle initial after a capitalized first name, before another capitalized
+  // word: drop just that period. Repeated for "John D. E. Smith".
+  for (let i = 0; i < 3; i++) {
+    t = t.replace(/\b([A-Z][a-z]+)\s+([A-Z])\.(\s+["'A-Z])/g, '$1 $2$3');
+  }
+  // Common courtesy/title abbreviations.
+  t = t.replace(/\b(Mr|Mrs|Ms|Mx|Dr|Prof|Sr|Jr|Rev|Gen|Sen|Rep|Gov|Lt|Sgt|Col|Capt)\.(\s)/g, '$1$2');
+  return t;
+}
+
 // ---- article → ordered paragraph strings ------------------------------------
 
 const decodeEntities = (s) => String(s)
@@ -166,8 +188,12 @@ async function synthesizeArticle(article) {
   const bytesToMs = (bytes) => Math.round((bytes / 2) / sampleRate * 1000); // mono 16-bit
 
   for (const para of paragraphs) {
+    // The offset is recorded BEFORE the paragraph's audio, using the running
+    // (already silence-capped) byte total, so highlight/resume stay accurate.
     paragraphOffsetsMs.push(bytesToMs(totalBytes));
-    for (const chunk of chunkText(para)) {
+    const paraParts = [];
+    let paraSr = sampleRate;
+    for (const chunk of chunkText(normalizeForTts(para))) {
       const text = chunk.trim();
       // Skip chunks with nothing to say (empty, or punctuation/symbols only) —
       // those return empty audio and break the request.
@@ -175,10 +201,16 @@ async function synthesizeArticle(article) {
       const wav = await synthChunk(text);
       if (!wav) continue; // provider returned empty audio for this chunk
       const { pcm, sampleRate: sr } = pcmOf(wav);
-      sampleRate = sr;
-      pcmParts.push(pcm);
-      totalBytes += pcm.length;
+      paraSr = sr; sampleRate = sr;
+      paraParts.push(pcm);
     }
+    let paraPcm = Buffer.concat(paraParts);
+    if (paraPcm.length && CAP_SILENCE) {
+      const capped = await capSilence(Buffer.concat([wavHeader(paraPcm.length, paraSr), paraPcm]));
+      if (capped !== null) { try { paraPcm = pcmOf(capped).pcm; } catch (e) { /* keep raw */ } }
+    }
+    pcmParts.push(paraPcm);
+    totalBytes += paraPcm.length;
   }
   const pcm = Buffer.concat(pcmParts, totalBytes);
   const wav = Buffer.concat([wavHeader(pcm.length, sampleRate), pcm]);
@@ -205,6 +237,28 @@ async function synthesizeArticle(article) {
     paragraphOffsetsMs,
     voice: c.voice,
   };
+}
+
+/** Shorten over-long silences in a WAV via ffmpeg's silenceremove, so the
+ *  synthesized speech doesn't drag at commas/sentence ends. Returns the input
+ *  unchanged if ffmpeg is missing or the filter fails. */
+function capSilence(wav) {
+  return new Promise((resolve) => {
+    const ff = spawn('ffmpeg', [
+      '-hide_banner', '-loglevel', 'error', '-i', 'pipe:0',
+      '-af', `silenceremove=stop_periods=-1:stop_threshold=${SIL_THRESHOLD}:stop_duration=${SIL_DURATION}:stop_silence=${SIL_KEEP}`,
+      '-f', 'wav', 'pipe:1',
+    ]);
+    const out = [];
+    ff.stdout.on('data', (c) => out.push(c));
+    ff.on('error', () => resolve(wav)); // ffmpeg not installed → passthrough
+    ff.on('close', (code) => {
+      const buf = Buffer.concat(out);
+      resolve(code === 0 && buf.length > 44 ? buf : wav);
+    });
+    ff.stdin.on('error', () => {});
+    ff.stdin.end(wav);
+  });
 }
 
 /** Encode a WAV buffer to Opus-in-Ogg via ffmpeg (24 kHz mono, ~28 kbps). */
