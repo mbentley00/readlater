@@ -15,12 +15,23 @@ function setStatus(text, cls) {
 
 const baseUrl = () => (urlEl.value.trim() || DEFAULT_SERVER).replace(/\/+$/, '');
 
+const notifyEl = document.getElementById('notifyMode');
+
 async function load() {
-  const s = await browser.storage.local.get({ serverUrl: '', token: '', username: '' });
+  const s = await browser.storage.local.get({
+    serverUrl: '', token: '', username: '', notifyMode: 'summary',
+  });
   urlEl.value = s.serverUrl || DEFAULT_SERVER;
   userEl.value = s.username;
   tokenEl.value = s.token;
+  notifyEl.value = s.notifyMode;
 }
+
+// Saved on change: it's a preference, not part of the sign-in form.
+notifyEl.addEventListener('change', async () => {
+  await browser.storage.local.set({ notifyMode: notifyEl.value });
+  setStatus('Notification preference saved ✔', 'ok');
+});
 
 document.getElementById('signin').addEventListener('click', async () => {
   const username = userEl.value.trim();

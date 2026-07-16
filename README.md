@@ -47,9 +47,38 @@ highlights, and manage your API token.
 
 ### Email articles in (newsletters)
 
-Every account also gets a private **email address** (shown in Settings) —
-mail sent there lands in the inbox as an article. Enable it by pointing an
-inbound-email provider (Postmark works well) at the webhook:
+Forward a newsletter to a mailbox and it shows up in your list. There are two
+ways to wire this up; pick one.
+
+**IMAP polling (no mail provider, single account).** The server logs into one
+mailbox every couple of minutes and saves each new message as an article for
+one account. Nothing to pay for, no MX record, no webhook.
+
+```
+# the mailbox to sign into (mail plumbing)
+READLATER_IMAP_HOST=mail.yourdomain.com    # required to enable
+READLATER_IMAP_USER=read@yourdomain.com    # required
+READLATER_IMAP_PASS=…                      # required — keep it in a secret
+
+# NOT a mail setting: the Earmark username whose library the mail lands in
+READLATER_IMAP_SAVE_TO_EARMARK_USER=michael   # required
+
+READLATER_IMAP_ALLOW_FROM=you@gmail.com    # optional sender allowlist
+READLATER_IMAP_PORT=993                    # optional
+READLATER_IMAP_MAILBOX=INBOX               # optional
+READLATER_IMAP_INTERVAL=120                # optional, seconds
+```
+
+Messages are marked read once saved, so each is processed once; the article's
+`email:<Message-ID>` URL means even a lost flag can't create a duplicate.
+`Fwd:` prefixes are stripped from the title. `ALLOW_FROM` matches the `From:`
+header — it keeps stray mail out of your reader, but headers are forgeable, so
+it is not a security boundary. Keep the address private.
+
+**Inbound webhook (per-account aliases, needs a provider).** Every account gets
+a private alias (shown in Settings); an inbound-email provider POSTs parsed mail
+to the server. Note that *forwarded* mail does not work here — routing is by
+recipient alias, and a forward's recipient is the mailbox, not your alias.
 
 1. Set `READLATER_INBOUND_SECRET=<random>` and
    `READLATER_INBOUND_DOMAIN=in.yourdomain.com` on the server.
@@ -58,9 +87,79 @@ inbound-email provider (Postmark works well) at the webhook:
    `https://your-server/api/inbound-email?secret=<that secret>` and the
    inbound domain to `in.yourdomain.com`.
 
-Delivery is idempotent per message, HTML bodies are sanitized, and mail to
-unknown aliases is dropped. Regenerate your address in Settings if it ever
-starts collecting spam.
+Both paths are idempotent per message, sanitize HTML bodies, and queue TTS
+audio like any other save. If both are configured, Settings shows the IMAP
+mailbox.
+
+**From Gmail on Android:** to save a *link* inside an email, long-press it →
+Share → Earmark. To save the email itself, forward it to the mailbox above.
+
+### Skipping boilerplate
+
+Newsletters and importers leave the same junk in every article — "Sign up for
+the latest from our newsletter", "Some content from the original document could
+not be imported". Add a **skip rule** and paragraphs containing that phrase are
+dropped from articles as they are saved.
+
+Every route opens the phrase in an editable box, prefilled with the text you
+pointed at, so you can trim it to the part that actually repeats before
+committing:
+
+- **Web reader** — select the text and click **Never import**; or click an
+  existing highlight and choose **Never import** from its menu.
+- **Android reader** — long-press the paragraph, trim the text field, then
+  **Never import this text again**.
+- **Settings → Skipped text** — type a phrase directly.
+
+Settings shows how many times each rule has fired, so a rule that never matches
+is easy to spot and delete.
+
+Rules apply to **future saves only** — every save path (extension, save-by-URL,
+LLM rescue, PDF import, emailed newsletters), but never to an article already
+in your library. That is deliberate: highlights, reading position and the TTS
+position are all stored as indices into the article's paragraph sequence, so
+removing a paragraph from a saved article would silently re-anchor every
+highlight after it.
+
+Two guardrails. A phrase must be at least 8 characters, so a stray word cannot
+gut every article. And a rule will not delete a paragraph longer than 600
+characters: when boilerplate appears mid-essay, leaving one stray sentence is
+better than destroying three paragraphs of real prose. Adding a rule reports
+how many already-saved articles contain the phrase, which makes an over-broad
+rule obvious before it starts affecting future saves.
+
+### Backups
+
+Fly snapshots the data volume daily with 5-day retention. That covers disk
+failure; it does not cover deleting something and noticing next week, and the
+snapshots live in the same Fly account as the data. For a copy you control:
+
+```bash
+export EARMARK_TOKEN="<API token from /settings>"
+./server/backup.sh ~/earmark-backups
+```
+
+Cron it daily. Each run writes `earmark-<timestamp>.ndjson.gz` and prunes
+anything older than `EARMARK_BACKUP_KEEP_DAYS` (default 30). Before storing, it
+checks the header counts, the `end` trailer, and the lines actually received —
+every line of a truncated NDJSON file parses on its own, so the trailer is the
+only thing that distinguishes a complete backup from half of one. It also
+refuses to write a zero-article backup over existing ones.
+
+Use `export.ndjson`, not `export.json`, for anything large. A full account
+serialized as a single JSON document cannot be read back: V8 caps strings at
+~536M characters and a real account exceeds that. NDJSON streams both ways —
+a 20k-article backup restores in ~14MB of heap.
+
+Read one back:
+
+```bash
+gzip -dc earmark-20260709T033000Z.ndjson.gz | head -1   # header: counts, views
+gzip -dc earmark-20260709T033000Z.ndjson.gz | tail -1   # trailer: rows written
+```
+
+The Android app also keeps a full local copy of articles and highlights, but
+it is a sync replica, not a backup — deletions propagate to it.
 
 Upgrading from the old single-token version: the first account created adopts
 the existing token (from `READLATER_TOKEN` or `data/token.txt`) and all
@@ -157,8 +256,10 @@ works). Timestamps are epoch milliseconds.
 | `GET /api/articles?includeArchived=1` | List article metadata (no HTML) |
 | `GET /api/articles?q=…&domain=…&highlighted=1&minWords=…&maxWords=…&minHighlights=…` | Search + filters (terms AND-matched vs title/author/site/text; domain matches subdomains; `email` = emailed-in) |
 | `GET/POST /api/views`, `DELETE /api/views/{id}` | Saved filter views (shown as tabs in web + Android) |
+| `GET/POST /api/skip-rules`, `DELETE /api/skip-rules/{id}` | Boilerplate phrases dropped from future saves |
 | `POST /api/import/pdf?filename=…` | Import a PDF (raw body); text extracted into an article |
-| `GET /api/export.json` | Full backup: all articles (with HTML) + highlights |
+| `GET /api/export.json` | Full export as one JSON document: articles (with HTML), highlights, views |
+| `GET /api/export.ndjson` | Same data, line-delimited — **use this for backups** (see below) |
 | `POST /api/app.apk`, `GET /app.apk` | Upload / download the Android app build |
 | `GET /api/articles/{id}` | Full article incl. HTML |
 | `PATCH /api/articles/{id}` | Update `archived` / `favorite` / `readParagraph` |

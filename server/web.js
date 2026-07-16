@@ -12,6 +12,7 @@
 
 const crypto = require('crypto');
 const fs = require('fs');
+const skip = require('./skip'); // MIN_PHRASE_CHARS, so the UI and server agree
 
 function escapeHtml(s) {
   return String(s ?? '')
@@ -40,12 +41,29 @@ main { max-width: 46rem; margin: 0 auto; padding: 1.4rem 1.2rem 4rem; }
 h1 { font-size:1.5rem; }
 .empty { color:var(--muted); text-align:center; margin:4rem 0; font-style:italic; }
 ul.articles { list-style:none; padding:0; margin:0; }
-ul.articles li { display:flex; gap:.8rem; align-items:baseline; padding:.85rem .2rem; border-bottom:1px solid var(--line); }
+ul.articles li { display:flex; gap:.8rem; align-items:flex-start; padding:.85rem .2rem; border-bottom:1px solid var(--line); }
 ul.articles .main { flex:1; min-width:0; }
+/* og:image thumbnail, mirroring the Android list card */
+ul.articles .thumb { flex:none; width:84px; height:84px; object-fit:cover; border-radius:8px; background:var(--line); }
+@media (max-width:560px) { ul.articles .thumb { width:56px; height:56px; } }
 ul.articles .title { font-size:1.08rem; text-decoration:none; color:var(--fg); font-weight:600; }
 ul.articles .title:hover { color:var(--accent); }
 .meta { color:var(--muted); font-size:.8rem; font-family: system-ui, sans-serif; margin-top:.15rem; }
 .actions { display:flex; gap:.35rem; font-family: system-ui, sans-serif; }
+.skip-add { display:flex; gap:.4rem; margin:.6rem 0 .3rem; }
+.skip-add input { flex:1; min-width:0; padding:.35rem .5rem; border:1px solid var(--line); border-radius:6px; background:transparent; color:var(--fg); }
+ul.skip-rules { list-style:none; padding:0; margin:.5rem 0 0; }
+ul.skip-rules li { display:flex; gap:.6rem; align-items:center; padding:.35rem 0; border-bottom:1px solid var(--line); }
+ul.skip-rules .phrase { flex:1; min-width:0; color:var(--fg); overflow-wrap:anywhere; }
+/* "Never import this text" editor, opened from the reader */
+#skip-dialog, #reparse-dialog { position:fixed; inset:0; z-index:80; background:rgba(0,0,0,.45); display:flex; align-items:center; justify-content:center; padding:1rem; }
+#skip-dialog[hidden], #reparse-dialog[hidden] { display:none; }
+.reparse-actions { display:flex; flex-direction:column; gap:.4rem; }
+.reparse-actions .act { text-align:left; }
+.skip-box { background:var(--bg); border:1px solid var(--line); border-radius:10px; padding:1rem; width:min(34rem,100%); display:flex; flex-direction:column; gap:.6rem; box-shadow:0 8px 30px rgba(0,0,0,.35); }
+.skip-box textarea { width:100%; box-sizing:border-box; padding:.5rem; border:1px solid var(--line); border-radius:6px; background:transparent; color:var(--fg); font:1rem/1.4 inherit; resize:vertical; }
+.skip-actions { display:flex; gap:.4rem; justify-content:flex-end; }
+.skip-box .act[disabled] { opacity:.5; cursor:not-allowed; }
 button.act { background:none; border:1px solid var(--line); border-radius:6px; color:var(--muted); cursor:pointer; font-size:.78rem; padding:.15rem .5rem; }
 .pager { display:flex; gap:1rem; align-items:center; justify-content:center; margin:1.5rem 0; }
 .pager .act { padding:.35rem .8rem; text-decoration:none; }
@@ -97,6 +115,7 @@ form.saveview { display:flex; gap:.5rem; margin:.6rem 0 0; font-family:system-ui
 form.saveview input[name=name] { padding:.3rem .5rem; border:1px solid var(--line); border-radius:6px; background:var(--card); color:var(--fg); font-size:.85rem; }
 #hl-tip, #hl-menu { position:absolute; z-index:60; }
 #hl-tip button, #hl-menu button { background:var(--accent); color:var(--accent-fg); border:none; border-radius:6px; padding:.35rem .8rem; cursor:pointer; font:.85rem system-ui,sans-serif; box-shadow:0 2px 8px rgba(0,0,0,.25); }
+#hl-tip button + button, #hl-menu button + button { margin-left:.3rem; }
 mark[data-hl-id] { cursor:pointer; }
 /* When the panel is open on a wide screen, shrink the page so the article and
    panel are both fully visible instead of the panel overlapping the text. */
@@ -301,9 +320,13 @@ ${!searching && !savedView ? `<div class="meta">${total.toLocaleString('en-US')}
       a.readParagraph > 0 ? `¶${a.readParagraph} in progress` : null,
       hlCount ? `${hlCount} highlight${hlCount > 1 ? 's' : ''}` : null,
     ].filter(Boolean).map(escapeHtml).join(' · ');
+    const thumb = a.imageUrl && /^https?:\/\//i.test(a.imageUrl)
+      ? `<img class="thumb" src="${escapeHtml(a.imageUrl)}" alt="" loading="lazy" decoding="async" referrerpolicy="no-referrer">`
+      : '';
     return `<li data-id="${a.id}">
       <div class="main"><a class="title" href="/read/${a.id}">${escapeHtml(a.title)}</a>
       <div class="meta">${meta}</div></div>
+      ${thumb}
       <div class="actions">
         <button class="act fav" data-act="favorite" data-val="${a.favorite ? 'false' : 'true'}" title="Favorite">${a.favorite ? '★' : '☆'}</button>
         <button class="act" data-act="archive" data-val="${a.archived ? 'false' : 'true'}">${a.archived ? 'Unarchive' : 'Archive'}</button>
@@ -326,6 +349,12 @@ ${!searching && !savedView ? `<div class="meta">${total.toLocaleString('en-US')}
     : `<div class="empty">${empty}</div>`);
 
   const script = `
+// Drop thumbnails whose og:image 404s or is hotlink-blocked, rather than
+// leaving a broken-image icon. 'error' doesn't bubble, so listen on capture.
+document.addEventListener('error', (e) => {
+  if (e.target.tagName === 'IMG' && e.target.classList.contains('thumb')) e.target.remove();
+}, true);
+
 document.addEventListener('click', async (e) => {
   const dv = e.target.closest('button.del-view');
   if (dv) {
@@ -400,11 +429,12 @@ function readerPage(ctx, user, article) {
 <article class="reader">
   <header>
     <h1>${escapeHtml(article.title)}</h1>
-    <div class="meta">${meta}${meta ? ' · ' : ''}<a href="${escapeHtml(article.url)}" rel="noopener noreferrer">original ↗</a></div>
+    <div class="meta">${meta}${meta ? ' · ' : ''}<a href="/read/${escapeHtml(article.id)}/original" target="_blank" rel="noopener noreferrer">view original ↗</a></div>
     <div class="actions reader-actions">
       <button class="act fav" data-act="favorite" data-val="${article.favorite ? 'false' : 'true'}" title="Favorite">${article.favorite ? '★' : '☆'}</button>
       <button class="act" data-act="archive" data-val="${article.archived ? 'false' : 'true'}">${article.archived ? 'Unarchive' : 'Archive'}</button>
       <button class="act" id="hl-toggle">Highlights (${hls.length})</button>
+      <button class="act" id="reparse-btn" title="Re-extract this article if it was parsed wrong">Fix parsing</button>
     </div>
     <div class="meta">Select any text to highlight it.</div>
   </header>
@@ -414,8 +444,37 @@ function readerPage(ctx, user, article) {
   <div class="hl-panel-head"><strong>Highlights (${hls.length})</strong><button class="act" id="hl-close">×</button></div>
   <div class="hl-panel-body">${hls.length ? hlItems : '<div class="meta">No highlights yet. Select text in the article to add one.</div>'}</div>
 </aside>
-<div id="hl-tip" hidden><button id="hl-save">Highlight</button></div>
-<div id="hl-menu" hidden><button id="hl-menu-del">Delete highlight</button></div>`;
+<div id="hl-tip" hidden><button id="hl-save">Highlight</button><button id="skip-save" title="Drop this text from articles saved in future">Never import</button></div>
+<div id="hl-menu" hidden><button id="hl-menu-del">Delete highlight</button><button id="hl-menu-skip">Never import</button></div>
+<div id="reparse-dialog" hidden>
+  <div class="skip-box">
+    <strong>Fix parsing</strong>
+    <div class="meta">What's wrong with how this article was parsed? We'll re-extract
+    it from the original source.</div>
+    <div class="reparse-actions">
+      <button class="act" data-hint="too-short">Too short — text is missing</button>
+      <button class="act" data-hint="too-long">Too long — extra menus/ads/junk</button>
+      <button class="act" data-hint="other">Something else looks wrong</button>
+    </div>
+    <div id="reparse-msg" class="meta"></div>
+    <div class="skip-actions">
+      <button class="act" id="reparse-cancel" type="button">Cancel</button>
+    </div>
+  </div>
+</div>
+<div id="skip-dialog" hidden>
+  <div class="skip-box">
+    <strong>Never import this text</strong>
+    <div class="meta">Trim it to just the part that repeats. Paragraphs containing this
+    phrase are dropped from articles you save from now on; articles already saved keep it.</div>
+    <textarea id="skip-text" rows="4" maxlength="300"></textarea>
+    <div id="skip-dialog-msg" class="meta"></div>
+    <div class="skip-actions">
+      <button class="act" id="skip-cancel" type="button">Cancel</button>
+      <button class="act" id="skip-confirm" type="button">Add rule</button>
+    </div>
+  </div>
+</div>`;
 
   const script = `
 const ARTICLE = ${JSON.stringify(article.id)};
@@ -426,8 +485,8 @@ document.addEventListener('keydown', (e) => {
   if (e.metaKey || e.ctrlKey || e.altKey) return;
   const t = e.target;
   if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.tagName === 'SELECT' || t.isContentEditable)) return;
-  if (e.key === 'o' && ORIGINAL_URL) {
-    window.open(ORIGINAL_URL, '_blank', 'noopener');
+  if (e.key === 'o') {
+    window.open('/read/' + ARTICLE + '/original', '_blank', 'noopener');
   } else if (e.key === 'e') {
     e.preventDefault();
     fetch('/api/articles/' + ARTICLE, {
@@ -437,22 +496,70 @@ document.addEventListener('keydown', (e) => {
   }
 });
 
-// mark existing highlights in the rendered article (best-effort text match),
-// tagging each mark with its highlight id so the side panel can jump to it.
+// Anchor stored highlights onto the rendered article, tagging each mark with its
+// id so the panel can jump to it. Matching is deliberately fuzzy: a highlight
+// saved on Android carries markdown markers ("*Tribune*") and collapsed
+// whitespace the rendered HTML ("<em>Tribune</em>") lacks, and a highlight can
+// span inline elements. So we canonicalize both sides, match in canonical space,
+// map the offsets back to the DOM, and wrap the range even across text nodes.
 const HLS = ${JSON.stringify(hls.map((h) => ({ id: h.id, text: h.text })))};
 const root = document.getElementById('content');
-for (const h of HLS) {
-  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
-  let node;
-  while ((node = walker.nextNode())) {
-    const i = node.nodeValue.indexOf(h.text);
-    if (i < 0) continue;
-    const range = document.createRange();
-    range.setStart(node, i); range.setEnd(node, i + h.text.length);
-    const mark = document.createElement('mark'); mark.dataset.hlId = h.id;
-    try { range.surroundContents(mark); } catch (e) {}
-    break;
+function isWs(c) { const n = c.charCodeAt(0); return n === 32 || n === 9 || n === 10 || n === 13 || n === 160; }
+function canonChar(c) {
+  const n = c.charCodeAt(0);
+  if (n === 0x2018 || n === 0x2019 || n === 0x201B || n === 0x2032) return "'";
+  if (n === 0x201C || n === 0x201D || n === 0x201F || n === 0x2033) return '"';
+  if (n === 0x2013 || n === 0x2014 || n === 0x2212) return '-';
+  return c;
+}
+function canonNeedle(s) {
+  let out = '', prevSpace = false;
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (c === '*' || c === '_') continue; // markdown emphasis markers
+    if (isWs(c)) { if (!prevSpace && out) { out += ' '; prevSpace = true; } }
+    else { out += canonChar(c); prevSpace = false; }
   }
+  return prevSpace ? out.slice(0, -1) : out;
+}
+// Flatten root's (still-unmarked) text nodes into a canonical string, keeping a
+// map from each canonical char back to its DOM position.
+function buildIndex() {
+  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
+    acceptNode: (nd) => nd.parentElement && nd.parentElement.closest('mark[data-hl-id]')
+      ? NodeFilter.FILTER_REJECT : NodeFilter.FILTER_ACCEPT
+  });
+  const segs = [];
+  let orig = '', nd;
+  while ((nd = walker.nextNode())) { segs.push({ node: nd, start: orig.length }); orig += nd.nodeValue; }
+  let canon = '', prevSpace = false;
+  const map = [];
+  for (let i = 0; i < orig.length; i++) {
+    const c = orig[i];
+    if (isWs(c)) { if (!prevSpace && canon) { canon += ' '; map.push(i); prevSpace = true; } }
+    else { canon += canonChar(c); map.push(i); prevSpace = false; }
+  }
+  return { segs, canon, map };
+}
+function wrapRange(segs, from, to, id) {
+  for (const { node, start } of segs) {
+    const s = Math.max(from, start), e = Math.min(to, start + node.nodeValue.length);
+    if (s >= e) continue;
+    const range = document.createRange();
+    range.setStart(node, s - start);
+    range.setEnd(node, e - start);
+    const mark = document.createElement('mark');
+    mark.dataset.hlId = id;
+    try { range.surroundContents(mark); } catch (err) {}
+  }
+}
+for (const h of HLS) {
+  const needle = canonNeedle(h.text);
+  if (!needle) continue;
+  const { segs, canon, map } = buildIndex(); // rebuilt per highlight so earlier marks are excluded
+  const ci = canon.indexOf(needle);
+  if (ci < 0) continue;
+  wrapRange(segs, map[ci], map[ci + needle.length - 1] + 1, h.id);
 }
 
 // Highlights side panel: toggle (pushes the page aside), jump-to, and delete.
@@ -472,9 +579,30 @@ document.querySelectorAll('.hl-item').forEach((item) => {
   item.addEventListener('click', (e) => { if (!e.target.closest('button')) flashMark(item.dataset.hlId); });
 });
 async function deleteHighlight(id) {
-  if (!confirm('Delete this highlight?')) return;
-  await fetch('/api/highlights/' + id, { method: 'DELETE' });
-  location.reload();
+  // No confirm, no page reload: delete, then update the DOM in place.
+  const res = await fetch('/api/highlights/' + id, { method: 'DELETE' });
+  if (!res.ok) { alert('Could not delete that highlight.'); return; }
+  removeHighlightFromDom(id);
+}
+// Update the page in place instead of reloading: drop the panel row, unwrap the
+// inline mark (keeping its words), and re-count.
+function removeHighlightFromDom(id) {
+  const sel = 'mark[data-hl-id="' + CSS.escape(id) + '"]';
+  panel.querySelector('.hl-item[data-hl-id="' + CSS.escape(id) + '"]')?.remove();
+  root.querySelectorAll(sel).forEach((mark) => {
+    const parent = mark.parentNode;
+    while (mark.firstChild) parent.insertBefore(mark.firstChild, mark);
+    parent.removeChild(mark);
+    parent.normalize(); // merge the text nodes back together
+  });
+  const n = panel.querySelectorAll('.hl-item').length;
+  document.getElementById('hl-toggle').textContent = 'Highlights (' + n + ')';
+  const head = panel.querySelector('.hl-panel-head strong');
+  if (head) head.textContent = 'Highlights (' + n + ')';
+  if (n === 0) {
+    const body = panel.querySelector('.hl-panel-body');
+    if (body) body.innerHTML = '<div class="meta">No highlights yet. Select text in the article to add one.</div>';
+  }
 }
 // Panel "Delete" buttons.
 document.querySelectorAll('.hl-item .del-hl').forEach((b) => {
@@ -536,6 +664,108 @@ document.getElementById('hl-save').addEventListener('mousedown', async (e) => {
   });
   tip.hidden = true;
   location.reload();
+});
+
+// "Never import": open the phrase in an editable box, prefilled with whatever
+// text you pointed at, so you can trim it down to the bit that actually
+// repeats before committing. This article keeps the text either way — rules
+// apply to future saves only, because paragraph indices anchor the highlights
+// and reading position of anything already saved.
+const MIN_SKIP_PHRASE = ${skip.MIN_PHRASE_CHARS};
+const dlg = document.getElementById('skip-dialog');
+const dlgText = document.getElementById('skip-text');
+const dlgMsg = document.getElementById('skip-dialog-msg');
+const dlgOk = document.getElementById('skip-confirm');
+
+function refreshSkipDialog() {
+  const n = dlgText.value.trim().length;
+  dlgOk.disabled = n < MIN_SKIP_PHRASE;
+  if (n && n < MIN_SKIP_PHRASE) dlgMsg.textContent = 'Use at least ' + MIN_SKIP_PHRASE + ' characters.';
+  else if (dlgMsg.dataset.sticky !== '1') dlgMsg.textContent = '';
+}
+function openSkipDialog(text) {
+  tip.hidden = true;
+  menu.hidden = true;
+  dlgMsg.dataset.sticky = '0';
+  dlgMsg.textContent = '';
+  dlgText.value = String(text || '').replace(/\\s+/g, ' ').trim().slice(0, 300);
+  dlg.hidden = false;
+  refreshSkipDialog();
+  dlgText.focus();
+  dlgText.select();
+}
+const closeSkipDialog = () => { dlg.hidden = true; };
+
+dlgText.addEventListener('input', refreshSkipDialog);
+document.getElementById('skip-cancel').addEventListener('click', closeSkipDialog);
+dlg.addEventListener('click', (e) => { if (e.target === dlg) closeSkipDialog(); });
+document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && !dlg.hidden) closeSkipDialog(); });
+
+// ---- "Fix parsing": pick what's wrong, reparse, reload on success -----------
+const reparseDlg = document.getElementById('reparse-dialog');
+const reparseMsg = document.getElementById('reparse-msg');
+const closeReparse = () => { reparseDlg.hidden = true; };
+document.getElementById('reparse-btn').addEventListener('click', () => {
+  reparseMsg.textContent = '';
+  reparseDlg.querySelectorAll('button').forEach((b) => { b.disabled = false; });
+  reparseDlg.hidden = false;
+});
+document.getElementById('reparse-cancel').addEventListener('click', closeReparse);
+reparseDlg.addEventListener('click', (e) => { if (e.target === reparseDlg) closeReparse(); });
+document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && !reparseDlg.hidden) closeReparse(); });
+reparseDlg.querySelectorAll('[data-hint]').forEach((btn) => {
+  btn.addEventListener('click', async () => {
+    reparseDlg.querySelectorAll('button').forEach((b) => { b.disabled = true; });
+    reparseMsg.textContent = 'Reparsing… this can take a few seconds.';
+    try {
+      const res = await fetch('/api/articles/' + ARTICLE + '/reparse', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ hint: btn.dataset.hint }),
+      });
+      const d = await res.json();
+      if (d.ok) { location.reload(); return; }
+      reparseMsg.textContent = d.reason === 'no-source'
+        ? "There's no saved original to reparse this one from."
+        : "Couldn't get a better parse (" + (d.reason || 'unknown') + ').';
+    } catch (err) {
+      reparseMsg.textContent = 'Reparse failed: ' + err.message;
+    }
+    reparseDlg.querySelectorAll('button').forEach((b) => { b.disabled = false; });
+  });
+});
+
+// from a fresh selection
+document.getElementById('skip-save').addEventListener('mousedown', (e) => {
+  e.preventDefault(); // don't collapse the selection before we read it
+  openSkipDialog(String(document.getSelection()));
+});
+// from an existing highlight's menu
+document.getElementById('hl-menu-skip').addEventListener('click', (e) => {
+  e.stopPropagation();
+  const hl = HLS.find((h) => h.id === menuHlId);
+  openSkipDialog(hl ? hl.text : '');
+});
+
+dlgOk.addEventListener('click', async () => {
+  const phrase = dlgText.value.trim();
+  if (phrase.length < MIN_SKIP_PHRASE) return;
+  dlgOk.disabled = true;
+  const res = await fetch('/api/skip-rules', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ phrase }),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    dlgMsg.dataset.sticky = '1';
+    dlgMsg.textContent = data.error || 'Could not add that rule.';
+    dlgOk.disabled = false;
+    return;
+  }
+  dlgMsg.dataset.sticky = '1';
+  dlgMsg.textContent = data.existingMatches
+    ? 'Added. ' + data.existingMatches + ' article(s) you already saved contain it; those are left unchanged.'
+    : 'Added.';
+  setTimeout(closeSkipDialog, data.existingMatches ? 2200 : 800);
 });`;
   return { body, script };
 }
@@ -603,8 +833,15 @@ ${total ? `<div class="meta">${total.toLocaleString('en-US')} article${total ===
 
 function settingsPage(ctx, user, url, req) {
   const msg = url.searchParams.get('msg');
+  const rules = ctx.store.listSkipRules(user.id);
   const origin = `${(req.headers['x-forwarded-proto'] || '').split(',')[0].trim() || 'http'}://${req.headers.host || 'localhost'}`;
-  const email = ctx.INBOUND_DOMAIN ? `
+  // Two ways in: an IMAP mailbox the server polls (one shared address, so it
+  // takes precedence when configured), or a per-account alias via the
+  // inbound-email webhook.
+  const email = ctx.INBOUND_MAILBOX ? `
+  <dt>Forward articles to</dt><dd><code class="token">${escapeHtml(ctx.INBOUND_MAILBOX)}</code>
+  <div class="meta">Forward a newsletter here and it appears in your list within a couple of minutes.</div></dd>`
+    : ctx.INBOUND_DOMAIN ? `
   <dt>Email articles to</dt><dd><code class="token">${escapeHtml(user.emailAlias)}@${escapeHtml(ctx.INBOUND_DOMAIN)}</code></dd>
   <dt>Regenerate email address</dt>
   <dd class="meta">If the address starts getting spam. Newsletters subscribed with the old address will stop arriving.<br><br>
@@ -623,13 +860,63 @@ ${msg === 'alias' ? '<div class="notice">Email address regenerated — update yo
   <dt>Android app</dt>
   <dd class="meta"><a href="/app.apk">Download the Android app (APK)</a> — open this page on your phone,
   download, and tap the file to install or update.</dd>` : ''}
+  <dt>Skipped text</dt>
+  <dd class="meta">Phrases dropped from articles as they are saved — newsletter
+  sign-ups, import warnings. A paragraph containing one is removed. Existing
+  articles are never changed; select text in the reader to add a rule quickly.
+    <form id="skip-add" class="skip-add">
+      <input type="text" id="skip-phrase" placeholder="Sign up for the latest from our newsletter" maxlength="300">
+      <button class="act" type="submit">Add</button>
+    </form>
+    <div id="skip-msg" class="meta"></div>
+    ${rules.length ? `<ul class="skip-rules">${rules.map((r) => `
+      <li data-id="${escapeHtml(r.id)}">
+        <span class="phrase">${escapeHtml(r.phrase)}</span>
+        <span class="meta">${r.hits ? `removed ${r.hits}×` : 'never matched yet'}</span>
+        <button class="act del-skip" type="button">Remove</button>
+      </li>`).join('')}</ul>`
+      : '<div class="meta">No rules yet.</div>'}
+  </dd>
   <dt>Export your data</dt>
   <dd class="meta">
-    <a href="/api/export.json">Everything as JSON</a> (articles with full text + highlights) ·
+    <a href="/api/export.ndjson">Full backup (NDJSON)</a> — use this one; it streams and restores at any size ·
+    <a href="/api/export.json">as one JSON document</a> ·
     <a href="/api/highlights/export.md">Highlights as Markdown</a>
   </dd>
 </dl>`;
-  return { body, script: '' };
+
+  const script = `
+const msgEl = document.getElementById('skip-msg');
+const say = (t, bad) => { msgEl.textContent = t; msgEl.style.color = bad ? '#b3261e' : ''; };
+
+document.getElementById('skip-add').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const input = document.getElementById('skip-phrase');
+  const phrase = input.value.trim();
+  if (!phrase) return;
+  const res = await fetch('/api/skip-rules', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ phrase }),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) return say(data.error || 'could not add that rule', true);
+  input.value = '';
+  // Rules are not retroactive: say so plainly when old articles contain it.
+  say(data.existingMatches
+    ? data.existingMatches + ' existing article(s) contain this — they are left as they are. Reloading…'
+    : 'Added. Reloading…');
+  setTimeout(() => location.reload(), data.existingMatches ? 1800 : 500);
+});
+
+document.querySelectorAll('.del-skip').forEach((b) => {
+  b.addEventListener('click', async () => {
+    const li = b.closest('li[data-id]');
+    await fetch('/api/skip-rules/' + li.dataset.id, { method: 'DELETE' });
+    li.remove();
+  });
+});
+`;
+  return { body, script };
 }
 
 // ---------------------------------------------------------------- handler
@@ -741,6 +1028,34 @@ async function handle(ctx, req, res, url) {
     };
     ctx.store.insertView(v);
     return redirect(res, `/?view=v:${v.id}`);
+  }
+
+  // "View original": show the raw captured source (email HTML, extension-
+  // captured page) in a sandboxed frame — no scripts, opaque origin, so it
+  // can't run code or reach the session. Normal web articles where we kept no
+  // copy just redirect to the real URL.
+  if (req.method === 'GET' && parts[0] === 'read' && parts.length === 3 && parts[2] === 'original') {
+    const article = ctx.store.getArticle(parts[1], user.id);
+    if (!article) {
+      return send(res, 404, page({ title: 'Not found', body: '<div class="empty">No such article.</div>', user, nonce }), { nonce });
+    }
+    const source = ctx.store.getArticleSource(parts[1], user.id);
+    if (!source) {
+      if (/^https?:\/\//i.test(article.url)) { res.writeHead(302, { Location: article.url }); return res.end(); }
+      return send(res, 404, page({ title: 'No original', body: '<div class="empty">No original source was kept for this article.</div>', user, nonce }), { nonce });
+    }
+    const doc = `<!doctype html><html><head><meta charset="utf-8"><title>Original — ${escapeHtml(article.title)}</title>`
+      + `<style>body{margin:0;font-family:system-ui,sans-serif}.bar{padding:8px 12px;background:#f3efe6;color:#1a1a18;border-bottom:1px solid #d8cfbe;font-size:14px}`
+      + `.bar a{color:#3d6b52}iframe{border:0;width:100%;height:calc(100vh - 38px)}</style></head>`
+      + `<body><div class="bar">Original captured source · <a href="/read/${escapeHtml(article.id)}">← back to reader</a></div>`
+      + `<iframe sandbox="" srcdoc="${escapeHtml(source)}"></iframe></body></html>`;
+    res.writeHead(200, {
+      'Content-Type': 'text/html; charset=utf-8',
+      // No scripts anywhere; passive content (images/styles) may load so the
+      // original renders. The iframe's empty sandbox is the real guard.
+      'Content-Security-Policy': "script-src 'none'; img-src * data:; style-src * 'unsafe-inline'; font-src * data:; base-uri 'none'; form-action 'none'",
+    });
+    return res.end(doc);
   }
 
   // Android app download (uploaded to the server via POST /api/app.apk).

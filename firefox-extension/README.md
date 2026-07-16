@@ -12,11 +12,23 @@ cookies / client-side rendering) — rather than re-fetching the URL.
 ## Use
 
 - Toolbar button → **Save this page**
-- Right-click → **Save page to ReadLater**
-- Keyboard: **Alt+T**
+- Right-click a page → **Save page to Earmark**
+- Right-click a link → **Save link to Earmark** (the server fetches the target)
+- Keyboard: **Alt+D** (the toolbar tooltip shows whatever key is actually bound)
 
-A notification confirms the save; the article then appears in the Android app
-on next sync.
+The toolbar icon is the primary feedback: **…** while saving, then **✓** or
+**!**. Notifications are secondary and coalesced — saving twenty tabs raises one
+"Saved 20 articles to Earmark" toast once the burst stops, not twenty toasts.
+Failures batch the same way, deduplicated by reason. Each kind reuses a fixed
+notification id, so a new one replaces the old rather than queueing behind it.
+
+Options → **Notifications**: one summary per batch (default), only on failure,
+or never. The article appears in the Android app on the next sync.
+
+Note: `Alt+{F,E,V,S,B,T,H}` are Firefox's menubar access keys (File, Edit, View,
+History, Bookmarks, Tools, Help). Firefox swallows those before the extension
+sees them, and the match ignores Shift — so `Alt+T` and `Alt+Shift+S` both fail
+silently. Pick a letter outside that set.
 
 ## Files
 

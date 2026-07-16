@@ -48,7 +48,9 @@ data class TtsPlaybackState(
     /** True when the current audio is the server (Kokoro) voice, false for the device voice. */
     val serverVoice: Boolean = false,
     /** elapsedRealtime() at which the sleep timer will pause playback; 0 = no timer. */
-    val sleepTimerEndsAt: Long = 0L
+    val sleepTimerEndsAt: Long = 0L,
+    /** Binge mode: archive each article on completion and play the next. */
+    val autoAdvance: Boolean = false
 )
 
 /**
@@ -67,6 +69,7 @@ class TtsService : Service() {
         const val ACTION_STOP = "com.readlater.app.tts.action.STOP"
         const val ACTION_SET_POSITION = "com.readlater.app.tts.action.SET_POSITION"
         const val ACTION_SET_SLEEP_TIMER = "com.readlater.app.tts.action.SET_SLEEP_TIMER"
+        const val ACTION_TOGGLE_AUTO_ADVANCE = "com.readlater.app.tts.action.TOGGLE_AUTO_ADVANCE"
 
         const val EXTRA_ARTICLE_ID = "articleId"
         const val EXTRA_START_PARAGRAPH = "startParagraph"
@@ -120,6 +123,15 @@ class TtsService : Service() {
     private var blocks: List<Block> = emptyList()
     private var currentIndex = 0
     private var isPlaying = false
+
+    // Auto-advance ("binge"): when on, finishing an article archives it and
+    // plays the next inbox article, chaining until the user stops. Survives
+    // pause/resume and the hop between articles; cleared only by Stop.
+    private var autoAdvance = false
+    // elapsedRealtime() when the current paragraph began playing — lets a
+    // double-tap highlight tell "just crossed into this paragraph" from
+    // "well into it" without per-word position tracking.
+    private var paragraphStartedAtMs = 0L
 
     /** Estimated speech duration of each block at the current rate (ms). */
     private var blockDurationsMs: LongArray = LongArray(0)
@@ -208,6 +220,7 @@ class TtsService : Service() {
             ACTION_STOP -> handleStop()
             ACTION_SET_POSITION -> handleSetPosition(intent)
             ACTION_SET_SLEEP_TIMER -> handleSetSleepTimer(intent.getIntExtra(EXTRA_SLEEP_MINUTES, 0))
+            ACTION_TOGGLE_AUTO_ADVANCE -> handleToggleAutoAdvance()
             // System-delivered media buttons (MediaButtonReceiver in the
             // manifest) route into the session callback.
             Intent.ACTION_MEDIA_BUTTON -> MediaButtonReceiver.handleIntent(mediaSession, intent)
@@ -309,6 +322,7 @@ class TtsService : Service() {
                 return@launch
             }
             articleId = article.id
+            disarmArchive() // a pending confirmation never carries to a new article
             // Make this the cold-start resume target: if the process is killed
             // while listening, reopening returns to this article.
             app.settings.lastArticleId = article.id
@@ -360,18 +374,29 @@ class TtsService : Service() {
         isPlaying = false
         playToken++          // invalidate any pending watchdog
         cancelAudioWatchdog()
-        if (!usingSpeakFallback && audioTrack != null) {
-            // remember the exact position so resume continues mid-sentence
-            if (deviceStreamMode) {
-                val head = (audioTrack?.playbackHeadPosition?.toLong() ?: 0L) and 0xFFFFFFFFL
-                val b = synchronized(deviceBoundaries) { deviceBoundaries.lastOrNull { it.first <= head } }
-                if (b != null) {
-                    currentIndex = b.second
-                    resumePositionMs = b.third + ((head - b.first) * 1000 / trackSampleRate).toInt()
-                } else resumePositionMs = 0
+        if (!usingSpeakFallback) {
+            // Capture the exact position so resume continues mid-sentence — but
+            // only if the player is wired up. The opus (cloud) path assigns
+            // audioTrack asynchronously, so it can briefly be null while the
+            // decode thread is already playing; fall back to the current block.
+            if (audioTrack != null) {
+                if (deviceStreamMode) {
+                    val head = (audioTrack?.playbackHeadPosition?.toLong() ?: 0L) and 0xFFFFFFFFL
+                    val b = synchronized(deviceBoundaries) { deviceBoundaries.lastOrNull { it.first <= head } }
+                    if (b != null) {
+                        currentIndex = b.second
+                        resumePositionMs = b.third + ((head - b.first) * 1000 / trackSampleRate).toInt()
+                    } else resumePositionMs = 0
+                } else {
+                    resumePositionMs = trackPositionMs()
+                }
             } else {
-                resumePositionMs = trackPositionMs()
+                resumePositionMs = msForBlock(currentIndex)
             }
+            // ALWAYS tear down the player. releasePlayer() bumps playThreadGen,
+            // which is the only thing that stops a running server-stream thread.
+            // Gating this on audioTrack != null (as before) let the cloud decode
+            // thread keep playing past a pause, so resume jumped ahead.
             releasePlayer()
         } else {
             tts?.stop() // fallback speak(): position is lost, resume re-speaks
@@ -455,9 +480,24 @@ class TtsService : Service() {
 
     /** Estimated characters spoken per second at 1.0× rate (≈180 wpm). */
     private val baseCharsPerSecond = 15f
+    /** Rough characters per word (incl. trailing space) for word estimates. */
+    private val avgCharsPerWord = 6f
+    /** Double-tap this far into a new paragraph → the user means the one that
+     *  just finished, so highlight the previous paragraph instead. */
+    private val prevParagraphWordWindow = 7
+    /** Past this fraction of an article, one triple-tap archives (no confirm). */
+    private val nearEndFraction = 0.8f
 
     private var lastButtonAt = 0L
     private val buttonDebounceMs = 500L
+
+    // Archive-and-next is destructive and easy to trigger by accident, so it
+    // needs two triple-taps: the first arms it, the second within the window
+    // commits. Armed against a specific article — if playback has since moved
+    // on, the stale arm must not archive whatever is playing now.
+    private val archiveConfirmWindowMs = 5_000L
+    private var archiveArmedFor: String? = null
+    private var archiveArmedAt = 0L
 
     private fun isOurMediaKey(code: Int) = code == KeyEvent.KEYCODE_HEADSETHOOK ||
         code == KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE ||
@@ -469,7 +509,8 @@ class TtsService : Service() {
     /** Dispatch a media key with debounce so a single physical tap (which some
      *  Bluetooth earbuds deliver more than once) doesn't toggle twice. On the
      *  Pixel Buds a single tap is play/pause, double tap is NEXT (→ highlight),
-     *  and triple tap is PREVIOUS (→ archive and play the next article). */
+     *  and triple tap is PREVIOUS (→ archive and play the next article, which
+     *  takes two triple-taps within five seconds). */
     private fun dispatchMediaKey(code: Int) {
         val now = android.os.SystemClock.elapsedRealtime()
         if (now - lastButtonAt < buttonDebounceMs) {
@@ -483,8 +524,52 @@ class TtsService : Service() {
             KeyEvent.KEYCODE_MEDIA_PLAY -> if (!isPlaying) handleResume()
             KeyEvent.KEYCODE_MEDIA_PAUSE -> if (isPlaying) handlePause()
             KeyEvent.KEYCODE_MEDIA_NEXT -> handleHighlightCurrent()
-            KeyEvent.KEYCODE_MEDIA_PREVIOUS -> handleArchiveAndNext()
+            KeyEvent.KEYCODE_MEDIA_PREVIOUS -> handleArchiveAndNextConfirmed()
         }
+    }
+
+    /**
+     * Triple headset tap. The first one arms; a second within
+     * [archiveConfirmWindowMs] archives and advances. Anything else — a
+     * different article, or the window lapsing — silently disarms, so a stray
+     * triple-tap in your pocket costs nothing.
+     */
+    private fun handleArchiveAndNextConfirmed() {
+        val id = articleId ?: return
+        // Near the end you're effectively done, so a single triple-tap archives
+        // without the confirmation — the accidental-skip risk it guards against
+        // barely applies when there's little left to lose.
+        if (playbackProgress() >= nearEndFraction) {
+            disarmArchive()
+            handleArchiveAndNext()
+            return
+        }
+        val now = android.os.SystemClock.elapsedRealtime()
+        val armed = archiveArmedFor == id && now - archiveArmedAt <= archiveConfirmWindowMs
+        if (armed) {
+            disarmArchive()
+            handleArchiveAndNext()
+        } else {
+            archiveArmedFor = id
+            archiveArmedAt = now
+            Toast.makeText(this, "Triple-tap again to archive & skip", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    /** Record that a new paragraph just started playing (for #3's word estimate). */
+    private fun markParagraphStart() { paragraphStartedAtMs = android.os.SystemClock.elapsedRealtime() }
+
+    /** Fraction of the article listened so far (0..1), by paragraph position. */
+    private fun playbackProgress(): Float {
+        if (speakableBlocks.isEmpty()) return 0f
+        val pos = speakableBlocks.indexOf(currentIndex).coerceAtLeast(0)
+        return (pos + 1).toFloat() / speakableBlocks.size
+    }
+
+    /** Forget any pending archive confirmation (window lapsed, or we moved on). */
+    private fun disarmArchive() {
+        archiveArmedFor = null
+        archiveArmedAt = 0L
     }
 
     /** Skip forward by roughly 30 seconds of estimated speech, paragraph-granular. */
@@ -511,9 +596,39 @@ class TtsService : Service() {
     /** Save the currently spoken paragraph as a highlight (double headset tap). */
     private fun handleHighlightCurrent() {
         val id = articleId ?: return
-        val text = blocks.getOrNull(currentIndex)?.let { speakableText(it) } ?: return
-        app.repository.addHighlight(id, text, null, currentIndex)
-        Toast.makeText(this, "Paragraph highlighted", Toast.LENGTH_SHORT).show()
+        // If we only just crossed into the current paragraph, the user almost
+        // certainly meant the one that just finished — highlight that instead.
+        val target = if (wordsIntoCurrentParagraph() < prevParagraphWordWindow) {
+            prevSpeakable(currentIndex - 1) ?: currentIndex
+        } else currentIndex
+        val text = blocks.getOrNull(target)?.let { speakableText(it) } ?: return
+        // A short beat before committing, as requested — makes the gesture feel
+        // deliberate. The target is captured now, so a paragraph advancing in
+        // the meantime doesn't change what gets highlighted.
+        mainHandler.postDelayed({
+            app.repository.addHighlight(id, text, null, target)
+            Toast.makeText(
+                this,
+                if (target != currentIndex) "Previous paragraph highlighted" else "Paragraph highlighted",
+                Toast.LENGTH_SHORT
+            ).show()
+        }, 250)
+    }
+
+    /** Estimated words spoken so far within the current paragraph. Uses exact
+     *  playback ms for the server voice; falls back to elapsed wall-time since
+     *  the paragraph began for the device voice. */
+    private fun wordsIntoCurrentParagraph(): Float {
+        val rate = if (serverMode) app.settings.serverSpeechRate else app.settings.ttsSpeechRate
+        val msInto = if (serverMode && serverOffsetsMs.isNotEmpty()) {
+            (trackPositionMs() - msForBlock(currentIndex)).coerceAtLeast(0)
+        } else if (isPlaying && paragraphStartedAtMs > 0) {
+            (android.os.SystemClock.elapsedRealtime() - paragraphStartedAtMs).toInt().coerceAtLeast(0)
+        } else {
+            return Float.MAX_VALUE // unknown → treat as "well into it", highlight current
+        }
+        val chars = msInto / 1000f * baseCharsPerSecond * rate
+        return chars / avgCharsPerWord
     }
 
     /** Archive the current article and advance to the next inbox article, playing
@@ -536,6 +651,36 @@ class TtsService : Service() {
                 handleStop()
             }
         }
+    }
+
+    /** An article finished playing on its own. In auto-advance ("binge") mode,
+     *  archive it and roll on to the next inbox article; otherwise reset to the
+     *  top and stop. This is the single choke point every completion path uses. */
+    private fun handleArticleComplete() {
+        if (autoAdvance) {
+            logDbg("auto-advance: article complete → archive & next")
+            handleArchiveAndNext() // keeps autoAdvance on; stops if the inbox is empty
+        } else {
+            currentIndex = 0
+            handleStop()
+        }
+    }
+
+    /** Toggle binge mode. Turning it on while playing just arms the archive-on-
+     *  complete behavior; turning it on while idle also starts playback. */
+    private fun handleToggleAutoAdvance() {
+        autoAdvance = !autoAdvance
+        Toast.makeText(
+            this,
+            if (autoAdvance) "Auto-advance on — archives & plays the next when each finishes"
+            else "Auto-advance off",
+            Toast.LENGTH_SHORT
+        ).show()
+        if (autoAdvance && !isPlaying) {
+            if (articleId != null) handleResume()
+        }
+        publishState()
+        updateNotification()
     }
 
     /** Move the listening position without changing play/pause state —
@@ -576,6 +721,8 @@ class TtsService : Service() {
 
     private fun handleStop() {
         isPlaying = false
+        disarmArchive()
+        autoAdvance = false // Stop is the "user intervenes" that ends a binge
         tts?.stop()
         mainHandler.removeCallbacks(sleepRunnable)
         sleepTimerEndsAt = 0L
@@ -711,7 +858,8 @@ class TtsService : Service() {
     // headset media buttons to Earmark instead of the last music app. Pause/
     // resume seeks by byte offset for true mid-sentence resume. If a file can't
     // be parsed/played we fall back to speak() (audio works, buttons may not).
-    private var audioTrack: android.media.AudioTrack? = null
+    // Read on the main thread (handlePause), written on the opus decode thread.
+    @Volatile private var audioTrack: android.media.AudioTrack? = null
     private var playThread: Thread? = null
     @Volatile private var playThreadGen = 0
     private var trackSampleRate = 22050
@@ -721,6 +869,12 @@ class TtsService : Service() {
     private var preparedIdx = -1
     private val readyFiles = mutableSetOf<Int>()
     private val synthesizing = mutableSetOf<Int>()
+    // A block whose text exceeds the engine's input limit is synthesized in
+    // pieces (see chunkForSynthesis) and the piece WAVs are joined into the one
+    // tts-<idx>.wav the rest of the pipeline expects. These track how many
+    // pieces a block was split into and how many have come back.
+    private val synthPartTotal = mutableMapOf<Int, Int>()
+    private val synthPartDone = mutableMapOf<Int, Int>()
     private var awaitingIdx = -1
     private var awaitingFromMs = 0
     private var resumePositionMs = 0
@@ -740,6 +894,115 @@ class TtsService : Service() {
     @Volatile private var deviceAudibleFromMs = 0
 
     private fun synthFile(idx: Int) = java.io.File(cacheDir, "tts-$idx.wav")
+    private fun synthPartFile(idx: Int, k: Int) = java.io.File(cacheDir, "tts-$idx.p$k.wav")
+
+    /** Android's TextToSpeech rejects input longer than getMaxSpeechInputLength()
+     *  (4000 on every shipping engine); the call returns ERROR and nothing plays.
+     *  A newsletter that parses into one big block hits exactly this, which looked
+     *  like "TTS stops after a paragraph or two." Keep a margin under the limit. */
+    private val maxSynthChars = 3500
+
+    /** Split [text] into <= maxSynthChars pieces, preferring sentence boundaries
+     *  and falling back to word boundaries for a single runaway sentence. Short
+     *  text (the common case) returns a single piece unchanged. */
+    private fun chunkForSynthesis(text: String): List<String> {
+        if (text.length <= maxSynthChars) return listOf(text)
+        val chunks = mutableListOf<String>()
+        val cur = StringBuilder()
+        fun flush() { if (cur.isNotBlank()) { chunks.add(cur.toString().trim()); cur.setLength(0) } }
+        val sentences = Regex("[^.!?]+[.!?]+\\s*|[^.!?]+$").findAll(text).map { it.value }.toList()
+            .ifEmpty { listOf(text) }
+        for (s in sentences) {
+            if (s.length > maxSynthChars) {
+                // A single sentence longer than the limit: hard-split on spaces.
+                flush()
+                var rest = s
+                while (rest.length > maxSynthChars) {
+                    val cut = rest.lastIndexOf(' ', maxSynthChars).let { if (it <= 0) maxSynthChars else it }
+                    chunks.add(rest.substring(0, cut).trim())
+                    rest = rest.substring(cut)
+                }
+                if (rest.isNotBlank()) cur.append(rest)
+            } else {
+                if (cur.length + s.length > maxSynthChars) flush()
+                cur.append(s)
+            }
+        }
+        flush()
+        return chunks.ifEmpty { listOf(text.take(maxSynthChars)) }
+    }
+
+    /** Concatenate the piece WAVs of a split block (see synthesize) into the
+     *  single tts-<idx>.wav the streamer plays. Runs off the main thread — several
+     *  MB of PCM. Returns false (→ speak fallback) if any piece is unreadable. */
+    private fun concatWavParts(idx: Int, total: Int): Boolean {
+        return try {
+            var sampleRate = 0
+            var channels = 0
+            val pcm = java.io.ByteArrayOutputStream()
+            for (k in 0 until total) {
+                val info = parseWav(synthPartFile(idx, k)) ?: return false
+                if (sampleRate == 0) { sampleRate = info.sampleRate; channels = info.channels }
+                java.io.RandomAccessFile(synthPartFile(idx, k), "r").use { raf ->
+                    raf.seek(info.dataOffset)
+                    var remaining = info.dataLen
+                    val buf = ByteArray(64 * 1024)
+                    while (remaining > 0) {
+                        val n = raf.read(buf, 0, minOf(buf.size.toLong(), remaining).toInt())
+                        if (n <= 0) break
+                        pcm.write(buf, 0, n)
+                        remaining -= n
+                    }
+                }
+            }
+            if (sampleRate == 0 || pcm.size() == 0) return false
+            writeWav(synthFile(idx), pcm.toByteArray(), sampleRate, channels)
+            for (k in 0 until total) synthPartFile(idx, k).delete()
+            true
+        } catch (e: Exception) { logDbg("concat err: ${e.message}"); false }
+    }
+
+    /** Write 16-bit PCM out as a mono/stereo WAV. */
+    private fun writeWav(file: java.io.File, pcm: ByteArray, sampleRate: Int, channels: Int) {
+        fun i32(v: Int) = byteArrayOf(
+            (v and 0xff).toByte(), ((v shr 8) and 0xff).toByte(),
+            ((v shr 16) and 0xff).toByte(), ((v shr 24) and 0xff).toByte()
+        )
+        fun i16(v: Int) = byteArrayOf((v and 0xff).toByte(), ((v shr 8) and 0xff).toByte())
+        java.io.FileOutputStream(file).use { out ->
+            out.write("RIFF".toByteArray(Charsets.US_ASCII)); out.write(i32(36 + pcm.size))
+            out.write("WAVE".toByteArray(Charsets.US_ASCII))
+            out.write("fmt ".toByteArray(Charsets.US_ASCII)); out.write(i32(16)); out.write(i16(1))
+            out.write(i16(channels)); out.write(i32(sampleRate))
+            out.write(i32(sampleRate * channels * 2)); out.write(i16(channels * 2)); out.write(i16(16))
+            out.write("data".toByteArray(Charsets.US_ASCII)); out.write(i32(pcm.size)); out.write(pcm)
+        }
+    }
+
+    /** All pieces of a split block are back — join them and hand off exactly like
+     *  a single-shot synth would. */
+    private fun onSynthPartDone(idx: Int) {
+        val total = synthPartTotal[idx] ?: return
+        val done = (synthPartDone[idx] ?: 0) + 1
+        synthPartDone[idx] = done
+        if (done < total) return
+        synthPartDone.remove(idx)
+        synthPartTotal.remove(idx)
+        Thread {
+            val ok = concatWavParts(idx, total)
+            mainHandler.post {
+                synthesizing.remove(idx)
+                if (ok && synthFile(idx).length() > 128) {
+                    readyFiles.add(idx)
+                    logDbg("synth done (joined $total) idx=$idx (${synthFile(idx).length()} bytes)")
+                    if (idx == awaitingIdx && isPlaying) { awaitingIdx = -1; startFilePlayback(idx, awaitingFromMs) }
+                } else {
+                    logDbg("synth join FAILED idx=$idx")
+                    if (idx == awaitingIdx && isPlaying) { awaitingIdx = -1; beginSpeakFallback("join failed") }
+                }
+            }
+        }.also { it.isDaemon = true }.start()
+    }
 
     // --- Server voice (Kokoro): one downloaded WAV for the whole article,
     // played continuously; playback time maps to app paragraphs via the
@@ -836,6 +1099,8 @@ class TtsService : Service() {
         discardPlayer()
         readyFiles.clear()
         synthesizing.clear()
+        synthPartTotal.clear()
+        synthPartDone.clear()
         awaitingIdx = -1
         usingSpeakFallback = false
         fallbackToasted = false
@@ -858,7 +1123,15 @@ class TtsService : Service() {
             mainHandler.post {
                 when {
                     id.startsWith("synth-") -> {
-                        val idx = id.removePrefix("synth-").toIntOrNull() ?: return@post
+                        val rest = id.removePrefix("synth-")
+                        // "synth-<idx>-<k>" is one piece of a split block; wait
+                        // for onSynthPartDone to join them. "synth-<idx>" is the
+                        // single-shot form.
+                        if (rest.contains('-')) {
+                            onSynthPartDone(rest.substringBefore('-').toIntOrNull() ?: return@post)
+                            return@post
+                        }
+                        val idx = rest.toIntOrNull() ?: return@post
                         synthesizing.remove(idx)
                         val f = synthFile(idx)
                         if (f.exists() && f.length() > 128) {
@@ -871,7 +1144,10 @@ class TtsService : Service() {
                         }
                     }
                     id.startsWith("spk-") -> {
-                        val idx = id.removePrefix("spk-").toIntOrNull() ?: return@post
+                        val rest = id.removePrefix("spk-")
+                        // "spk-<idx>-<k>" is a non-final piece — don't advance yet.
+                        if (rest.contains('-')) return@post
+                        val idx = rest.toIntOrNull() ?: return@post
                         if (usingSpeakFallback && isPlaying && idx == currentIndex) {
                             logDbg("done (fallback) idx=$idx")
                             advanceAndSpeak()
@@ -885,8 +1161,12 @@ class TtsService : Service() {
             val id = utteranceId ?: return
             mainHandler.post {
                 if (id.startsWith("synth-")) {
-                    val idx = id.removePrefix("synth-").toIntOrNull() ?: return@post
+                    // Covers both "synth-<idx>" and a piece "synth-<idx>-<k>":
+                    // any piece failing fails the whole block (→ speak fallback).
+                    val idx = id.removePrefix("synth-").substringBefore('-').toIntOrNull() ?: return@post
                     synthesizing.remove(idx)
+                    synthPartTotal.remove(idx)
+                    synthPartDone.remove(idx)
                     logDbg("synth ERROR idx=$idx")
                     if (idx == awaitingIdx && isPlaying) { awaitingIdx = -1; beginSpeakFallback("synth error") }
                 } else if (id.startsWith("spk-") && isPlaying) {
@@ -908,8 +1188,7 @@ class TtsService : Service() {
             // Genuinely finished the article. Reset the listening position so a
             // replay starts from the top rather than the last paragraph.
             logDbg("article complete at idx=$currentIndex / ${blocks.size} blocks")
-            currentIndex = 0
-            handleStop()
+            handleArticleComplete()
         } else {
             currentIndex = next
             articleId?.let { app.repository.saveTtsPositionLocal(it, next) }
@@ -932,6 +1211,7 @@ class TtsService : Service() {
         val idx = nextSpeakable(currentIndex) ?: run { handleStop(); return }
         currentIndex = idx
         resumePositionMs = 0
+        markParagraphStart()
         playParagraph(idx, 0)
     }
 
@@ -981,12 +1261,33 @@ class TtsService : Service() {
         val text = synthTextFor(idx) ?: return
         synthesizing.add(idx)
         engine.setSpeechRate(app.settings.ttsSpeechRate)
-        logDbg("synth queue idx=$idx (${text.length} chars) engine=${initializedEngine ?: "system"}")
-        val res = engine.synthesizeToFile(text, android.os.Bundle(), synthFile(idx), "synth-$idx")
-        if (res != TextToSpeech.SUCCESS) {
-            synthesizing.remove(idx)
-            logDbg("synth REJECTED idx=$idx code=$res")
-            if (idx == awaitingIdx) beginSpeakFallback("synth rejected")
+        val chunks = chunkForSynthesis(text)
+        if (chunks.size == 1) {
+            logDbg("synth queue idx=$idx (${text.length} chars) engine=${initializedEngine ?: "system"}")
+            val res = engine.synthesizeToFile(text, android.os.Bundle(), synthFile(idx), "synth-$idx")
+            if (res != TextToSpeech.SUCCESS) {
+                synthesizing.remove(idx)
+                logDbg("synth REJECTED idx=$idx code=$res")
+                if (idx == awaitingIdx) beginSpeakFallback("synth rejected")
+            }
+            return
+        }
+        // Oversized block: synthesize each piece to its own file; onSynthPartDone
+        // joins them once all pieces are back. Piece ids are "synth-<idx>-<k>";
+        // the un-suffixed "synth-<idx>" stays the single-shot form.
+        logDbg("synth queue idx=$idx in ${chunks.size} pieces (${text.length} chars) engine=${initializedEngine ?: "system"}")
+        synthPartTotal[idx] = chunks.size
+        synthPartDone[idx] = 0
+        for ((k, chunk) in chunks.withIndex()) {
+            val res = engine.synthesizeToFile(chunk, android.os.Bundle(), synthPartFile(idx, k), "synth-$idx-$k")
+            if (res != TextToSpeech.SUCCESS) {
+                synthesizing.remove(idx)
+                synthPartTotal.remove(idx)
+                synthPartDone.remove(idx)
+                logDbg("synth piece REJECTED idx=$idx k=$k code=$res")
+                if (idx == awaitingIdx) beginSpeakFallback("synth piece rejected")
+                return
+            }
         }
     }
 
@@ -1138,6 +1439,7 @@ class TtsService : Service() {
                                         if (myGen == playThreadGen && isPlaying && deviceStreamMode) {
                                             currentIndex = b.second
                                             preparedIdx = b.second
+                                            markParagraphStart()
                                             articleId?.let { app.repository.saveTtsPositionLocal(it, b.second) }
                                             publishState(); updateNotification()
                                         }
@@ -1163,8 +1465,7 @@ class TtsService : Service() {
                             if (myGen == playThreadGen) mainHandler.post {
                                 if (myGen == playThreadGen && isPlaying && deviceStreamMode) {
                                     logDbg("stream complete at idx=$para (${writtenFrames} frames)")
-                                    currentIndex = 0
-                                    handleStop()
+                                    handleArticleComplete()
                                 }
                             }
                             return@Thread
@@ -1341,8 +1642,7 @@ class TtsService : Service() {
                     if (myGen == playThreadGen) mainHandler.post {
                         if (myGen == playThreadGen && isPlaying && serverMode) {
                             logDbg("server complete (${bytesWritten}B)")
-                            currentIndex = 0
-                            handleStop()
+                            handleArticleComplete()
                         }
                     }
                 } catch (e: Exception) {
@@ -1412,10 +1712,13 @@ class TtsService : Service() {
                 val frameBytes = channels * 2
                 val speed = app.settings.serverSpeechRate
                 applyTrackSpeed(track, speed)
+                // Publish the track BEFORE playing, so a pause arriving during
+                // opus startup can find and release it (audioTrack is @Volatile).
+                // The WAV path already does this synchronously; opus must too.
+                audioTrack = track
                 track.play()
                 mainHandler.post {
                     if (myGen == playThreadGen && isPlaying && serverMode) {
-                        audioTrack = track
                         audioStarted = true
                         cancelAudioWatchdog()
                         logDbg("playing (server opus) sr=$sampleRate ch=$channels from=${fromMs}ms speed=$speed")
@@ -1486,8 +1789,7 @@ class TtsService : Service() {
                 if (myGen == playThreadGen && sawOutputEOS) mainHandler.post {
                     if (myGen == playThreadGen && isPlaying && serverMode) {
                         logDbg("server opus complete (${bytesWritten}B)")
-                        currentIndex = 0
-                        handleStop()
+                        handleArticleComplete()
                     }
                 }
             } catch (e: Exception) {
@@ -1501,7 +1803,10 @@ class TtsService : Service() {
                 runCatching { codec?.stop() }; runCatching { codec?.release() }
                 runCatching { extractor?.release() }
                 runCatching { fis?.close() }
-                // the AudioTrack is owned by audioTrack/releasePlayer, not the thread
+                // Normally releasePlayer() owns audioTrack. But if a pause raced
+                // startup and released a different (or null) reference, this
+                // track is orphaned — release it here so it can't keep playing.
+                if (audioTrack !== track) runCatching { track?.pause(); track?.flush(); track?.release() }
             }
         }.also { it.isDaemon = true; it.start() }
     }
@@ -1526,12 +1831,20 @@ class TtsService : Service() {
         audioStarted = false
         playToken++
         engine.setSpeechRate(app.settings.ttsSpeechRate)
-        logDbg("speak (fallback) idx=$idx")
-        val res = engine.speak(text, TextToSpeech.QUEUE_FLUSH, null, "spk-$idx")
-        if (res != TextToSpeech.SUCCESS) {
-            logDbg("fallback speak REJECTED code=$res")
-            failEngineAndRetry("The voice engine rejected the request")
-            return
+        // Same input-length limit applies to speak(); split long blocks and queue
+        // the pieces. Only the last piece carries the un-suffixed "spk-<idx>" id
+        // that advances to the next paragraph.
+        val chunks = chunkForSynthesis(text)
+        logDbg("speak (fallback) idx=$idx pieces=${chunks.size}")
+        for ((k, chunk) in chunks.withIndex()) {
+            val mode = if (k == 0) TextToSpeech.QUEUE_FLUSH else TextToSpeech.QUEUE_ADD
+            val uttId = if (k == chunks.size - 1) "spk-$idx" else "spk-$idx-$k"
+            val res = engine.speak(chunk, mode, null, uttId)
+            if (res != TextToSpeech.SUCCESS) {
+                logDbg("fallback speak REJECTED code=$res")
+                failEngineAndRetry("The voice engine rejected the request")
+                return
+            }
         }
         armAudioWatchdog(playToken)
         publishState(); updatePlaybackState(); updateNotification()
@@ -1617,7 +1930,7 @@ class TtsService : Service() {
     // ------------------------------------------------------------------ state
 
     private fun publishState() {
-        stateFlow.value = TtsPlaybackState(articleId, currentIndex, isPlaying, isPlaying && !audioStarted, serverMode, sleepTimerEndsAt)
+        stateFlow.value = TtsPlaybackState(articleId, currentIndex, isPlaying, isPlaying && !audioStarted, serverMode, sleepTimerEndsAt, autoAdvance)
     }
 
     private fun updatePlaybackState() {

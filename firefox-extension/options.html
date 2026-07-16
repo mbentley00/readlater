@@ -41,6 +41,14 @@
   </div>
   <div id="status"></div>
 
+  <label for="notifyMode">Notifications</label>
+  <select id="notifyMode">
+    <option value="summary">One summary per batch of saves</option>
+    <option value="errors">Only when a save fails</option>
+    <option value="none">Never (toolbar badge only)</option>
+  </select>
+  <div class="hint">The toolbar icon always shows … while saving, then ✓ or !.</div>
+
   <details>
     <summary>Advanced: use an API token directly</summary>
     <label for="token">API token</label>

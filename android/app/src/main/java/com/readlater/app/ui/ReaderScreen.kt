@@ -3,10 +3,16 @@ package com.readlater.app.ui
 import android.content.Context
 import android.content.Intent
 import android.net.Uri
+import android.webkit.WebView
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.combinedClickable
+import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
+import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.text.TextLayoutResult
 import androidx.compose.foundation.interaction.DragInteraction
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -23,6 +29,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.material.icons.Icons
@@ -31,6 +38,8 @@ import androidx.compose.material.icons.automirrored.filled.PlaylistPlay
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Archive
 import androidx.compose.material.icons.filled.Bedtime
+import androidx.compose.material.icons.filled.Block
+import androidx.compose.material.icons.filled.Build
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.MyLocation
@@ -91,6 +100,9 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.viewinterop.AndroidView
+import androidx.compose.ui.window.Dialog
+import androidx.compose.ui.window.DialogProperties
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontStyle
@@ -110,11 +122,32 @@ import kotlinx.coroutines.launch
 import java.util.Locale
 import kotlin.math.roundToInt
 
+/**
+ * The LazyColumn renders the article header as item 0, so paragraph N is list
+ * item N + 1. Paragraph indices (readParagraph, ttsParagraph, highlight
+ * anchors) live in *block* space; the list scrolls in *item* space. Always
+ * convert — mixing the two is why "go to reading position" landed a paragraph
+ * early, and why paragraph 0 scrolled to the header and pushed the paragraph
+ * itself to the bottom of the screen.
+ */
+private const val HEADER_ITEMS = 1
+
+private fun blockToItem(block: Int) = block + HEADER_ITEMS
+private fun itemToBlock(item: Int) = (item - HEADER_ITEMS).coerceAtLeast(0)
+
+private suspend fun LazyListState.scrollToBlock(block: Int) = scrollToItem(blockToItem(block))
+private suspend fun LazyListState.animateScrollToBlock(block: Int) =
+    animateScrollToItem(blockToItem(block))
+
 /** What the reader's bottom sheet is currently showing. */
 private sealed class SheetTarget {
     data class Create(val index: Int, val text: String) : SheetTarget()
     data class View(val index: Int) : SheetTarget()
 }
+
+/** A sub-paragraph highlight the user is building by press-hold-dragging across
+ *  words. `start` until `end` are character offsets into block `block`'s text. */
+private data class WordSelection(val block: Int, val start: Int, val end: Int, val text: String)
 
 private fun sendTtsCommand(
     context: Context,
@@ -196,11 +229,20 @@ fun ReaderScreen(articleId: String, onBack: () -> Unit, onOpenArticle: (String) 
         if (!didInitialScroll && blocks.isNotEmpty()) {
             val read = (article?.readParagraph ?: 0).coerceIn(0, blocks.size - 1)
             val tts = (article?.ttsParagraph ?: 0).coerceIn(0, blocks.size - 1)
-            if (read > 0 && tts > 0 && kotlin.math.abs(read - tts) > 2) {
-                listState.scrollToItem(minOf(read, tts))
-                resumeChoice = read to tts
-            } else {
-                listState.scrollToItem(maxOf(read, tts))
+            when {
+                // Already listening to this article — never interrupt with the
+                // chooser. This fires when you switch to another app mid-listen
+                // (the Activity is torn down and recreated) and come back while
+                // playback is still running; just land on the spoken paragraph
+                // and follow along.
+                isTtsThisArticle && ttsState.isPlaying -> {
+                    listState.scrollToBlock(ttsState.paragraphIndex.coerceIn(0, blocks.size - 1))
+                }
+                read > 0 && tts > 0 && kotlin.math.abs(read - tts) > 2 -> {
+                    listState.scrollToBlock(minOf(read, tts))
+                    resumeChoice = read to tts
+                }
+                else -> listState.scrollToBlock(maxOf(read, tts))
             }
             didInitialScroll = true
         }
@@ -211,7 +253,7 @@ fun ReaderScreen(articleId: String, onBack: () -> Unit, onOpenArticle: (String) 
         if (followTts && isTtsThisArticle && ttsState.isPlaying &&
             ttsState.paragraphIndex in blocks.indices
         ) {
-            listState.animateScrollToItem(ttsState.paragraphIndex)
+            listState.animateScrollToBlock(ttsState.paragraphIndex)
         }
     }
 
@@ -221,12 +263,12 @@ fun ReaderScreen(articleId: String, onBack: () -> Unit, onOpenArticle: (String) 
     // TTS keeps its own separate position.
     LaunchedEffect(didInitialScroll, isTtsThisArticle, ttsState.isPlaying, followTts) {
         if (!didInitialScroll || (isTtsThisArticle && ttsState.isPlaying && followTts)) return@LaunchedEffect
-        snapshotFlow { listState.firstVisibleItemIndex }
+        snapshotFlow { itemToBlock(listState.firstVisibleItemIndex) }
             .distinctUntilChanged()
             .debounce(800)
-            .collect { index ->
+            .collect { block ->
                 if (currentBlocks.isNotEmpty()) {
-                    repo.saveReadPositionLocal(articleId, index.coerceIn(0, currentBlocks.size - 1))
+                    repo.saveReadPositionLocal(articleId, block.coerceIn(0, currentBlocks.size - 1))
                 }
             }
     }
@@ -235,8 +277,9 @@ fun ReaderScreen(articleId: String, onBack: () -> Unit, onOpenArticle: (String) 
     DisposableEffect(articleId) {
         onDispose {
             if (didInitialScroll && currentBlocks.isNotEmpty()) {
-                val index = listState.firstVisibleItemIndex.coerceIn(0, currentBlocks.size - 1)
-                repo.saveReadPosition(articleId, index)
+                val block = itemToBlock(listState.firstVisibleItemIndex)
+                    .coerceIn(0, currentBlocks.size - 1)
+                repo.saveReadPosition(articleId, block)
             }
         }
     }
@@ -249,8 +292,15 @@ fun ReaderScreen(articleId: String, onBack: () -> Unit, onOpenArticle: (String) 
     val serverActive = if (isTtsThisArticle) ttsState.serverVoice else settings.useServerVoice
     val speechRate = if (serverActive) serverRate else deviceRate
     var sheetTarget by remember { mutableStateOf<SheetTarget?>(null) }
+    // In-progress word-level selection (double-tap a word to start, tap more to extend).
+    var wordSel by remember { mutableStateOf<WordSelection?>(null) }
     var menuOpen by remember { mutableStateOf(false) }
     var sleepDialog by remember { mutableStateOf(false) }
+    // "Report bad parse" chooser + in-flight flag, and the raw original to show
+    // in a WebView (non-null = viewer open).
+    var reparseDialog by remember { mutableStateOf(false) }
+    var reparsing by remember { mutableStateOf(false) }
+    var sourceView by remember { mutableStateOf<String?>(null) }
 
     // How far through the article the bottom of the viewport is (0..1).
     val readProgress by remember {
@@ -258,8 +308,8 @@ fun ReaderScreen(articleId: String, onBack: () -> Unit, onOpenArticle: (String) 
             val total = currentBlocks.size
             if (total == 0) 0f
             else {
-                val last = listState.layoutInfo.visibleItemsInfo.lastOrNull()?.index ?: 0
-                ((last + 1).toFloat() / total).coerceIn(0f, 1f)
+                val lastItem = listState.layoutInfo.visibleItemsInfo.lastOrNull()?.index ?: 0
+                ((itemToBlock(lastItem) + 1).toFloat() / total).coerceIn(0f, 1f)
             }
         }
     }
@@ -286,12 +336,12 @@ fun ReaderScreen(articleId: String, onBack: () -> Unit, onOpenArticle: (String) 
     var currentMatch by remember { mutableStateOf(0) }
     LaunchedEffect(matchBlocks) {
         currentMatch = 0
-        if (matchBlocks.isNotEmpty()) listState.scrollToItem(matchBlocks[0])
+        if (matchBlocks.isNotEmpty()) listState.scrollToBlock(matchBlocks[0])
     }
     fun goToMatch(delta: Int) {
         if (matchBlocks.isEmpty()) return
         currentMatch = ((currentMatch + delta) % matchBlocks.size + matchBlocks.size) % matchBlocks.size
-        scope.launch { listState.scrollToItem(matchBlocks[currentMatch]) }
+        scope.launch { listState.scrollToBlock(matchBlocks[currentMatch]) }
     }
 
     Scaffold(
@@ -428,20 +478,38 @@ fun ReaderScreen(articleId: String, onBack: () -> Unit, onOpenArticle: (String) 
                                 onDismissRequest = { menuOpen = false }
                             ) {
                                 DropdownMenuItem(
-                                    text = { Text("Open original") },
+                                    text = { Text("View original") },
                                     leadingIcon = {
                                         Icon(Icons.Filled.OpenInBrowser, contentDescription = null)
                                     },
                                     onClick = {
                                         menuOpen = false
-                                        try {
-                                            context.startActivity(
-                                                Intent(Intent.ACTION_VIEW, Uri.parse(a.url))
-                                            )
-                                        } catch (_: Exception) {
-                                            // No browser available — ignore.
+                                        val url = a.url
+                                        if (url.startsWith("http://") || url.startsWith("https://")) {
+                                            // A real web page — open it in the browser.
+                                            try {
+                                                context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)))
+                                            } catch (_: Exception) { /* no browser */ }
+                                        } else {
+                                            // Email/PDF import — show the captured source in a WebView.
+                                            scope.launch {
+                                                val src = runCatching { repo.articleSource(a.id) }.getOrNull()
+                                                when {
+                                                    src?.source != null -> sourceView = src.source
+                                                    src != null && src.url.startsWith("http") ->
+                                                        try { context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(src.url))) } catch (_: Exception) {}
+                                                    else -> snackbarHostState.showSnackbar("No original source is available for this article")
+                                                }
+                                            }
                                         }
                                     }
+                                )
+                                DropdownMenuItem(
+                                    text = { Text("Report bad parse") },
+                                    leadingIcon = {
+                                        Icon(Icons.Filled.Build, contentDescription = null)
+                                    },
+                                    onClick = { menuOpen = false; reparseDialog = true }
                                 )
                                 DropdownMenuItem(
                                     text = {
@@ -492,7 +560,7 @@ fun ReaderScreen(articleId: String, onBack: () -> Unit, onOpenArticle: (String) 
                                     context,
                                     TtsService.ACTION_PLAY,
                                     articleId,
-                                    listState.firstVisibleItemIndex
+                                    itemToBlock(listState.firstVisibleItemIndex)
                                         .coerceIn(0, (blocks.size - 1).coerceAtLeast(0))
                                 )
                             }
@@ -517,6 +585,17 @@ fun ReaderScreen(articleId: String, onBack: () -> Unit, onOpenArticle: (String) 
                     IconButton(onClick = { sendTtsCommand(context, TtsService.ACTION_STOP) }) {
                         Icon(Icons.Filled.Stop, contentDescription = "Stop")
                     }
+                    // Auto-advance ("binge"): archive each article when it finishes
+                    // and play the next, on down the inbox until you stop. Only
+                    // shown once you're actually listening to this article.
+                    IconButton(onClick = { sendTtsCommand(context, TtsService.ACTION_TOGGLE_AUTO_ADVANCE) }) {
+                        Icon(
+                            Icons.AutoMirrored.Filled.PlaylistPlay,
+                            contentDescription = "Auto-advance: archive and play the next when this finishes",
+                            tint = if (ttsState.autoAdvance) MaterialTheme.colorScheme.primary
+                            else LocalContentColor.current
+                        )
+                    }
                 }
                 // Jump the view back to the reading position and resume following.
                 IconButton(onClick = {
@@ -525,7 +604,7 @@ fun ReaderScreen(articleId: String, onBack: () -> Unit, onOpenArticle: (String) 
                     else article?.readParagraph ?: 0
                     scope.launch {
                         if (blocks.isNotEmpty()) {
-                            listState.animateScrollToItem(target.coerceIn(0, blocks.size - 1))
+                            listState.animateScrollToBlock(target.coerceIn(0, blocks.size - 1))
                         }
                     }
                 }) {
@@ -539,7 +618,7 @@ fun ReaderScreen(articleId: String, onBack: () -> Unit, onOpenArticle: (String) 
                 // Make the current view the position — both the scroll position
                 // and the listening position, whatever the playback state.
                 IconButton(onClick = {
-                    val idx = listState.firstVisibleItemIndex
+                    val idx = itemToBlock(listState.firstVisibleItemIndex)
                         .coerceIn(0, (blocks.size - 1).coerceAtLeast(0))
                     followTts = true
                     repo.saveReadPosition(articleId, idx)
@@ -642,19 +721,54 @@ fun ReaderScreen(articleId: String, onBack: () -> Unit, onOpenArticle: (String) 
                             paraHighlights = highlightsByPara[index].orEmpty(),
                             searchQuery = if (searchActive) searchQuery.trim() else "",
                             isSpoken = isTtsThisArticle && ttsState.paragraphIndex == index,
-                            onLongPress = { text ->
-                                sheetTarget = SheetTarget.Create(index, text)
-                            },
+                            selRange = wordSel?.takeIf { it.block == index }?.let { it.start until it.end },
+                            // Double-tap highlights the whole paragraph.
                             onDoubleTap = { text ->
+                                wordSel = null
                                 repo.addHighlight(articleId, text, null, index)
                                 scope.launch { snackbarHostState.showSnackbar("Highlighted") }
                             },
+                            // Press-hold-drag builds a word-level selection.
+                            onWordSelect = { s, e, sel -> wordSel = WordSelection(index, s, e, sel) },
                             onTap = {
-                                if (highlightsByPara.containsKey(index)) {
-                                    sheetTarget = SheetTarget.View(index)
+                                when {
+                                    // A normal tap elsewhere cancels an in-progress selection.
+                                    wordSel != null -> wordSel = null
+                                    highlightsByPara.containsKey(index) -> sheetTarget = SheetTarget.View(index)
                                 }
                             }
                         )
+                    }
+                }
+                // Confirm bar for a word-level selection, pinned under the list.
+                wordSel?.let { sel ->
+                    Surface(
+                        tonalElevation = 3.dp,
+                        color = MaterialTheme.colorScheme.surfaceVariant,
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text(
+                                text = "“${sel.text}”",
+                                style = MaterialTheme.typography.bodySmall,
+                                maxLines = 2,
+                                overflow = TextOverflow.Ellipsis,
+                                modifier = Modifier.weight(1f)
+                            )
+                            TextButton(onClick = { wordSel = null }) { Text("Cancel") }
+                            TextButton(onClick = {
+                                sheetTarget = SheetTarget.Create(sel.block, sel.text)
+                                wordSel = null
+                            }) { Text("Edit") }
+                            Button(onClick = {
+                                repo.addHighlight(articleId, sel.text, null, sel.block)
+                                wordSel = null
+                                scope.launch { snackbarHostState.showSnackbar("Highlighted") }
+                            }) { Text("Highlight") }
+                        }
                     }
                 }
                 }
@@ -674,7 +788,7 @@ fun ReaderScreen(articleId: String, onBack: () -> Unit, onOpenArticle: (String) 
             followTts = true
             repo.saveTtsPosition(articleId, pos) // sync the listening position to the chosen spot
             if (play) sendTtsCommand(context, TtsService.ACTION_PLAY, articleId, pos)
-            scope.launch { listState.scrollToItem(pos) }
+            scope.launch { listState.scrollToBlock(pos) }
         }
         AlertDialog(
             onDismissRequest = { resumeChoice = null },
@@ -696,10 +810,10 @@ fun ReaderScreen(articleId: String, onBack: () -> Unit, onOpenArticle: (String) 
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
                     TextButton(onClick = { resumeAt(read, true) }, modifier = Modifier.fillMaxWidth()) {
-                        Text("Reading position · $readPct% (play)")
+                        Text("▶️ Reading position · $readPct% (play)")
                     }
                     TextButton(onClick = { resumeAt(tts, true) }, modifier = Modifier.fillMaxWidth()) {
-                        Text("Listening position · $ttsPct% (play)")
+                        Text("▶️ Listening position · $ttsPct% (play)")
                     }
                 }
             },
@@ -744,6 +858,91 @@ fun ReaderScreen(articleId: String, onBack: () -> Unit, onOpenArticle: (String) 
         )
     }
 
+    // "Report bad parse": pick what's wrong; we re-extract server-side and the
+    // reader updates itself when the refreshed article flows back in.
+    if (reparseDialog) {
+        fun doReparse(hint: String) {
+            reparsing = true
+            scope.launch {
+                val result = runCatching { repo.reparseArticle(articleId, hint) }.getOrNull()
+                reparsing = false
+                reparseDialog = false
+                snackbarHostState.showSnackbar(when {
+                    result == null -> "Reparse failed — check your connection"
+                    result.ok -> "Reparsed with ${if (result.method.startsWith("readability")) "Readability" else "AI"}"
+                    result.reason == "no-source" -> "No saved original to reparse this one from"
+                    else -> "Couldn't get a better parse"
+                })
+            }
+        }
+        AlertDialog(
+            onDismissRequest = { if (!reparsing) reparseDialog = false },
+            title = { Text("Report bad parse") },
+            text = {
+                Column {
+                    if (reparsing) {
+                        Text("Reparsing… this can take a few seconds.")
+                        Spacer(modifier = Modifier.height(12.dp))
+                        LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+                    } else {
+                        Text("What's wrong with how this article was parsed? We'll re-extract it from the original source.")
+                        Spacer(modifier = Modifier.height(12.dp))
+                        TextButton(onClick = { doReparse("too-short") }, modifier = Modifier.fillMaxWidth()) {
+                            Text("Too short — text is missing")
+                        }
+                        TextButton(onClick = { doReparse("too-long") }, modifier = Modifier.fillMaxWidth()) {
+                            Text("Too long — extra menus / ads / junk")
+                        }
+                        TextButton(onClick = { doReparse("other") }, modifier = Modifier.fillMaxWidth()) {
+                            Text("Something else looks wrong")
+                        }
+                    }
+                }
+            },
+            confirmButton = {},
+            dismissButton = {
+                if (!reparsing) TextButton(onClick = { reparseDialog = false }) { Text("Cancel") }
+            }
+        )
+    }
+
+    // Full-screen viewer for the raw captured original (email/PDF source).
+    // JavaScript stays off so the untrusted source can't run code.
+    sourceView?.let { rawHtml ->
+        Dialog(
+            onDismissRequest = { sourceView = null },
+            properties = DialogProperties(usePlatformDefaultWidth = false)
+        ) {
+            Surface(modifier = Modifier.fillMaxSize()) {
+                Column(modifier = Modifier.fillMaxSize()) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        modifier = Modifier.fillMaxWidth().padding(start = 16.dp, end = 4.dp, top = 4.dp, bottom = 4.dp)
+                    ) {
+                        Text("Original source", modifier = Modifier.weight(1f))
+                        IconButton(onClick = { sourceView = null }) {
+                            Icon(Icons.Filled.Close, contentDescription = "Close")
+                        }
+                    }
+                    AndroidView(
+                        modifier = Modifier.fillMaxWidth().weight(1f),
+                        factory = { ctx ->
+                            WebView(ctx).apply {
+                                // `settings` (unqualified) would resolve to the app Settings in
+                                // this scope — use the WebView's own settings explicitly.
+                                val ws = this.settings
+                                ws.javaScriptEnabled = false
+                                ws.loadWithOverviewMode = true
+                                ws.useWideViewPort = true
+                            }
+                        },
+                        update = { it.loadDataWithBaseURL(null, rawHtml, "text/html", "utf-8", null) }
+                    )
+                }
+            }
+        }
+    }
+
     val target = sheetTarget
     if (target != null) {
         ModalBottomSheet(onDismissRequest = { sheetTarget = null }) {
@@ -753,6 +952,22 @@ fun ReaderScreen(articleId: String, onBack: () -> Unit, onOpenArticle: (String) 
                     onPlayFromHere = {
                         sendTtsCommand(context, TtsService.ACTION_PLAY, articleId, target.index)
                         sheetTarget = null
+                    },
+                    onNeverImport = { phrase ->
+                        sheetTarget = null
+                        scope.launch {
+                            repo.addSkipRule(phrase)
+                                .onSuccess { existing ->
+                                    snackbarHostState.showSnackbar(
+                                        if (existing > 0)
+                                            "Skipped in future saves ($existing saved article(s) keep it)"
+                                        else "Skipped in future saves"
+                                    )
+                                }
+                                .onFailure {
+                                    snackbarHostState.showSnackbar("Could not add that rule")
+                                }
+                        }
                     },
                     onSave = { text, note ->
                         repo.addHighlight(articleId, text, note, target.index)
@@ -834,8 +1049,9 @@ private fun BlockItem(
     paraHighlights: List<HighlightEntity>,
     searchQuery: String,
     isSpoken: Boolean,
-    onLongPress: (String) -> Unit,
+    selRange: IntRange?,
     onDoubleTap: (String) -> Unit,
+    onWordSelect: (start: Int, end: Int, selected: String) -> Unit,
     onTap: () -> Unit
 ) {
     when (block) {
@@ -882,8 +1098,9 @@ private fun BlockItem(
             paraHighlights = paraHighlights,
             searchQuery = searchQuery,
             isSpoken = isSpoken,
-            onLongPress = onLongPress,
+            selRange = selRange,
             onDoubleTap = onDoubleTap,
+            onWordSelect = onWordSelect,
             onTap = onTap
         )
 
@@ -893,8 +1110,9 @@ private fun BlockItem(
             paraHighlights = paraHighlights,
             searchQuery = searchQuery,
             isSpoken = isSpoken,
-            onLongPress = onLongPress,
+            selRange = selRange,
             onDoubleTap = onDoubleTap,
+            onWordSelect = onWordSelect,
             onTap = onTap
         )
     }
@@ -902,6 +1120,7 @@ private fun BlockItem(
 
 private val HighlightSpanColor = Color(0x66FFE082)
 private val HighlightTintColor = Color(0x33FFE082)
+private val PendingSelColor = Color(0x554A90D9) // blue: word(s) being selected
 
 /** Outline marking the paragraph TTS is reading — deliberately not a fill,
  *  so it can't be mistaken for the amber highlight tint. */
@@ -919,13 +1138,14 @@ private fun HighlightableText(
     paraHighlights: List<HighlightEntity>,
     searchQuery: String,
     isSpoken: Boolean,
-    onLongPress: (String) -> Unit,
+    selRange: IntRange?,
     onDoubleTap: (String) -> Unit,
+    onWordSelect: (start: Int, end: Int, selected: String) -> Unit,
     onTap: () -> Unit
 ) {
     // Render each highlight whose text is a substring of the paragraph as an inline
     // background span; if any highlight doesn't match, tint the whole paragraph.
-    val annotated = remember(text, paraHighlights, searchQuery) {
+    val annotated = remember(text, paraHighlights, searchQuery, selRange) {
         buildAnnotatedString {
             append(text)
             for (h in paraHighlights) {
@@ -934,9 +1154,51 @@ private fun HighlightableText(
                     addStyle(SpanStyle(background = HighlightSpanColor), start, start + h.text.length)
                 }
             }
+            // The word(s) currently being selected — a distinct blue so it can't
+            // be confused with a committed (amber) highlight.
+            selRange?.let { addStyle(SpanStyle(background = PendingSelColor), it.first, it.last + 1) }
             addSearchSpans(text, searchQuery)
         }
     }
+
+    // Layout, so a touch point can be mapped to the word under the finger.
+    var layout by remember { mutableStateOf<TextLayoutResult?>(null) }
+    fun wordAt(pos: Offset): IntRange? {
+        val l = layout ?: return null
+        val off = l.getOffsetForPosition(pos).coerceIn(0, text.length)
+        val w = l.getWordBoundary(off)
+        return if (w.start < w.end) w.start until w.end else null
+    }
+    val gestures = Modifier
+        .pointerInput(text) {
+            detectTapGestures(
+                onTap = { onTap() },
+                onDoubleTap = { onDoubleTap(text) } // whole-paragraph highlight
+            )
+        }
+        // Press and hold, then drag across words to select a span. The word
+        // under the initial press is the anchor; dragging grows or shrinks the
+        // range between the anchor and the word under the finger.
+        .pointerInput(text) {
+            var aStart = 0
+            var aEnd = 0
+            detectDragGesturesAfterLongPress(
+                onDragStart = { pos ->
+                    wordAt(pos)?.let {
+                        aStart = it.first; aEnd = it.last + 1
+                        onWordSelect(aStart, aEnd, text.substring(aStart, aEnd))
+                    }
+                },
+                onDrag = { change, _ ->
+                    change.consume()
+                    wordAt(change.position)?.let {
+                        val s = minOf(aStart, it.first)
+                        val e = maxOf(aEnd, it.last + 1)
+                        onWordSelect(s, e, text.substring(s, e))
+                    }
+                }
+            )
+        }
     val hasUnmatchedHighlight = remember(text, paraHighlights) {
         paraHighlights.any { text.indexOf(it.text) < 0 }
     }
@@ -955,11 +1217,6 @@ private fun HighlightableText(
                 .clip(MaterialTheme.shapes.small)
                 .spokenOutline(isSpoken)
                 .background(backgroundColor)
-                .combinedClickable(
-                    onClick = onTap,
-                    onLongClick = { onLongPress(text) },
-                    onDoubleClick = { onDoubleTap(text) }
-                )
                 .height(IntrinsicSize.Min)
         ) {
             Box(
@@ -971,24 +1228,24 @@ private fun HighlightableText(
             Text(
                 text = annotated,
                 style = ReadingTextStyle.copy(fontStyle = FontStyle.Italic),
-                modifier = Modifier.padding(start = 14.dp, top = 4.dp, bottom = 4.dp, end = 4.dp)
+                onTextLayout = { layout = it },
+                modifier = Modifier
+                    .padding(start = 14.dp, top = 4.dp, bottom = 4.dp, end = 4.dp)
+                    .then(gestures)
             )
         }
     } else {
         Text(
             text = annotated,
             style = ReadingTextStyle,
+            onTextLayout = { layout = it },
             modifier = Modifier
                 .fillMaxWidth()
                 .padding(vertical = 6.dp)
                 .clip(MaterialTheme.shapes.small)
                 .spokenOutline(isSpoken)
                 .background(backgroundColor)
-                .combinedClickable(
-                    onClick = onTap,
-                    onLongClick = { onLongPress(text) },
-                    onDoubleClick = { onDoubleTap(text) }
-                )
+                .then(gestures)
                 .padding(4.dp)
         )
     }
@@ -998,6 +1255,7 @@ private fun HighlightableText(
 private fun CreateHighlightSheet(
     initialText: String,
     onPlayFromHere: () -> Unit,
+    onNeverImport: (text: String) -> Unit,
     onSave: (text: String, note: String?) -> Unit
 ) {
     var text by remember(initialText) { mutableStateOf(initialText) }
@@ -1039,8 +1297,29 @@ private fun CreateHighlightSheet(
                 Text("Save highlight")
             }
         }
+        androidx.compose.material3.HorizontalDivider()
+        // Boilerplate, not a highlight. Trim the field above to the phrase
+        // first. The server needs at least 8 characters so a stray word can't
+        // start deleting paragraphs from everything you save.
+        TextButton(
+            enabled = text.trim().length >= MIN_SKIP_PHRASE,
+            onClick = { onNeverImport(text.trim()) }
+        ) {
+            Icon(Icons.Filled.Block, contentDescription = null)
+            Spacer(modifier = Modifier.width(4.dp))
+            Text("Never import this text again")
+        }
+        Text(
+            "Paragraphs containing this are dropped from articles you save from " +
+                "now on. Articles already saved are left as they are.",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
     }
 }
+
+/** Mirrors MIN_PHRASE_CHARS in the server's skip.js. */
+private const val MIN_SKIP_PHRASE = 8
 
 @Composable
 private fun ViewHighlightsSheet(

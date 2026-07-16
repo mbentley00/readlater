@@ -42,6 +42,16 @@ class Repository(
 
     suspend fun deleteView(id: String) = api.deleteView(id)
 
+    /**
+     * Never import paragraphs containing [phrase] again. Server-side and
+     * forward-looking only: articles already saved keep their text, because
+     * highlights and reading positions are anchored to paragraph indices.
+     * Resolves to the number of already-saved articles containing the phrase.
+     */
+    suspend fun addSkipRule(phrase: String): Result<Int> = withContext(Dispatchers.IO) {
+        runCatching { api.addSkipRule(phrase) }
+    }
+
     private fun viewsToJson(views: List<RemoteView>): String {
         val arr = org.json.JSONArray()
         views.forEach { v ->
@@ -198,6 +208,30 @@ class Repository(
 
     private fun paragraphCountOf(html: String?): Int =
         html?.let { HtmlParser.parse(it).size } ?: 0
+
+    /**
+     * Ask the server to re-extract a mis-parsed article ([hint] = "too-short" |
+     * "too-long" | "other"). On success the server has reset the read/listen
+     * positions (the parse changed), and we replace the local copy with the
+     * returned article. Returns the result so the UI can report success/reason.
+     */
+    suspend fun reparseArticle(id: String, hint: String): ApiClient.ReparseResult = withContext(Dispatchers.IO) {
+        val result = api.reparse(id, hint)
+        val r = result.article
+        if (result.ok && r != null) {
+            articleDao.upsertAll(listOf(ArticleEntity(
+                id = r.id, url = r.url, title = r.title, byline = r.byline, siteName = r.siteName,
+                excerpt = r.excerpt, html = r.html, savedAt = r.savedAt, updatedAt = r.updatedAt,
+                archived = r.archived, favorite = r.favorite, readParagraph = r.readParagraph,
+                ttsParagraph = r.ttsParagraph, dirty = false, wordCount = r.wordCount,
+                paragraphCount = paragraphCountOf(r.html), imageUrl = r.imageUrl, publishedAt = r.publishedAt
+            )))
+        }
+        result
+    }
+
+    /** Raw captured/fetched original source for "view original". */
+    suspend fun articleSource(id: String): ApiClient.ArticleSource = api.articleSource(id)
 
     fun toggleArchive(article: ArticleEntity) {
         bgScope.launch {

@@ -579,7 +579,10 @@ async function main() {
       Subject: 'Issue #42',
       MessageID: 'msg-abc-123',
       Date: 'Sat, 5 Jul 2026 10:00:00 +0000',
-      HtmlBody: '<h1>Issue #42</h1><script>evil()</script><p onclick="x()">Hello subscriber.</p>',
+      HtmlBody: '<table><tr><td><h1>Issue #42</h1><script>evil()</script>'
+        + '<p onclick="x()">Hello subscriber, welcome to another issue of this fine newsletter.</p>'
+        + '<div>Here is the second paragraph with a bit more to say for itself.</div>'
+        + '<p>Here is the second paragraph with a bit more to say for itself.</p></td></tr></table>',
       TextBody: 'Issue #42. Hello subscriber.',
     };
     // secret required
@@ -600,7 +603,14 @@ async function main() {
     assert.strictEqual(r.body.byline, 'A Newsletter');
     assert.ok(!r.body.html.includes('<script>'), 'script tags stripped from email html');
     assert.ok(!r.body.html.includes('onclick'), 'inline handlers stripped from email html');
-    assert.ok(r.body.html.includes('Hello subscriber.'), 'email body preserved');
+    assert.ok(r.body.html.includes('Hello subscriber'), 'email body preserved');
+    // Table-wrapped newsletter is segmented into real paragraphs, not one blob.
+    assert.ok((r.body.html.match(/<p>/g) || []).length >= 2, 'email body split into paragraphs');
+    // The paragraph repeated as <div> then <p> is de-duplicated.
+    assert.strictEqual(
+      (r.body.html.match(/second paragraph with a bit more/g) || []).length, 1,
+      'duplicate email paragraph dropped'
+    );
 
     // provider retries are idempotent (same MessageID)
     er = await fetch(BASE + '/api/inbound-email?secret=whsec-test', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(emailPayload) });
@@ -615,12 +625,38 @@ async function main() {
     r = await api('GET', `/api/articles/${emailArt}`, undefined, BOB);
     assert.strictEqual(r.status, 404, "email article is private to alice");
 
+    // ---- reparse a mis-parsed article ------------------------------------
+    // Save a sparse newsletter, then reparse it. The raw email is kept as the
+    // source; the (mock) LLM returns a fuller body for the "too short" hint.
+    er = await fetch(BASE + '/api/inbound-email?secret=whsec-test', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        From: 'writer@newsletter.example', FromFull: { Email: 'writer@newsletter.example', Name: 'NL' },
+        ToFull: [{ Email: aliceEmail }], Subject: 'Sparse issue', MessageID: 'msg-sparse-1',
+        HtmlBody: '<div>tiny</div>', TextBody: 'tiny',
+      }),
+    });
+    const sparseId = (await er.json()).id;
+    // "View original" returns the raw email source we captured at save time.
+    r = await api('GET', `/api/articles/${sparseId}/source`);
+    assert.strictEqual(r.status, 200);
+    assert.strictEqual(r.body.kind, 'email', 'source kind is email');
+    assert.ok((r.body.source || '').includes('tiny'), 'raw email source available');
+    // Reparse with a "too short" hint — heuristic can't improve a stub, so it
+    // escalates to the LLM, which fills in a real body.
+    r = await api('POST', `/api/articles/${sparseId}/reparse`, { hint: 'too-short' });
+    assert.strictEqual(r.status, 200);
+    assert.strictEqual(r.body.ok, true, 'reparse succeeded');
+    assert.strictEqual(r.body.method, 'llm', 'reparse escalated to the LLM');
+    assert.ok(r.body.article.html.includes('rescued article body'), 'reparse replaced the body');
+    await api('DELETE', `/api/articles/${sparseId}`);
+
     await api('DELETE', `/api/articles/${emailArt}`);
 
     // ---- export + apk hosting --------------------------------------------
     res = await fetch(BASE + '/api/export.json', { headers: HEADERS });
     assert.strictEqual(res.status, 200);
-    assert.ok((res.headers.get('content-disposition') || '').includes('readlater-export.json'));
+    assert.ok((res.headers.get('content-disposition') || '').includes('earmark-export.json'));
     const exported = await res.json();
     assert.strictEqual(exported.username, 'alice');
     assert.ok(exported.articles.length >= 3, 'export contains all articles');
@@ -685,4 +721,103 @@ async function main() {
   }
 }
 
+/**
+ * The Dockerfile lists source files by name, so adding a module and forgetting
+ * to COPY it produces an image that crashes on boot with "Cannot find module".
+ * That has happened twice; catch it here instead of in production.
+ */
+function checkDockerfileCopiesEveryModule() {
+  const dockerfile = fs.readFileSync(path.join(__dirname, 'Dockerfile'), 'utf8');
+  const copied = new Set(
+    dockerfile.split('\n')
+      .filter((l) => l.startsWith('COPY '))
+      .flatMap((l) => l.match(/[\w.-]+\.js/g) || [])
+  );
+
+  const required = new Set();
+  for (const f of [...copied].filter((f) => fs.existsSync(path.join(__dirname, f)))) {
+    const src = fs.readFileSync(path.join(__dirname, f), 'utf8');
+    for (const m of src.matchAll(/require\(['"]\.\/([\w.-]+)['"]\)/g)) required.add(`${m[1]}.js`);
+  }
+
+  const missing = [...required].filter((m) => !copied.has(m));
+  assert.deepStrictEqual(missing, [], `Dockerfile does not COPY: ${missing.join(', ')}`);
+  console.log(`  Dockerfile copies all ${required.size} required modules ✔`);
+}
+
+/** Email HTML normalization: newsletter soup → clean, deduped paragraphs. */
+function testEmailNormalization() {
+  const { emailToCleanHtml, emailToBlocks } = require('./email');
+
+  // A table/div/font-wrapped newsletter with <br> splits, a script + inline
+  // handler, a hero image, and one paragraph duplicated (as real newsletters do
+  // with titles/subheaders/captions).
+  const html = `
+    <table><tr><td><center>
+      <img src="https://img.example/hero.jpg" alt="A caption">
+      <h1>The Big Headline</h1>
+      <div><font>First sentence of the intro.<br><br>Second, separate thought here.</font></div>
+      <p>A distinct standalone paragraph that is clearly long enough to count.</p>
+      <p>A distinct standalone paragraph that is clearly long enough to count.</p>
+      <script>track()</script>
+      <p onclick="evil()">And a closing paragraph after the duplicate one.</p>
+      <ul><li>list item one is here</li></ul>
+    </center></td></tr></table>`;
+
+  const out = emailToCleanHtml(html);
+  const pCount = (out.match(/<p>/g) || []).length;
+  assert.ok(pCount >= 4, `newsletter splits into paragraphs (got ${pCount})`);
+  assert.ok(!/script|track\(/.test(out), 'script stripped');
+  assert.ok(!/onclick|evil/.test(out), 'inline handler stripped');
+  assert.ok(/<h2>The Big Headline<\/h2>/.test(out), 'heading preserved as h2');
+  assert.ok(/hero\.jpg/.test(out), 'content image preserved');
+  assert.ok(/<ul>\s*<li>list item one/.test(out), 'list preserved');
+  assert.ok(/Second, separate thought/.test(out), 'double <br> splits a paragraph');
+  const dupCount = (out.match(/A distinct standalone paragraph/g) || []).length;
+  assert.strictEqual(dupCount, 1, 'duplicate long paragraph dropped, first kept');
+
+  // Short repeated lines are NOT deduped (they're often meant to repeat).
+  const shorty = emailToCleanHtml('<p>Read more</p><div>filler text goes here</div><p>Read more</p>');
+  assert.strictEqual((shorty.match(/Read more/g) || []).length, 2, 'short repeats kept');
+
+  // A body with no block tags at all still segments on <br>.
+  const brOnly = emailToBlocks('Line one here<br><br>Line two here');
+  assert.strictEqual(brOnly.length, 2, 'bare <br><br> body yields two blocks');
+
+  // Empty / junk input yields no blocks (caller falls back).
+  assert.strictEqual(emailToCleanHtml('   '), '', 'blank input yields empty');
+
+  console.log('  Email normalization + dedup ✔');
+}
+
+/** Reparse engine: heuristic (Readability) path + graceful no-source. Runs with
+ *  no ANTHROPIC_API_KEY in this process, so the LLM branch is skipped here (the
+ *  LLM escalation is covered end-to-end by the reparse endpoint test in main). */
+async function testReparseEngine() {
+  const { reparse } = require('./reparse');
+  const page = '<html><body><nav>menu menu menu</nav><article><h1>Real Title</h1>'
+    + '<p>' + 'Solid article sentence number here. '.repeat(30) + '</p>'
+    + '</article><footer>site footer junk</footer></body></html>';
+
+  // "too long": pretend the current parse was huge; Readability trims to the
+  // article body and that counts as a fix (no LLM needed).
+  const fixed = await reparse({
+    url: 'https://x.example/a', title: 't', hint: 'too-long',
+    sourceHtml: page, currentTextLen: 100000, fetchUrl: null,
+  });
+  assert.ok(fixed.ok && fixed.method === 'readability', 'heuristic reparse extracts the article');
+  assert.ok(/Solid article sentence/.test(fixed.article.html), 'reparsed html carries the body');
+
+  // No stored source and no fetcher → a clean, reported failure (no throw).
+  const none = await reparse({
+    url: 'email:x', title: 't', hint: 'other', sourceHtml: '', currentTextLen: 0, fetchUrl: null,
+  });
+  assert.ok(!none.ok && none.reason === 'no-source', 'missing source reported, not thrown');
+
+  console.log('  Reparse engine (heuristic + no-source) ✔');
+}
+
+testEmailNormalization();
+testReparseEngine().catch((e) => { console.error(e); process.exit(1); });
+checkDockerfileCopiesEveryModule();
 main().catch((e) => { console.error(e); process.exit(1); });

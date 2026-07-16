@@ -53,6 +53,11 @@ CREATE TABLE IF NOT EXISTS articles (
   excerpt TEXT,
   html TEXT,
   textContent TEXT,
+  -- raw source captured at save time (email HTML, fetched page, or the
+  -- extension's stripped page), kept so a mis-parsed article can be reparsed
+  -- and its original shown. Large; never sent in list/full-article responses,
+  -- only via the dedicated source getter.
+  sourceHtml TEXT,
   wordCount INTEGER NOT NULL DEFAULT 0,
   updatedAt INTEGER NOT NULL
 );
@@ -85,6 +90,19 @@ CREATE TABLE IF NOT EXISTS views (
 );
 CREATE INDEX IF NOT EXISTS views_user ON views(userId);
 
+-- Boilerplate phrases ("Sign up for our newsletter") to drop from articles as
+-- they are saved. Applied at save time only, never retroactively: paragraph
+-- indices anchor highlights and reading positions in already-saved articles.
+CREATE TABLE IF NOT EXISTS skip_rules (
+  id TEXT PRIMARY KEY,
+  userId TEXT NOT NULL,
+  phrase TEXT NOT NULL,
+  hits INTEGER NOT NULL DEFAULT 0,
+  createdAt INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS skip_rules_user ON skip_rules(userId);
+CREATE UNIQUE INDEX IF NOT EXISTS skip_rules_user_phrase ON skip_rules(userId, phrase COLLATE NOCASE);
+
 CREATE VIRTUAL TABLE IF NOT EXISTS articles_fts USING fts5(
   title, byline, siteName, excerpt, textContent,
   content='articles', content_rowid='rowid'
@@ -107,6 +125,13 @@ END;
 
 const rowUser = (r) => r || null;
 const rowArticle = (r) => r && { ...r, archived: !!r.archived, favorite: !!r.favorite };
+
+// Every article column EXCEPT the (potentially huge) raw sourceHtml, which is
+// only ever fetched on demand via getArticleSource — never in the full-article
+// GET or Android sync, which would otherwise double every article's payload.
+const ARTICLE_COLS = 'id, userId, url, domain, savedAt, archived, favorite, readParagraph, '
+  + 'ttsParagraph, title, byline, siteName, excerpt, html, textContent, imageUrl, publishedAt, '
+  + 'wordCount, updatedAt';
 
 // Extract readable text for word counting. Crucially, remove the CONTENT of
 // script/style/head/noscript/svg blocks — not just their tags — or embedded
@@ -228,6 +253,10 @@ function open(dataDir) {
   if (!articleCols.includes('publishedAt')) {
     sqlite.exec("ALTER TABLE articles ADD COLUMN publishedAt INTEGER");
   }
+  // raw source kept for reparse / "view original"
+  if (!articleCols.includes('sourceHtml')) {
+    sqlite.exec("ALTER TABLE articles ADD COLUMN sourceHtml TEXT");
+  }
   // one-time recompute after the script/style-stripping fix (imported
   // articles were over-counted by embedded JSON-LD / scripts).
   if (sqlite.pragma('user_version', { simple: true }) < 2) {
@@ -270,20 +299,23 @@ function open(dataDir) {
     // ---------------- articles
     articleCount: (userId) => prep('ac', 'SELECT COUNT(*) c FROM articles WHERE userId = ?').get(userId).c,
     getArticle: (id, userId) =>
-      rowArticle(prep('ag', 'SELECT * FROM articles WHERE id = ? AND userId = ?').get(id, userId)),
+      rowArticle(prep('ag', `SELECT ${ARTICLE_COLS} FROM articles WHERE id = ? AND userId = ?`).get(id, userId)),
+    /** Raw captured source for reparse / "view original". Returns '' when none. */
+    getArticleSource: (id, userId) =>
+      (prep('ags', 'SELECT sourceHtml FROM articles WHERE id = ? AND userId = ?').get(id, userId) || {}).sourceHtml || '',
     articleByUrl: (userId, url) =>
-      rowArticle(prep('abu', 'SELECT * FROM articles WHERE userId = ? AND url = ?').get(userId, url)),
+      rowArticle(prep('abu', `SELECT ${ARTICLE_COLS} FROM articles WHERE userId = ? AND url = ?`).get(userId, url)),
     insertArticle: (a) => prep('ai', `INSERT INTO articles
-      (id, userId, url, domain, savedAt, archived, favorite, readParagraph, title, byline, siteName, excerpt, html, textContent, imageUrl, publishedAt, wordCount, updatedAt)
-      VALUES (@id, @userId, @url, @domain, @savedAt, @archived, @favorite, @readParagraph, @title, @byline, @siteName, @excerpt, @html, @textContent, @imageUrl, @publishedAt, @wordCount, @updatedAt)`)
-      .run({ imageUrl: null, publishedAt: null, ...a, domain: hostOf(a.url), archived: a.archived ? 1 : 0, favorite: a.favorite ? 1 : 0, wordCount: articleWordCount(a) }),
-    // Update content; only overwrites imageUrl/publishedAt when new ones are provided.
+      (id, userId, url, domain, savedAt, archived, favorite, readParagraph, title, byline, siteName, excerpt, html, textContent, sourceHtml, imageUrl, publishedAt, wordCount, updatedAt)
+      VALUES (@id, @userId, @url, @domain, @savedAt, @archived, @favorite, @readParagraph, @title, @byline, @siteName, @excerpt, @html, @textContent, @sourceHtml, @imageUrl, @publishedAt, @wordCount, @updatedAt)`)
+      .run({ imageUrl: null, publishedAt: null, sourceHtml: null, ...a, domain: hostOf(a.url), archived: a.archived ? 1 : 0, favorite: a.favorite ? 1 : 0, wordCount: articleWordCount(a) }),
+    // Update content; only overwrites imageUrl/publishedAt/sourceHtml when new ones are provided.
     updateArticleContent: (id, f) => prep('auc', `UPDATE articles SET
       title = @title, byline = @byline, siteName = @siteName, excerpt = @excerpt,
       html = @html, textContent = @textContent, imageUrl = COALESCE(@imageUrl, imageUrl),
-      publishedAt = COALESCE(@publishedAt, publishedAt),
+      publishedAt = COALESCE(@publishedAt, publishedAt), sourceHtml = COALESCE(@sourceHtml, sourceHtml),
       wordCount = @wordCount, updatedAt = @updatedAt WHERE id = @id`)
-      .run({ imageUrl: null, publishedAt: null, ...f, id, wordCount: articleWordCount(f) }),
+      .run({ imageUrl: null, publishedAt: null, sourceHtml: null, ...f, id, wordCount: articleWordCount(f) }),
     patchArticle: (id, { archived, favorite, readParagraph, ttsParagraph, updatedAt }) =>
       prep('ap', `UPDATE articles SET
         archived = COALESCE(@archived, archived),
@@ -386,10 +418,32 @@ function open(dataDir) {
     },
     insertView: (v) => prep('vi', `INSERT INTO views (id, userId, name, filters, createdAt)
       VALUES (@id, @userId, @name, @filters, @createdAt)`).run({ ...v, filters: JSON.stringify(v.filters) }),
+    // ---- skip rules: boilerplate phrases stripped from articles as they save
+    listSkipRules: (userId) =>
+      prep('srl', 'SELECT * FROM skip_rules WHERE userId = ? ORDER BY createdAt').all(userId)
+        .map(({ userId: _u, ...r }) => r),
+    insertSkipRule: (r) => prep('sri', `INSERT INTO skip_rules (id, userId, phrase, hits, createdAt)
+      VALUES (@id, @userId, @phrase, 0, @createdAt)`).run(r),
+    deleteSkipRule: (id, userId) =>
+      prep('srd', 'DELETE FROM skip_rules WHERE id = ? AND userId = ?').run(id, userId),
+    /** Count how often a rule has actually fired, so dead rules are visible. */
+    bumpSkipRuleHits: (id, n) =>
+      prep('srh', 'UPDATE skip_rules SET hits = hits + ? WHERE id = ?').run(n, id),
+    /** How many already-saved articles contain this phrase (rules are not
+     *  retroactive — this is shown when adding one, so an over-broad phrase
+     *  is obvious before it starts eating future saves). */
+    countArticlesContaining: (userId, phrase) =>
+      prep('sac', "SELECT COUNT(*) c FROM articles WHERE userId = ? AND textContent LIKE '%' || ? || '%'")
+        .get(userId, phrase).c,
+
     deleteView: (id, userId) =>
       prep('vd', 'DELETE FROM views WHERE id = ? AND userId = ?').run(id, userId),
 
-    /** Everything the user owns, for backup/export. */
+    /**
+     * Everything the user owns, for backup/export. Loads every article (HTML
+     * included) into memory — fine for small accounts and tests, but a large
+     * one will exhaust the heap. Prefer iterExport() for anything user-facing.
+     */
     exportUser: (userId) => ({
       articles: prep('exa', 'SELECT * FROM articles WHERE userId = ? ORDER BY savedAt').all(userId)
         .map(rowArticle)
@@ -397,6 +451,29 @@ function open(dataDir) {
       highlights: prep('exh', 'SELECT * FROM highlights WHERE userId = ? ORDER BY createdAt').all(userId)
         .map(({ userId: _u, ...h }) => h),
     }),
+
+    /**
+     * Same rows as exportUser(), one at a time, so an account of any size can
+     * be streamed straight to the socket. Uses fresh statements rather than the
+     * prep() cache: an iterator holds its statement open for the whole walk, so
+     * a cached one would be busy if two exports overlapped.
+     */
+    iterExport: {
+      articles: function* (userId) {
+        const stmt = sqlite.prepare('SELECT * FROM articles WHERE userId = ? ORDER BY savedAt');
+        for (const row of stmt.iterate(userId)) {
+          const { userId: _u, domain: _d, ...a } = rowArticle(row);
+          yield a;
+        }
+      },
+      highlights: function* (userId) {
+        const stmt = sqlite.prepare('SELECT * FROM highlights WHERE userId = ? ORDER BY createdAt');
+        for (const row of stmt.iterate(userId)) {
+          const { userId: _u, ...h } = row;
+          yield h;
+        }
+      },
+    },
     insertHighlight: (h) => prep('hi', `INSERT INTO highlights
       (id, userId, clientId, articleId, text, note, paragraphIndex, createdAt)
       VALUES (@id, @userId, @clientId, @articleId, @text, @note, @paragraphIndex, @createdAt)`).run(h),

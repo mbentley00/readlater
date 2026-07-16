@@ -281,6 +281,22 @@ class ApiClient(private val settings: Settings) {
         return JSONObject(body).optString("title", "Saved")
     }
 
+    /**
+     * POST /api/skip-rules — never import paragraphs containing this phrase.
+     * Applies to future saves only; nothing already saved is rewritten.
+     * Returns how many already-saved articles contain the phrase, so the caller
+     * can say plainly that those are left alone.
+     */
+    suspend fun addSkipRule(phrase: String): Int {
+        val json = JSONObject().put("phrase", phrase)
+        val body = execute(
+            builder("/api/skip-rules")
+                .post(json.toString().toRequestBody(jsonMediaType))
+                .build()
+        )
+        return JSONObject(body).optInt("existingMatches", 0)
+    }
+
     /** GET /api/articles/{id}/highlights */
     suspend fun getHighlights(articleId: String): List<RemoteHighlight> {
         val body = execute(builder("/api/articles/$articleId/highlights").get().build())
@@ -308,6 +324,49 @@ class ApiClient(private val settings: Settings) {
     /** DELETE /api/highlights/{id} */
     suspend fun deleteHighlight(serverId: String) {
         execute(builder("/api/highlights/$serverId").delete().build())
+    }
+
+    /** Outcome of a reparse: either a fresh article, or a reason it couldn't help. */
+    data class ReparseResult(val ok: Boolean, val method: String, val article: RemoteArticle?, val reason: String?)
+
+    /** Raw captured/fetched original for "view original". */
+    data class ArticleSource(val url: String, val kind: String, val source: String?)
+
+    /**
+     * POST /api/articles/{id}/reparse — re-extract a mis-parsed article given a
+     * hint ("too-short" | "too-long" | "other"). The server may fetch the page
+     * and call an LLM, so this can take a while — use a much longer timeout than
+     * the default read timeout.
+     */
+    suspend fun reparse(articleId: String, hint: String): ReparseResult = withContext(Dispatchers.IO) {
+        val payload = JSONObject().put("hint", hint)
+        val request = builder("/api/articles/$articleId/reparse")
+            .post(payload.toString().toRequestBody(jsonMediaType)).build()
+        val longClient = client.newBuilder()
+            .readTimeout(150, TimeUnit.SECONDS)
+            .callTimeout(180, TimeUnit.SECONDS)
+            .build()
+        val body = try {
+            longClient.newCall(request).execute()
+        } catch (e: IOException) {
+            throw IOException("Network error: ${e.message}", e)
+        }.use { resp ->
+            val b = resp.body?.string().orEmpty()
+            if (!resp.isSuccessful) throw IOException("Server error ${resp.code}: ${b.take(200).ifBlank { resp.message }}")
+            b
+        }
+        val o = JSONObject(body)
+        if (o.optBoolean("ok", false)) {
+            ReparseResult(true, o.optString("method", ""), parseArticle(o.getJSONObject("article")), null)
+        } else {
+            ReparseResult(false, "", null, o.optString("reason", "unknown"))
+        }
+    }
+
+    /** GET /api/articles/{id}/source — the raw original, if available. */
+    suspend fun articleSource(articleId: String): ArticleSource {
+        val o = JSONObject(execute(builder("/api/articles/$articleId/source").get().build()))
+        return ArticleSource(o.optString("url", ""), o.optString("kind", "none"), o.stringOrNull("source"))
     }
 
     private fun parseArticle(o: JSONObject): RemoteArticle = RemoteArticle(

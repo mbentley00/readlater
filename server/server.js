@@ -31,6 +31,24 @@ const llm = require('./llm');
 const { extractReadable } = require('./extract');
 const pdf = require('./pdf');
 const tts = require('./tts');
+const inbound = require('./inbound');
+const skip = require('./skip');
+const { emailToCleanHtml } = require('./email');
+const { reparse } = require('./reparse');
+
+// Cap raw source we keep for reparse/"view original" so a single huge message
+// can't blow the data volume. Big enough for any real newsletter or page.
+const SOURCE_CAP = 3 * 1024 * 1024;
+
+/** Fetch a page's HTML (shared by save-by-URL, reparse and "view original"). */
+async function fetchPageHtml(url) {
+  const resp = await fetch(url, {
+    headers: { 'User-Agent': 'Mozilla/5.0 (compatible; EarmarkBot/1.0)', Accept: 'text/html' },
+    redirect: 'follow', signal: AbortSignal.timeout(25000),
+  });
+  if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+  return (await resp.text()).slice(0, SOURCE_CAP);
+}
 
 const PORT = parseInt(process.env.PORT || '8090', 10);
 const DATA_DIR = process.env.READLATER_DATA_DIR || path.join(__dirname, 'data');
@@ -151,12 +169,38 @@ function ogImage(pageHtml, baseUrl) {
   try { return new URL(m[1].trim(), baseUrl).href.slice(0, 2000); } catch { return null; }
 }
 
+/**
+ * Drop the user's boilerplate phrases from article content on its way to the
+ * database. Every write of html/textContent goes through this, so a rule
+ * applies no matter which path produced the article — extension, save-by-URL,
+ * LLM rescue, PDF import or email.
+ *
+ * Save-time only: paragraph indices anchor highlights and reading positions,
+ * so filtering an article that already has them would re-anchor them silently.
+ */
+function withSkipRules(userId, fields) {
+  const rules = store.listSkipRules(userId);
+  if (!rules.length) return fields;
+  const { removed, ...clean } = skip.applySkipRules(rules, fields);
+  if (!removed.length) return fields;
+
+  const perRule = new Map();
+  for (const r of removed) perRule.set(r.ruleId, (perRule.get(r.ruleId) || 0) + 1);
+  for (const [id, n] of perRule) store.bumpSkipRuleHits(id, n);
+  console.log(`skip rules removed ${removed.length} block(s): ` +
+    removed.map((r) => JSON.stringify(r.text.slice(0, 60))).join(', '));
+  return clean;
+}
+
 // Background page fetch + extraction for save-by-URL, so the client isn't kept
 // waiting on a slow page. Updates the placeholder article in place.
 async function fillSavedUrl(articleId, userId, artUrl) {
   const setContent = (fields) => {
     const cur = store.getArticle(articleId, userId);
-    if (cur) store.updateArticleContent(articleId, { byline: null, siteName: hostOf(artUrl), updatedAt: Date.now(), ...fields });
+    if (cur) {
+      store.updateArticleContent(articleId, withSkipRules(userId,
+        { byline: null, siteName: hostOf(artUrl), updatedAt: Date.now(), ...fields }));
+    }
     return cur;
   };
   let pageHtml = '';
@@ -211,11 +255,11 @@ async function fillSavedUrl(articleId, userId, artUrl) {
         if (!better || !better.textContent || better.textContent.length < 400) return;
         const cur = store.getArticle(articleId, userId);
         if (!cur || better.textContent.length <= (cur.textContent || '').length) return;
-        store.updateArticleContent(articleId, {
+        store.updateArticleContent(articleId, withSkipRules(userId, {
           title: cur.title, byline: cur.byline, siteName: cur.siteName,
           excerpt: better.textContent.slice(0, 300),
           html: better.html, textContent: better.textContent, updatedAt: Date.now(),
-        });
+        }));
         enqueueTts(articleId, userId, true);
         console.log(`save-url LLM-upgraded ${articleId} (${(cur.textContent || '').length} → ${better.textContent.length})`);
       })
@@ -402,6 +446,130 @@ function sanitizeEmailHtml(html) {
     .replace(/(href|src)\s*=\s*(["']?)\s*javascript:[^"'\s>]*\2/gi, '$1="#"');
 }
 
+/**
+ * Turn a parsed email into an article row. Shared by the inbound-email webhook
+ * and the IMAP poller so both store identical rows and dedupe identically:
+ * `email:<messageId>` is the article URL, so redelivery (webhook retries, or a
+ * message the poller sees twice) is a no-op rather than a duplicate.
+ */
+function saveEmailArticle({ userId, messageId, subject, from, date, html, text }) {
+  const url = `email:${messageId}`;
+  const existing = store.articleByUrl(userId, url);
+  if (existing) return { article: existing, created: false };
+
+  const body = typeof text === 'string' ? text : '';
+  // Restructure newsletter soup into real paragraphs (and drop duplicate
+  // subheaders/captions). Falls back to the raw-sanitized body if that yields
+  // nothing, and to the plain-text part if there's no HTML at all — so we never
+  // store an empty article.
+  let articleHtml;
+  if (typeof html === 'string' && html.trim()) {
+    articleHtml = emailToCleanHtml(html) || sanitizeEmailHtml(html);
+  } else {
+    articleHtml = `<pre>${escapeText(body)}</pre>`;
+  }
+  const article = withSkipRules(userId, {
+    id: newId(),
+    userId,
+    url,
+    savedAt: Date.parse(date) || Date.now(),
+    archived: false, favorite: false, readParagraph: 0,
+    title: sanitizeString(subject) || '(no subject)',
+    byline: sanitizeString(from),
+    siteName: 'Email',
+    excerpt: sanitizeString(body.replace(/\s+/g, ' ').trim(), 300),
+    html: articleHtml,
+    textContent: body ? body.slice(0, 200000) : null,
+    // Keep the raw email HTML: it can't be re-fetched, so it's the only way to
+    // reparse a mis-parsed newsletter or show its original.
+    sourceHtml: typeof html === 'string' && html.trim() ? html.slice(0, SOURCE_CAP) : null,
+    updatedAt: Date.now(),
+  });
+  store.insertArticle(article);
+  enqueueTts(article.id, userId); // emailed newsletters get audio like any other save
+  return { article, created: true };
+}
+
+/** res.write() that waits for 'drain', so a slow client throttles us instead
+ *  of filling the socket buffer with the whole export. */
+function write(res, chunk) {
+  if (res.write(chunk)) return Promise.resolve();
+  return new Promise((resolve, reject) => {
+    const onDrain = () => { res.off('close', onClose); resolve(); };
+    const onClose = () => { res.off('drain', onDrain); reject(new Error('client disconnected')); };
+    res.once('drain', onDrain);
+    res.once('close', onClose);
+  });
+}
+
+/**
+ * Stream one account's full backup as JSON. Hand-assembled rather than
+ * JSON.stringify'd whole: articles carry inline HTML, and a real account is
+ * bigger than the heap (a 20k-article account OOMs the process if buffered).
+ *
+ * `counts` is written in the header, before the rows, so a restore can verify
+ * it received everything the server intended to send.
+ */
+const exportHead = (user) => ({
+  format: 'earmark-export/1',
+  exportedAt: Date.now(),
+  username: user.username,
+  counts: {
+    articles: store.articleCount(user.id),
+    highlights: store.highlightCount(user.id),
+  },
+  views: store.listViews(user.id).map(({ userId: _u, ...v }) => v),
+});
+
+async function streamExport(res, user) {
+  const head = exportHead(user);
+  // Open the object with the scalar fields, then splice in the big arrays.
+  await write(res, JSON.stringify(head).slice(0, -1));
+
+  for (const [key, rows] of [
+    ['articles', store.iterExport.articles(user.id)],
+    ['highlights', store.iterExport.highlights(user.id)],
+  ]) {
+    await write(res, `,${JSON.stringify(key)}:[`);
+    let first = true;
+    for (const row of rows) {
+      await write(res, (first ? '' : ',') + JSON.stringify(row));
+      first = false;
+    }
+    await write(res, ']');
+  }
+  await write(res, '}');
+  res.end();
+}
+
+/**
+ * Line-delimited export: a header line, one line per record, then an "end"
+ * trailer carrying the row counts actually written.
+ *
+ * This is the format to back up with. A whole account serialized as one JSON
+ * document cannot be read back — V8 refuses to build a string over ~536M
+ * characters, and a real account exceeds that — whereas NDJSON streams in both
+ * directions. The trailer is what makes truncation detectable: every line of a
+ * half-downloaded file still parses, so without it a cut-off backup looks fine.
+ */
+async function streamExportNdjson(res, user) {
+  const line = (o) => JSON.stringify(o) + '\n'; // stringify escapes newlines, so 1 record == 1 line
+  await write(res, line(exportHead(user)));
+
+  let articles = 0;
+  for (const a of store.iterExport.articles(user.id)) {
+    await write(res, line({ type: 'article', data: a }));
+    articles++;
+  }
+  let highlights = 0;
+  for (const h of store.iterExport.highlights(user.id)) {
+    await write(res, line({ type: 'highlight', data: h }));
+    highlights++;
+  }
+  await write(res, line({ type: 'end', articles, highlights }));
+  res.end();
+}
+
 // ---------------------------------------------------------------- routing
 const ctx = {
   store, newId, sanitizeString, readBody, parseBody,
@@ -409,6 +577,7 @@ const ctx = {
   createSession, sessionCookie, getSessionUser, destroySession,
   searchArticles, countArticles, hostOf,
   ALLOW_SIGNUP, INBOUND_DOMAIN, APK_FILE, EXT_XPI_FILE, EXT_META_FILE,
+  INBOUND_MAILBOX: inbound.enabled() ? inbound.cfg.user : '',
 };
 
 const server = http.createServer(async (req, res) => {
@@ -455,33 +624,18 @@ const server = http.createServer(async (req, res) => {
       if (!target) return json(res, 200, { ok: true, dropped: 'unknown recipient' });
 
       // idempotent per message: providers may retry delivery
-      const msgId = sanitizeString(b.MessageID) ||
+      const messageId = sanitizeString(b.MessageID) ||
         crypto.createHash('sha256').update(`${b.From}|${b.Subject}|${b.Date}`).digest('hex').slice(0, 24);
-      const artUrl = `email:${msgId}`;
-      let a = store.articleByUrl(target.id, artUrl);
-      if (!a) {
-        const text = typeof b.TextBody === 'string' ? b.TextBody : '';
-        const html = typeof b.HtmlBody === 'string' && b.HtmlBody.trim()
-          ? sanitizeEmailHtml(b.HtmlBody)
-          : `<pre>${escapeText(text)}</pre>`;
-        const from = (b.FromFull && (b.FromFull.Name || b.FromFull.Email)) || b.From || null;
-        a = {
-          id: newId(),
-          userId: target.id,
-          url: artUrl,
-          savedAt: Date.parse(b.Date) || Date.now(),
-          archived: false, favorite: false, readParagraph: 0,
-          title: sanitizeString(b.Subject) || '(no subject)',
-          byline: sanitizeString(from),
-          siteName: 'Email',
-          excerpt: sanitizeString(text.replace(/\s+/g, ' ').trim(), 300),
-          html,
-          textContent: text ? text.slice(0, 200000) : null,
-          updatedAt: Date.now(),
-        };
-        store.insertArticle(a);
-      }
-      return json(res, 200, { ok: true, id: a.id });
+      const { article } = saveEmailArticle({
+        userId: target.id,
+        messageId,
+        subject: b.Subject,
+        from: (b.FromFull && (b.FromFull.Name || b.FromFull.Email)) || b.From || null,
+        date: b.Date,
+        html: b.HtmlBody,
+        text: b.TextBody,
+      });
+      return json(res, 200, { ok: true, id: article.id });
     } catch (e) {
       if (e instanceof SyntaxError) return json(res, 400, { error: 'invalid JSON body' });
       console.error(e);
@@ -527,18 +681,43 @@ const server = http.createServer(async (req, res) => {
     }
 
     // ---- full-account export (articles incl. HTML + all highlights)
+    // Streamed row by row: a full account is far larger than this machine's
+    // heap, so it is never assembled in memory. No Content-Length (chunked).
     if (req.method === 'GET' && parts[1] === 'export.json' && parts.length === 2) {
-      const body = JSON.stringify({
-        exportedAt: Date.now(),
-        username: user.username,
-        ...store.exportUser(user.id),
-      });
       res.writeHead(200, {
         'Content-Type': 'application/json; charset=utf-8',
-        'Content-Length': Buffer.byteLength(body),
-        'Content-Disposition': 'attachment; filename="readlater-export.json"',
+        'Content-Disposition': 'attachment; filename="earmark-export.json"',
+        'Cache-Control': 'no-store',
       });
-      return res.end(body);
+      try {
+        await streamExport(res, user);
+      } catch (e2) {
+        // Headers are long gone, so this cannot become a 5xx. Abort instead:
+        // the truncated JSON won't parse, so a consumer fails loudly rather
+        // than trusting a half-file.
+        console.error('export failed midstream:', e2.message);
+        res.destroy();
+      }
+      return;
+    }
+
+    // ---- same data, line-delimited: the format to back up with (see above)
+    if (req.method === 'GET' && parts[1] === 'export.ndjson' && parts.length === 2) {
+      res.writeHead(200, {
+        'Content-Type': 'application/x-ndjson; charset=utf-8',
+        'Content-Disposition': 'attachment; filename="earmark-export.ndjson"',
+        'Cache-Control': 'no-store',
+      });
+      try {
+        await streamExportNdjson(res, user);
+      } catch (e) {
+        // Abort rather than end cleanly: every line of a truncated NDJSON file
+        // still parses, so the missing "end" trailer is the only thing that
+        // tells a backup script the file is incomplete.
+        console.error('export failed midstream:', e.message);
+        res.destroy();
+      }
+      return;
     }
 
     // ---- Android APK hosting: POST uploads a build (streamed to the data
@@ -649,7 +828,7 @@ const server = http.createServer(async (req, res) => {
         const image = sanitizeString(b.image, 2000);
         const pub = typeof b.publishedAt === 'number' ? b.publishedAt
           : (b.publishedAt ? Date.parse(String(b.publishedAt)) : NaN);
-        const fields = {
+        const fields = withSkipRules(user.id, {
           title: sanitizeString(b.title) || artUrl,
           byline: sanitizeString(b.byline),
           siteName: sanitizeString(b.siteName),
@@ -659,7 +838,14 @@ const server = http.createServer(async (req, res) => {
           imageUrl: image && /^https?:\/\//i.test(image) ? image : null,
           publishedAt: Number.isFinite(pub) && pub > 0 && pub < now + 86400000 ? pub : null,
           updatedAt: now,
-        };
+        });
+        // Keep the extension's captured page (only sent for weak parses) as the
+        // raw source, so those — the ones most likely to be mis-parsed — can be
+        // reparsed and shown in the original. A normal, clean save sends none and
+        // we store nothing (reparse re-fetches the URL instead).
+        if (typeof b.fallbackHtml === 'string' && b.fallbackHtml.trim()) {
+          fields.sourceHtml = b.fallbackHtml.slice(0, SOURCE_CAP);
+        }
         let a = store.articleByUrl(user.id, artUrl);
         if (a) {
           store.updateArticleContent(a.id, fields);
@@ -692,7 +878,7 @@ const server = http.createServer(async (req, res) => {
               // Only upgrade if the LLM actually found more than we had.
               const currentLen = (current.textContent || '').length;
               if (better.textContent.length <= currentLen * 1.5 && currentLen > 800) return;
-              store.updateArticleContent(articleId, {
+              store.updateArticleContent(articleId, withSkipRules(user.id, {
                 title: current.title,
                 byline: current.byline,
                 siteName: current.siteName,
@@ -700,7 +886,7 @@ const server = http.createServer(async (req, res) => {
                 html: better.html,
                 textContent: better.textContent,
                 updatedAt: Date.now(),
-              });
+              }));
               console.log(`LLM rescue upgraded article ${articleId} (${currentLen} → ${better.textContent.length} chars)`);
             })
             .catch((e) => console.error(`LLM rescue failed for ${articleId}: ${e.message}`));
@@ -818,6 +1004,54 @@ const server = http.createServer(async (req, res) => {
       }
     }
 
+    // ---- reparse a mis-parsed article. The user says what's wrong (hint), we
+    // re-extract from the raw source (or a fresh fetch) and overwrite the parse.
+    // Synchronous so the client gets the result — heuristic is fast, the LLM
+    // path can take a few seconds, so clients allow a longer timeout here.
+    if (req.method === 'POST' && parts.length === 4 && parts[1] === 'articles' && parts[3] === 'reparse') {
+      const a = store.getArticle(parts[2], user.id);
+      if (!a) return json(res, 404, { error: 'article not found' });
+      const b = parseBody(await readBody(req), req.headers['content-type']);
+      const hint = ['too-short', 'too-long', 'other'].includes(b.hint) ? b.hint : 'other';
+      const result = await reparse({
+        url: a.url,
+        title: a.title,
+        hint,
+        sourceHtml: store.getArticleSource(a.id, user.id),
+        currentTextLen: (a.textContent || '').length,
+        fetchUrl: fetchPageHtml,
+      });
+      if (!result.ok) return json(res, 200, { ok: false, reason: result.reason });
+      const art = result.article;
+      store.updateArticleContent(a.id, withSkipRules(user.id, {
+        title: art.title || a.title,
+        byline: art.byline != null ? art.byline : a.byline,
+        siteName: art.siteName || a.siteName,
+        excerpt: art.excerpt || (art.textContent || '').slice(0, 300),
+        html: art.html,
+        textContent: art.textContent,
+        updatedAt: Date.now(),
+      }));
+      // The parse changed, so paragraph indices moved — reset read/listen
+      // positions rather than leave them pointing into the wrong paragraph.
+      store.patchArticle(a.id, { readParagraph: 0, ttsParagraph: 0, updatedAt: Date.now() });
+      enqueueTts(a.id, user.id, true);
+      return json(res, 200, { ok: true, method: result.method, article: pubArticle(store.getArticle(a.id, user.id)) });
+    }
+
+    // ---- raw source for "view original": the captured source if we kept one,
+    // else a fresh fetch for a normal web URL.
+    if (req.method === 'GET' && parts.length === 4 && parts[1] === 'articles' && parts[3] === 'source') {
+      const a = store.getArticle(parts[2], user.id);
+      if (!a) return json(res, 404, { error: 'article not found' });
+      let source = store.getArticleSource(a.id, user.id);
+      let kind = source ? (a.url.startsWith('email:') ? 'email' : 'captured') : 'none';
+      if (!source && /^https?:\/\//i.test(a.url)) {
+        try { source = await fetchPageHtml(a.url); kind = 'web'; } catch { source = ''; }
+      }
+      return json(res, 200, { url: a.url, kind, hasSource: !!source, source: source || null });
+    }
+
     // ---- highlights nested under an article
     if (parts[1] === 'articles' && parts.length === 4 && parts[3] === 'highlights') {
       const a = store.getArticle(parts[2], user.id);
@@ -868,7 +1102,7 @@ const server = http.createServer(async (req, res) => {
       const artUrl = 'pdf:' + crypto.createHash('sha256').update(buf).digest('hex').slice(0, 24);
       const now = Date.now();
       let a = store.articleByUrl(user.id, artUrl);
-      const fields = {
+      const fields = withSkipRules(user.id, {
         title: sanitizeString(parsed.title) || filename,
         byline: null,
         siteName: 'PDF',
@@ -876,7 +1110,7 @@ const server = http.createServer(async (req, res) => {
         html: parsed.html,
         textContent: parsed.textContent.slice(0, 500000),
         updatedAt: now,
-      };
+      });
       if (a) {
         store.updateArticleContent(a.id, fields);
       } else {
@@ -891,6 +1125,37 @@ const server = http.createServer(async (req, res) => {
     }
 
     // ---- saved views (named filter sets shown as tabs in the clients)
+    // ---- skip rules: boilerplate phrases dropped from future saves
+    if (parts[1] === 'skip-rules') {
+      if (req.method === 'GET' && parts.length === 2) {
+        return json(res, 200, { rules: store.listSkipRules(user.id) });
+      }
+      if (req.method === 'POST' && parts.length === 2) {
+        const b = parseBody(await readBody(req), req.headers['content-type']);
+        const phrase = String(b.phrase || '').replace(/\s+/g, ' ').trim();
+        const err = skip.phraseError(phrase);
+        if (err) return json(res, 400, { error: `phrase ${err}` });
+        const rule = { id: newId(), userId: user.id, phrase, createdAt: Date.now() };
+        try {
+          store.insertSkipRule(rule);
+        } catch (e) {
+          if (/UNIQUE/i.test(e.message)) return json(res, 409, { error: 'you already have that rule' });
+          throw e;
+        }
+        // Rules are not retroactive; report how many saved articles contain the
+        // phrase so an over-broad one is obvious before it eats future saves.
+        return json(res, 201, {
+          id: rule.id, phrase, hits: 0, createdAt: rule.createdAt,
+          existingMatches: store.countArticlesContaining(user.id, phrase),
+        });
+      }
+      if (req.method === 'DELETE' && parts.length === 3) {
+        const { changes } = store.deleteSkipRule(parts[2], user.id);
+        if (!changes) return json(res, 404, { error: 'rule not found' });
+        return json(res, 200, { ok: true });
+      }
+    }
+
     if (parts[1] === 'views') {
       if (req.method === 'GET' && parts.length === 2) {
         return json(res, 200, { views: store.listViews(user.id).map(({ userId, ...v }) => v) });
@@ -969,5 +1234,9 @@ server.listen(PORT, '0.0.0.0', () => {
   }
   if (INBOUND_SECRET) {
     console.log(`Email-to-save enabled${INBOUND_DOMAIN ? ` for @${INBOUND_DOMAIN}` : ''} — webhook at /api/inbound-email`);
+  }
+  if (!inbound.start({ saveEmailArticle, findUserByName, crypto })) {
+    console.log('IMAP inbox polling disabled (set READLATER_IMAP_HOST, _USER, _PASS ' +
+      'and _SAVE_TO_EARMARK_USER to enable)');
   }
 });

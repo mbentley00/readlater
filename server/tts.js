@@ -12,6 +12,13 @@ const { spawn } = require('child_process');
 //   TTS_MODEL     default hexgrad/Kokoro-82M
 //   TTS_VOICE     default af_bella
 //   TTS_SAMPLE_RATE default 24000 (Kokoro's native rate)
+//
+// Pause shortening (Kokoro dwells at commas):
+//   TTS_SHORTEN_PAUSES  '0' to disable; on by default
+//   TTS_MAX_PAUSE_MS    longest silence to leave alone, default 260
+//   TTS_PAUSE_DBFS      what counts as silence, default -42
+// Audio is cached per article, so changing these only affects new synthesis —
+// POST /api/articles/{id}/audio to force one to regenerate.
 
 const DEFAULT_URL = 'https://api.deepinfra.com/v1/openai/audio/speech';
 const MAX_CHUNK_CHARS = 1000; // keep each API call well within provider limits
@@ -130,6 +137,101 @@ function wavHeader(pcmLen, sampleRate) {
   return h;
 }
 
+// ---- pause shortening -------------------------------------------------------
+//
+// Kokoro leaves a long pause at every comma. ffmpeg's `silenceremove` can cut
+// them, but it trims from the *edges* of each silent run, which eats the tail
+// of the preceding word and the onset of the next — that's why TTS_CAP_SILENCE
+// exists and is off.
+//
+// Instead: find each run of near-silence and, if it is longer than the cap,
+// delete from its MIDDLE, keeping equal halves at both ends. The decay out of a
+// word and the onset into the next are preserved exactly; only dead air in the
+// centre disappears. Both splice points sit deep in sub-threshold audio, and a
+// short crossfade guarantees no step discontinuity (click).
+
+const SHORTEN_PAUSES = process.env.TTS_SHORTEN_PAUSES !== '0'; // on by default
+const MAX_PAUSE_MS = parseInt(process.env.TTS_MAX_PAUSE_MS || '260', 10);
+const PAUSE_DBFS = parseFloat(process.env.TTS_PAUSE_DBFS || '-42'); // "silence" ceiling
+const FRAME_MS = 10;   // analysis granularity
+const XFADE_MS = 3;    // blend across each splice
+
+/**
+ * Shrink every silent run longer than maxPauseMs down to maxPauseMs.
+ * Pure function over 16-bit mono PCM; returns the input untouched when there is
+ * nothing to do, so callers can pass it through unconditionally.
+ */
+function shortenPauses(pcm, sampleRate, {
+  maxPauseMs = MAX_PAUSE_MS, dbfs = PAUSE_DBFS, frameMs = FRAME_MS, xfadeMs = XFADE_MS,
+} = {}) {
+  const samples = Math.floor(pcm.length / 2);
+  const frame = Math.max(1, Math.round((sampleRate * frameMs) / 1000));
+  const maxPauseSamples = Math.round((sampleRate * maxPauseMs) / 1000);
+  if (samples < frame * 2 || maxPauseSamples <= 0) return pcm;
+
+  const threshold = 32767 * Math.pow(10, dbfs / 20);
+  const peakAt = (i) => Math.abs(pcm.readInt16LE(i * 2));
+
+  // Classify each frame as silent / loud by its peak.
+  const frames = Math.floor(samples / frame);
+  const silent = new Uint8Array(frames);
+  for (let f = 0; f < frames; f++) {
+    let peak = 0;
+    for (let i = f * frame; i < (f + 1) * frame; i++) {
+      const v = peakAt(i);
+      if (v > peak) peak = v;
+      if (peak > threshold) break;
+    }
+    silent[f] = peak <= threshold ? 1 : 0;
+  }
+
+  // Walk silent runs, keeping the outer halves of any that exceed the cap.
+  const keep = []; // [startSample, endSample) ranges to retain, in order
+  let cursor = 0;
+  let f = 0;
+  while (f < frames) {
+    if (!silent[f]) { f++; continue; }
+    let end = f;
+    while (end < frames && silent[end]) end++;
+    const runStart = f * frame;
+    const runEnd = end * frame;
+    const runLen = runEnd - runStart;
+    if (runLen > maxPauseSamples) {
+      const half = Math.floor(maxPauseSamples / 2);
+      keep.push([cursor, runStart + half]);       // ...speech + decay into the pause
+      cursor = runEnd - (maxPauseSamples - half); // onset out of the pause + speech...
+    }
+    f = end;
+  }
+  if (!keep.length) return pcm; // no run exceeded the cap
+  keep.push([cursor, samples]);
+
+  const total = keep.reduce((n, [a, b]) => n + (b - a), 0);
+  const out = Buffer.alloc(total * 2);
+  const seams = [];
+  let w = 0;
+  for (let k = 0; k < keep.length; k++) {
+    const [a, b] = keep[k];
+    for (let i = a; i < b; i++) out.writeInt16LE(pcm.readInt16LE(i * 2), (w + i - a) * 2);
+    w += b - a;
+    if (k < keep.length - 1) seams.push({ at: w, before: b - a, after: keep[k + 1][1] - keep[k + 1][0] });
+  }
+
+  // Ramp down into each seam and back up out of it. Both sides are already
+  // sub-threshold, so this removes the step without audibly ducking speech.
+  const xfade = Math.max(1, Math.round((sampleRate * xfadeMs) / 1000));
+  for (const { at, before, after } of seams) {
+    const n = Math.min(xfade, before, after);
+    for (let i = 0; i < n; i++) {
+      const outIdx = (at - n + i) * 2;
+      out.writeInt16LE(Math.round(out.readInt16LE(outIdx) * (1 - i / n)), outIdx);
+      const inIdx = (at + i) * 2;
+      out.writeInt16LE(Math.round(out.readInt16LE(inIdx) * (i / n)), inIdx);
+    }
+  }
+  return out;
+}
+
 // ---- synthesis --------------------------------------------------------------
 
 async function synthChunk(text) {
@@ -205,7 +307,10 @@ async function synthesizeArticle(article) {
       paraParts.push(pcm);
     }
     let paraPcm = Buffer.concat(paraParts);
-    if (paraPcm.length && CAP_SILENCE) {
+    if (paraPcm.length && SHORTEN_PAUSES) {
+      try { paraPcm = shortenPauses(paraPcm, paraSr); } catch (e) { /* keep raw audio */ }
+    } else if (paraPcm.length && CAP_SILENCE) {
+      // legacy ffmpeg path, kept behind its env flag
       const capped = await capSilence(Buffer.concat([wavHeader(paraPcm.length, paraSr), paraPcm]));
       if (capped !== null) { try { paraPcm = pcmOf(capped).pcm; } catch (e) { /* keep raw */ } }
     }
@@ -285,4 +390,4 @@ function encodeOpus(wav) {
   });
 }
 
-module.exports = { enabled, paragraphsOf, synthesizeArticle, encodeOpus, cfg };
+module.exports = { enabled, paragraphsOf, synthesizeArticle, encodeOpus, cfg, shortenPauses };

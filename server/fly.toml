@@ -4,7 +4,16 @@ app = 'readlater-mbent'
 primary_region = 'sjc'
 
 [env]
-  READLATER_INBOUND_DOMAIN = 'in.doc-ent.com'
+  # Email-to-save: the server polls this mailbox over IMAP and saves each
+  # forwarded message as an article. The password lives in a Fly secret
+  # (READLATER_IMAP_PASS), never here.
+  READLATER_IMAP_HOST = 'mail.doc-ent.com'
+  READLATER_IMAP_USER = 'read@doc-ent.com'
+  # Not a mail setting: the Earmark username whose library forwarded mail
+  # lands in (as typed on the login page).
+  READLATER_IMAP_SAVE_TO_EARMARK_USER = 'michael'
+  READLATER_IMAP_ALLOW_FROM = 'bentley.michael.j@gmail.com'
+  READLATER_IMAP_INTERVAL = '120'
 
 [http_service]
   internal_port = 8090

@@ -32,7 +32,24 @@ If the page contains no article at all, respond with exactly: NONE`;
  * Returns {html, textContent} or null (disabled / no article found / error —
  * callers keep whatever extraction they already have).
  */
-async function extractArticle({ url, title, pageHtml }) {
+/** When a user reparses a mis-parsed article, they say what was wrong; turn
+ *  that into a concrete instruction so the model corrects that failure mode. */
+function hintInstruction(hint) {
+  switch (hint) {
+    case 'too-short':
+      return '\n\nThe previous extraction was TOO SHORT — it dropped real article '
+        + 'text. Be thorough: include the COMPLETE body, every paragraph, and do '
+        + 'not stop early.';
+    case 'too-long':
+      return '\n\nThe previous extraction was TOO LONG — it kept boilerplate. Be '
+        + 'stricter: return ONLY the article body, excluding navigation, ads, '
+        + 'related links, comments, newsletter chrome, headers and footers.';
+    default:
+      return '';
+  }
+}
+
+async function extractArticle({ url, title, pageHtml, hint }) {
   const c = getClient();
   if (!c) return null;
   try {
@@ -42,7 +59,7 @@ async function extractArticle({ url, title, pageHtml }) {
       system: SYSTEM,
       messages: [{
         role: 'user',
-        content: `URL: ${url}\nTitle hint: ${title}\n\nPage HTML:\n${String(pageHtml).slice(0, MAX_INPUT_CHARS)}`,
+        content: `URL: ${url}\nTitle hint: ${title}${hintInstruction(hint)}\n\nPage HTML:\n${String(pageHtml).slice(0, MAX_INPUT_CHARS)}`,
       }],
     });
     const text = response.content
