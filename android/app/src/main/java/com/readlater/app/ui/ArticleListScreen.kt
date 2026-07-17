@@ -187,6 +187,28 @@ fun ArticleListScreen(
     }
 
     var showViewsDialog by remember { mutableStateOf(false) }
+
+    // How many articles sit behind each chip. Computed once in the background
+    // rather than from a live flow: the inbox holds a few hundred articles while
+    // the library holds tens of thousands, so keeping the whole library loaded
+    // just to size the chips would slow down the screen you look at most. The
+    // trade-off is that a count can lag a change by a moment — recomputed after
+    // each sync and whenever the views change, which is close enough for a label.
+    var inboxCount by remember { mutableStateOf<Int?>(null) }
+    var archiveCount by remember { mutableStateOf<Int?>(null) }
+    var viewCounts by remember { mutableStateOf<Map<String, Int>>(emptyMap()) }
+    LaunchedEffect(views, syncing) {
+        if (syncing) return@LaunchedEffect // recount once it settles, not mid-write
+        runCatching { repo.articlesForCounting() }.onSuccess { (all, hl) ->
+            inboxCount = all.count { !it.archived }
+            archiveCount = all.count { it.archived }
+            viewCounts = views.associate { v ->
+                v.id to all.count { matchesView(it, v, hl[it.id] ?: 0) }
+            }
+        }
+    }
+    /** Chip label with its count once known — "Inbox" until then, never "Inbox (…)". */
+    fun chipLabel(name: String, n: Int?): String = if (n == null) name else "$name  $n"
     // Publishers present in the loaded library, most common first (quick-picks).
     val topDomains = remember(unsorted) {
         unsorted.mapNotNull {
@@ -453,12 +475,12 @@ fun ArticleListScreen(
                 FilterChip(
                     selected = !showArchived && selectedView == null,
                     onClick = { showArchived = false; selectedViewId = null },
-                    label = { Text("Inbox") }
+                    label = { Text(chipLabel("Inbox", inboxCount), maxLines = 1) }
                 )
                 FilterChip(
                     selected = showArchived && selectedView == null,
                     onClick = { showArchived = true; selectedViewId = null },
-                    label = { Text("Archive") }
+                    label = { Text(chipLabel("Archive", archiveCount), maxLines = 1) }
                 )
                 views.forEach { v ->
                     FilterChip(
@@ -466,7 +488,7 @@ fun ArticleListScreen(
                         onClick = {
                             selectedViewId = if (selectedViewId == v.id) null else v.id
                         },
-                        label = { Text(v.name) }
+                        label = { Text(chipLabel(v.name, viewCounts[v.id]), maxLines = 1) }
                     )
                 }
                 FilterChip(

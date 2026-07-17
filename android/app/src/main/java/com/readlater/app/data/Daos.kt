@@ -25,6 +25,20 @@ interface ArticleDao {
     )
     fun allArticlesFlow(): Flow<List<ArticleEntity>>
 
+    /**
+     * One-shot version of [allArticlesFlow], for counting how many articles each
+     * saved view holds. A *flow* over the whole library would keep tens of
+     * thousands of rows live behind the inbox — which only needs a few hundred —
+     * so the counts are computed once in the background instead, and are allowed
+     * to lag a little rather than slow the list down.
+     */
+    @Query(
+        "SELECT id, url, title, byline, siteName, excerpt, NULL AS html, savedAt, updatedAt, " +
+            "archived, favorite, readParagraph, dirty, wordCount, paragraphCount, ttsParagraph, " +
+            "imageUrl, publishedAt FROM articles"
+    )
+    suspend fun allArticlesOnce(): List<ArticleEntity>
+
     @Query("SELECT * FROM articles WHERE id = :id")
     fun articleFlow(id: String): Flow<ArticleEntity?>
 
@@ -87,6 +101,10 @@ interface HighlightDao {
 
     @Query("SELECT articleId, COUNT(*) AS n FROM highlights GROUP BY articleId")
     fun countsByArticle(): Flow<List<HighlightCount>>
+
+    /** One-shot counts, for the background view-count pass (see allArticlesOnce). */
+    @Query("SELECT articleId, COUNT(*) AS n FROM highlights GROUP BY articleId")
+    suspend fun countsByArticleOnce(): List<HighlightCount>
 
     @Query(
         "SELECT h.clientId, h.serverId, h.articleId, h.text, h.note, h.paragraphIndex, " +

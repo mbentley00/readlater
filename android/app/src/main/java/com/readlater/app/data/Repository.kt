@@ -29,6 +29,16 @@ class Repository(
 
     fun allArticles(): Flow<List<ArticleEntity>> = articleDao.allArticlesFlow()
 
+    /** Whole library + per-article highlight counts, fetched once off the main
+     *  thread. Used to size the view chips without putting the entire library
+     *  behind the inbox list. */
+    suspend fun articlesForCounting(): Pair<List<ArticleEntity>, Map<String, Int>> =
+        withContext(Dispatchers.IO) {
+            val all = articleDao.allArticlesOnce()
+            val counts = highlightDao.countsByArticleOnce().associate { it.articleId to it.n }
+            all to counts
+        }
+
     fun highlightCounts(): Flow<List<HighlightCount>> = highlightDao.countsByArticle()
 
     suspend fun fetchViews(): List<RemoteView> = api.listViews().also {
