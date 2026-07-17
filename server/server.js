@@ -178,11 +178,21 @@ function ogImage(pageHtml, baseUrl) {
  * Save-time only: paragraph indices anchor highlights and reading positions,
  * so filtering an article that already has them would re-anchor them silently.
  */
-function withSkipRules(userId, fields) {
+function withSkipRules(userId, fields, url) {
+  // Built-in per-publisher rules run first (they truncate), then the user's
+  // phrase rules run over what's left.
+  let input = fields;
+  if (url) {
+    const { truncated, ...cut } = skip.applyDomainRules(url, input);
+    if (truncated) {
+      console.log(`domain rule: truncated ${url} at its end-of-article mark`);
+      input = cut;
+    }
+  }
   const rules = store.listSkipRules(userId);
-  if (!rules.length) return fields;
-  const { removed, ...clean } = skip.applySkipRules(rules, fields);
-  if (!removed.length) return fields;
+  if (!rules.length) return input;
+  const { removed, ...clean } = skip.applySkipRules(rules, input);
+  if (!removed.length) return input;
 
   const perRule = new Map();
   for (const r of removed) perRule.set(r.ruleId, (perRule.get(r.ruleId) || 0) + 1);
@@ -199,7 +209,7 @@ async function fillSavedUrl(articleId, userId, artUrl) {
     const cur = store.getArticle(articleId, userId);
     if (cur) {
       store.updateArticleContent(articleId, withSkipRules(userId,
-        { byline: null, siteName: hostOf(artUrl), updatedAt: Date.now(), ...fields }));
+        { byline: null, siteName: hostOf(artUrl), updatedAt: Date.now(), ...fields }, artUrl));
     }
     return cur;
   };
@@ -259,7 +269,7 @@ async function fillSavedUrl(articleId, userId, artUrl) {
           title: cur.title, byline: cur.byline, siteName: cur.siteName,
           excerpt: better.textContent.slice(0, 300),
           html: better.html, textContent: better.textContent, updatedAt: Date.now(),
-        }));
+        }, artUrl));
         enqueueTts(articleId, userId, true);
         console.log(`save-url LLM-upgraded ${articleId} (${(cur.textContent || '').length} → ${better.textContent.length})`);
       })
@@ -838,7 +848,7 @@ const server = http.createServer(async (req, res) => {
           imageUrl: image && /^https?:\/\//i.test(image) ? image : null,
           publishedAt: Number.isFinite(pub) && pub > 0 && pub < now + 86400000 ? pub : null,
           updatedAt: now,
-        });
+        }, artUrl);
         // Keep the extension's captured page (only sent for weak parses) as the
         // raw source, so those — the ones most likely to be mis-parsed — can be
         // reparsed and shown in the original. A normal, clean save sends none and
@@ -886,7 +896,7 @@ const server = http.createServer(async (req, res) => {
                 html: better.html,
                 textContent: better.textContent,
                 updatedAt: Date.now(),
-              }));
+              }, artUrl));
               console.log(`LLM rescue upgraded article ${articleId} (${currentLen} → ${better.textContent.length} chars)`);
             })
             .catch((e) => console.error(`LLM rescue failed for ${articleId}: ${e.message}`));
@@ -1034,7 +1044,7 @@ const server = http.createServer(async (req, res) => {
         html: art.html,
         textContent: art.textContent,
         updatedAt: Date.now(),
-      }));
+      }, a.url));
       // The parse changed, so paragraph indices moved — reset read/listen
       // positions rather than leave them pointing into the wrong paragraph.
       store.patchArticle(a.id, { readParagraph: 0, ttsParagraph: 0, updatedAt: Date.now() });

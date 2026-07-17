@@ -95,6 +95,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
@@ -164,13 +165,17 @@ private fun sendTtsCommand(
     context: Context,
     action: String,
     articleId: String? = null,
-    startParagraph: Int? = null
+    startParagraph: Int? = null,
+    /** Start playback in "play through" mode: archive each article as it
+     *  finishes and roll on to the next. Only ever turns it ON. */
+    autoAdvance: Boolean = false
 ) {
     val intent = Intent(context, TtsService::class.java).setAction(action)
     if (action == TtsService.ACTION_PLAY || action == TtsService.ACTION_SET_POSITION) {
         intent.putExtra(TtsService.EXTRA_ARTICLE_ID, articleId)
         intent.putExtra(TtsService.EXTRA_START_PARAGRAPH, startParagraph ?: -1)
     }
+    if (autoAdvance) intent.putExtra(TtsService.EXTRA_AUTO_ADVANCE, true)
     if (action == TtsService.ACTION_PLAY) {
         // PLAY must go through startForegroundService so the service may promote itself.
         ContextCompat.startForegroundService(context, intent)
@@ -201,7 +206,11 @@ fun ReaderScreen(articleId: String, onBack: () -> Unit, onOpenArticle: (String) 
     val isTtsThisArticle = ttsState.articleId == articleId
 
     val listState = rememberLazyListState()
-    var didInitialScroll by remember { mutableStateOf(false) }
+    // Saveable, and that is the whole mechanism behind not re-asking "resume
+    // where?" when you leave for another app and come back: that path recreates
+    // the Activity, restores this as true, and the question is skipped. Opening
+    // the article for real starts a fresh saveable scope, so it still gets asked.
+    var didInitialScroll by rememberSaveable { mutableStateOf(false) }
 
     // Bodies of archived articles aren't synced eagerly — fetch on open.
     LaunchedEffect(article?.id, article?.html == null) {
@@ -240,20 +249,18 @@ fun ReaderScreen(articleId: String, onBack: () -> Unit, onOpenArticle: (String) 
         if (!didInitialScroll && blocks.isNotEmpty()) {
             val read = (article?.readParagraph ?: 0).coerceIn(0, blocks.size - 1)
             val tts = (article?.ttsParagraph ?: 0).coerceIn(0, blocks.size - 1)
-            when {
-                // Already listening to this article — never interrupt with the
-                // chooser. This fires when you switch to another app mid-listen
-                // (the Activity is torn down and recreated) and come back while
-                // playback is still running; just land on the spoken paragraph
-                // and follow along.
-                isTtsThisArticle && ttsState.isPlaying -> {
-                    listState.scrollToBlock(ttsState.paragraphIndex.coerceIn(0, blocks.size - 1))
-                }
-                read > 0 && tts > 0 && kotlin.math.abs(read - tts) > 2 -> {
-                    listState.scrollToBlock(minOf(read, tts))
-                    resumeChoice = read to tts
-                }
-                else -> listState.scrollToBlock(maxOf(read, tts))
+            // Ask whenever the two positions have really diverged. This used to
+            // also skip the question whenever TTS happened to be playing this
+            // article, which was too blunt: opening an article that is playing,
+            // to read ahead of where it has spoken, is exactly when the positions
+            // differ and the choice matters most — and it silently jumped you to
+            // the spoken paragraph instead. Coming back to the app is handled by
+            // didInitialScroll surviving above, so erring toward asking is safe.
+            if (read > 0 && tts > 0 && kotlin.math.abs(read - tts) > 2) {
+                listState.scrollToBlock(minOf(read, tts))
+                resumeChoice = read to tts
+            } else {
+                listState.scrollToBlock(maxOf(read, tts))
             }
             didInitialScroll = true
         }
@@ -443,25 +450,36 @@ fun ReaderScreen(articleId: String, onBack: () -> Unit, onOpenArticle: (String) 
                         Icon(Icons.Filled.Search, contentDescription = "Find in article")
                     }
                     if (a != null) {
-                        // Archive & play next: archive this one, open the next
-                        // inbox article, and auto-start playing it.
+                        // "Play through": start reading THIS article aloud and keep
+                        // going — archive each one as it finishes and roll on to the
+                        // next. Tapping again while it's on turns it back into an
+                        // ordinary single-article listen.
+                        //
+                        // This used to archive the current article immediately and
+                        // jump to the next, which read as a second, mysterious play
+                        // button — it shared its icon with a bottom-bar toggle that
+                        // armed the same behaviour for later. There is now exactly
+                        // one control for playing through, and it starts here.
                         if (!a.archived) {
+                            val playingThrough = isTtsThisArticle && ttsState.autoAdvance
                             IconButton(onClick = {
-                                scope.launch {
-                                    val next = repo.nextInboxArticle(a)
-                                    repo.toggleArchive(a)
-                                    if (next != null) {
-                                        sendTtsCommand(context, TtsService.ACTION_PLAY, next.id, 0)
-                                        onOpenArticle(next.id)
-                                    } else {
-                                        sendTtsCommand(context, TtsService.ACTION_STOP)
-                                        onBack()
-                                    }
+                                if (playingThrough) {
+                                    sendTtsCommand(context, TtsService.ACTION_TOGGLE_AUTO_ADVANCE)
+                                } else {
+                                    followTts = true
+                                    sendTtsCommand(
+                                        context, TtsService.ACTION_PLAY, articleId,
+                                        autoAdvance = true
+                                    )
                                 }
                             }) {
                                 Icon(
                                     Icons.AutoMirrored.Filled.PlaylistPlay,
-                                    contentDescription = "Archive and play next"
+                                    contentDescription = if (playingThrough)
+                                        "Playing through the inbox — tap to stop after this article"
+                                    else "Play through: read this aloud, then archive it and play the next",
+                                    tint = if (playingThrough) MaterialTheme.colorScheme.primary
+                                    else LocalContentColor.current
                                 )
                             }
                         }
@@ -614,20 +632,12 @@ fun ReaderScreen(articleId: String, onBack: () -> Unit, onOpenArticle: (String) 
                     Icon(Icons.Filled.SkipNext, contentDescription = "Next paragraph")
                 }
                 // Stop playback entirely and dismiss the player (only while active).
+                // Play-through lives on the top bar's ▶≡ button — it used to also
+                // sit here, sharing that icon, which made the two bars look like
+                // they did the same things.
                 if (isTtsThisArticle) {
                     IconButton(onClick = { sendTtsCommand(context, TtsService.ACTION_STOP) }) {
                         Icon(Icons.Filled.Stop, contentDescription = "Stop")
-                    }
-                    // Auto-advance ("binge"): archive each article when it finishes
-                    // and play the next, on down the inbox until you stop. Only
-                    // shown once you're actually listening to this article.
-                    IconButton(onClick = { sendTtsCommand(context, TtsService.ACTION_TOGGLE_AUTO_ADVANCE) }) {
-                        Icon(
-                            Icons.AutoMirrored.Filled.PlaylistPlay,
-                            contentDescription = "Auto-advance: archive and play the next when this finishes",
-                            tint = if (ttsState.autoAdvance) MaterialTheme.colorScheme.primary
-                            else LocalContentColor.current
-                        )
                     }
                 }
                 // Jump the view back to the reading position and resume following.

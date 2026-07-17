@@ -859,7 +859,40 @@ async function reparseEngineChecks() {
   console.log('  Reparse engine (direction guard + email + no-source) ✔');
 }
 
+/** Economist articles end at a black square; nothing after it is the article. */
+function testEconomistEndMark() {
+  const { applyDomainRules, isEconomist } = require('./skip');
+  const html = '<div><p>Opening paragraph with real prose in it.</p>'
+    + '<p>The last sentence of the piece ends here.■</p></div>'
+    + '<div><h2>Explore more</h2><p>Subscribe to our newsletter.</p></div>';
+
+  assert.ok(isEconomist('https://www.economist.com/leaders/2026/07/17/x'), 'matches economist.com');
+  assert.ok(isEconomist('https://economist.com/x'), 'matches bare economist.com');
+  assert.ok(!isEconomist('https://economist.com.evil.example/x'), 'does not match a lookalike domain');
+  assert.ok(!isEconomist('https://nytimes.com/x'), 'does not match other publishers');
+
+  const cut = applyDomainRules('https://www.economist.com/x', { html, textContent: 'x' });
+  assert.ok(cut.truncated, 'truncates at the end mark');
+  assert.ok(/last sentence of the piece/.test(cut.html), 'keeps the sentence carrying the mark');
+  assert.ok(!/Explore more/.test(cut.html), 'drops trailing apparatus');
+  assert.ok(!/Subscribe to our newsletter/.test(cut.html), 'drops the subscription pitch');
+
+  // Guardrails: never truncate someone else's article, or one with no mark.
+  assert.strictEqual(applyDomainRules('https://nytimes.com/x', { html }).truncated, false, 'other domains untouched');
+  assert.strictEqual(
+    applyDomainRules('https://www.economist.com/x', { html: '<p>No mark in this one.</p>' }).truncated,
+    false, 'no mark means no truncation'
+  );
+
+  // A block that is only the mark carries no prose and goes too.
+  const solo = applyDomainRules('https://www.economist.com/x', { html: '<p>Real prose.</p><p>■</p><p>Junk.</p>' });
+  assert.ok(/Real prose/.test(solo.html) && !/Junk/.test(solo.html), 'solo mark: prose kept, junk dropped');
+
+  console.log('  Economist end-of-article mark ✔');
+}
+
 testEmailNormalization();
+testEconomistEndMark();
 testReparseEngine().catch((e) => { console.error(e); process.exit(1); });
 checkDockerfileCopiesEveryModule();
 main().catch((e) => { console.error(e); process.exit(1); });

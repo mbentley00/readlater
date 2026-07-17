@@ -75,6 +75,12 @@ class TtsService : Service() {
         const val EXTRA_START_PARAGRAPH = "startParagraph"
         const val EXTRA_SLEEP_MINUTES = "sleepMinutes"
 
+        /** On ACTION_PLAY: also switch auto-advance on, so this article plays and
+         *  then keeps going through the inbox. Only ever enables it — the
+         *  internal PLAY that hops to the next article omits it and must not
+         *  clear the mode it is running under. */
+        const val EXTRA_AUTO_ADVANCE = "autoAdvance"
+
         private const val CHANNEL_ID = "tts_playback"
         private const val NOTIFICATION_ID = 1001
 
@@ -322,6 +328,10 @@ class TtsService : Service() {
                 return@launch
             }
             articleId = article.id
+            // "Play through" starts here: the reader asks for it on the first
+            // article, and every later hop inherits it (handleArchiveAndNext
+            // reuses this path without the extra, which must not clear it).
+            if (intent.getBooleanExtra(EXTRA_AUTO_ADVANCE, false)) autoAdvance = true
             disarmArchive() // a pending confirmation never carries to a new article
             // Make this the cold-start resume target: if the process is killed
             // while listening, reopening returns to this article.

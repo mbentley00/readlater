@@ -102,4 +102,85 @@ function applySkipRules(rules, fields) {
   return { ...fields, html: root.innerHTML, textContent, excerpt, removed };
 }
 
-module.exports = { applySkipRules, phraseError, MAX_BLOCK_CHARS, MIN_PHRASE_CHARS, BLOCK_SELECTOR };
+// ---------------------------------------------------------------- domain rules
+//
+// Unlike skip rules — user phrases, matched anywhere — these are built-in and
+// structural: they know how one publisher marks the end of its articles.
+
+/** The Economist closes every article with a black square. */
+const ECONOMIST_END_MARK = '■';
+
+const hostOf = (url) => {
+  try { return new URL(String(url)).hostname.toLowerCase().replace(/^www\./, ''); }
+  catch { return ''; }
+};
+
+const isEconomist = (url) => {
+  const h = hostOf(url);
+  return h === 'economist.com' || h.endsWith('.economist.com');
+};
+
+/**
+ * Truncate an Economist article at its end-of-article mark.
+ *
+ * Their body copy ends with a black square (■); everything after it is trailing
+ * apparatus — "explore more", subscription pitches, related-article rails — that
+ * reads as part of the piece and, worse, gets spoken aloud after the article has
+ * actually finished.
+ *
+ * The marker's own block is KEPT (the square sits at the end of the last real
+ * sentence, so dropping the block would eat that sentence); everything after it
+ * in document order goes. A block-level marker that is only the square itself is
+ * dropped too, since it carries no prose.
+ *
+ * Returns fields unchanged when the article isn't the Economist's or has no
+ * marker — a missing square must never truncate an article to nothing.
+ */
+function applyDomainRules(url, fields) {
+  const html = fields.html || '';
+  if (!html || !isEconomist(url) || !html.includes(ECONOMIST_END_MARK)) {
+    return { ...fields, truncated: false };
+  }
+
+  let root;
+  try {
+    const { document } = parseHTML('<!doctype html><html><body></body></html>');
+    root = document.createElement('div');
+    document.body.appendChild(root);
+    root.innerHTML = html;
+  } catch {
+    return { ...fields, truncated: false }; // never lose the article over a rule
+  }
+
+  // querySelectorAll is document order, and an ancestor always precedes its
+  // descendants — so everything after the marker block is safe to remove.
+  const blocks = [...root.querySelectorAll(BLOCK_SELECTOR)];
+  const markIdx = blocks.findIndex((el) => (el.textContent || '').includes(ECONOMIST_END_MARK));
+  if (markIdx === -1) return { ...fields, truncated: false }; // square wasn't in a block
+
+  const mark = blocks[markIdx];
+  for (const el of blocks.slice(markIdx + 1)) {
+    if (el.isConnected) el.remove();
+  }
+  // Anything after the marker's block that isn't itself a block (stray divs,
+  // rails, trailing text) — walk up to the marker's top-level ancestor and drop
+  // every later sibling at each level.
+  for (let node = mark; node && node !== root; node = node.parentNode) {
+    while (node.nextSibling) node.parentNode.removeChild(node.nextSibling);
+  }
+  // A block holding only the square is apparatus, not prose.
+  if (norm(mark.textContent) === ECONOMIST_END_MARK) mark.remove();
+
+  const textContent = norm(root.textContent) || fields.textContent;
+  return {
+    ...fields,
+    html: root.innerHTML,
+    textContent: typeof fields.textContent === 'string' ? textContent : fields.textContent,
+    truncated: true,
+  };
+}
+
+module.exports = {
+  applySkipRules, phraseError, applyDomainRules, isEconomist,
+  MAX_BLOCK_CHARS, MIN_PHRASE_CHARS, BLOCK_SELECTOR, ECONOMIST_END_MARK,
+};
