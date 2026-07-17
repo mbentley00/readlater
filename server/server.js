@@ -34,7 +34,7 @@ const tts = require('./tts');
 const inbound = require('./inbound');
 const skip = require('./skip');
 const { emailToCleanHtml } = require('./email');
-const { reparse } = require('./reparse');
+const { reparse, textOf } = require('./reparse');
 
 // Cap raw source we keep for reparse/"view original" so a single huge message
 // can't blow the data volume. Big enough for any real newsletter or page.
@@ -1018,7 +1018,10 @@ const server = http.createServer(async (req, res) => {
         title: a.title,
         hint,
         sourceHtml: store.getArticleSource(a.id, user.id),
-        currentTextLen: (a.textContent || '').length,
+        // Measure the parse the user is actually looking at. textContent can be a
+        // different measure entirely — for emails it's the message's plain-text
+        // part, not the rendered body — which would make "too short" unfixable.
+        currentTextLen: textOf(a.html).length,
         fetchUrl: fetchPageHtml,
       });
       if (!result.ok) return json(res, 200, { ok: false, reason: result.reason });

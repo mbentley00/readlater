@@ -1538,7 +1538,15 @@ class TtsService : Service() {
         val file = serverAudioFile(id, fmt)
         if (file.length() < 44) {
             logDbg("downloading server audio ($fmt) for $id")
-            if (!app.apiClient.downloadAudio(id, fmt, file)) { logDbg("server audio download failed"); return false }
+            // The WiFi lock is held ONLY for the transfer: once the file is on
+            // disk, playback is entirely local and needs no radio at all.
+            acquireWifiLock()
+            val ok = try {
+                app.apiClient.downloadAudio(id, fmt, file)
+            } finally {
+                releaseWifiLock()
+            }
+            if (!ok) { logDbg("server audio download failed"); return false }
         }
         if (id != articleId || !isPlaying) return false // superseded while downloading
         serverOffsetsMs = meta.offsetsMs
@@ -1972,20 +1980,34 @@ class TtsService : Service() {
                 acquire(6 * 60 * 60 * 1000L) // safety cap: 6 hours
             }
         }
-        // Keep WiFi awake too, so downloading/waiting for server audio doesn't
-        // stall when the screen turns off.
-        if (wifiLock?.isHeld != true) {
-            val wm = applicationContext.getSystemService(Context.WIFI_SERVICE) as android.net.wifi.WifiManager
-            wifiLock = wm.createWifiLock(android.net.wifi.WifiManager.WIFI_MODE_FULL_HIGH_PERF, "ReadLater::TtsWifi").apply {
-                setReferenceCounted(false)
-                acquire()
-            }
-        }
     }
 
     private fun releaseWakeLock() {
         if (wakeLock?.isHeld == true) wakeLock?.release()
         wakeLock = null
+        releaseWifiLock()
+    }
+
+    /**
+     * Hold WiFi up for a server-audio download so it can't stall with the screen
+     * off. Scoped to the transfer ONLY — see releaseWifiLock.
+     *
+     * This used to be acquired alongside the wake lock and held for the entire
+     * listening session, which was a serious battery drain: WIFI_MODE_FULL_HIGH_PERF
+     * disables WiFi power-save, so the radio stayed at full power for hours while
+     * we played a file that was already on disk. Playback is local; only the
+     * download needs the network.
+     */
+    private fun acquireWifiLock() {
+        if (wifiLock?.isHeld == true) return
+        val wm = applicationContext.getSystemService(Context.WIFI_SERVICE) as android.net.wifi.WifiManager
+        wifiLock = wm.createWifiLock(android.net.wifi.WifiManager.WIFI_MODE_FULL_HIGH_PERF, "ReadLater::TtsWifi").apply {
+            setReferenceCounted(false)
+            acquire()
+        }
+    }
+
+    private fun releaseWifiLock() {
         if (wifiLock?.isHeld == true) wifiLock?.release()
         wifiLock = null
     }

@@ -790,10 +790,24 @@ function testEmailNormalization() {
   console.log('  Email normalization + dedup ✔');
 }
 
-/** Reparse engine: heuristic (Readability) path + graceful no-source. Runs with
- *  no ANTHROPIC_API_KEY in this process, so the LLM branch is skipped here (the
- *  LLM escalation is covered end-to-end by the reparse endpoint test in main). */
+/** Reparse engine: the cheap (heuristic) paths and the direction guard.
+ *
+ *  The LLM branch is deliberately disabled here by clearing ANTHROPIC_API_KEY —
+ *  a developer's real key is usually in the ambient environment, and without this
+ *  these tests fire real, billable API calls and their outcome depends on the
+ *  account's credit balance. LLM escalation is covered against a mock by the
+ *  reparse endpoint test in main(). */
 async function testReparseEngine() {
+  const realKey = process.env.ANTHROPIC_API_KEY;
+  delete process.env.ANTHROPIC_API_KEY;
+  try {
+    await reparseEngineChecks();
+  } finally {
+    if (realKey !== undefined) process.env.ANTHROPIC_API_KEY = realKey;
+  }
+}
+
+async function reparseEngineChecks() {
   const { reparse } = require('./reparse');
   const page = '<html><body><nav>menu menu menu</nav><article><h1>Real Title</h1>'
     + '<p>' + 'Solid article sentence number here. '.repeat(30) + '</p>'
@@ -814,7 +828,35 @@ async function testReparseEngine() {
   });
   assert.ok(!none.ok && none.reason === 'no-source', 'missing source reported, not thrown');
 
-  console.log('  Reparse engine (heuristic + no-source) ✔');
+  // REGRESSION: "too short" must never hand back something shorter. Here the
+  // current parse is already longer than anything the source can yield, so the
+  // only correct answer is to change nothing.
+  const shorter = await reparse({
+    url: 'https://x.example/a', title: 't', hint: 'too-short',
+    sourceHtml: page, currentTextLen: 100000, fetchUrl: null,
+  });
+  assert.ok(!shorter.ok, '"too short" refuses a shorter parse');
+  assert.strictEqual(shorter.reason, 'no-improvement', 'reports no-improvement rather than regressing');
+
+  // ...and symmetrically, "too long" must not hand back something longer.
+  const longer = await reparse({
+    url: 'https://x.example/a', title: 't', hint: 'too-long',
+    sourceHtml: page, currentTextLen: 10, fetchUrl: null,
+  });
+  assert.ok(!longer.ok, '"too long" refuses a longer parse');
+
+  // An email reparse uses the newsletter restructurer, not Readability.
+  const emailSrc = '<table><tr><td>' +
+    Array.from({ length: 12 }, (_, i) => `<p>Newsletter paragraph number ${i} with enough words to count as real prose here.</p>`).join('') +
+    '</td></tr></table>';
+  const mail = await reparse({
+    url: 'email:<abc@x>', title: 'NL', hint: 'too-short',
+    sourceHtml: emailSrc, currentTextLen: 20, fetchUrl: null,
+  });
+  assert.ok(mail.ok && mail.method === 'email-structure', 'email reparse uses the email restructurer');
+  assert.ok((mail.article.html.match(/<p>/g) || []).length >= 10, 'email reparse yields real paragraphs');
+
+  console.log('  Reparse engine (direction guard + email + no-source) ✔');
 }
 
 testEmailNormalization();
