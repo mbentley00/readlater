@@ -101,6 +101,9 @@ mark.flash { animation: hlflash 1.6s ease; }
 .hl-count { font-size:.8rem; font-family:system-ui,sans-serif; color:var(--accent); white-space:nowrap; }
 code.token { background:var(--card); border:1px solid var(--line); border-radius:6px; padding:.25rem .5rem; font-size:.85rem; user-select:all; overflow-wrap:anywhere; }
 .reader-actions { margin-top:.6rem; }
+/* article count on a view chip — present but never louder than the name */
+.chip-n { color:var(--muted); font-size:.85em; font-variant-numeric:tabular-nums; }
+.view-chip.active .chip-n { color:inherit; opacity:.75; }
 form.search { display:flex; gap:.5rem; align-items:center; flex-wrap:wrap; font-family:system-ui,sans-serif; font-size:.85rem; margin-bottom:1rem; }
 form.search input[type=search] { flex:1; min-width:12rem; padding:.4rem .6rem; border:1px solid var(--line); border-radius:6px; background:var(--card); color:var(--fg); }
 form.search select { padding:.35rem .4rem; border:1px solid var(--line); border-radius:6px; background:var(--card); color:var(--fg); max-width:14rem; }
@@ -248,11 +251,26 @@ function listPage(ctx, user, view, url) {
   const domainOptions = ctx.store.domainCounts(user.id)
     .map(({ domain: h, n }) => `<option value="${escapeHtml(h)}" ${h === domain ? 'selected' : ''}>${escapeHtml(h)} (${n})</option>`).join('');
 
+  // How many articles each view holds, so a view's size is visible before you
+  // open it. These are plain indexed COUNT(*)s (one per view, plus the inbox) —
+  // a few ms even on a 24k-article account — so they're exact rather than
+  // estimated. If a view ever grows an expensive filter, cache it rather than
+  // dropping the number: an approximate count is fine, a missing one isn't.
+  const countFor = (filters) => {
+    try { return ctx.store.countArticles(user.id, filters); }
+    catch { return null; } // never let a count break the page
+  };
+  const inboxCount = countFor({});
+  const chipCount = (n) => (n === null ? '' : ` <span class="chip-n">${n}</span>`);
+
   // saved views as chips; × deletes (via the page script)
   const viewChips = savedViews.length ? `
-<div class="views">${savedViews.map((v) => `
+<div class="views">
+  <span class="view-chip ${!savedView && !searching ? 'active' : ''}">
+    <a href="/">Inbox${chipCount(inboxCount)}</a>
+  </span>${savedViews.map((v) => `
   <span class="view-chip ${savedView && savedView.id === v.id ? 'active' : ''}">
-    <a href="/?view=v:${v.id}">${escapeHtml(v.name)}</a><button class="act del-view" data-view-id="${v.id}" title="Delete view">×</button>
+    <a href="/?view=v:${v.id}">${escapeHtml(v.name)}${chipCount(countFor({ ...v.filters, includeArchived: !!v.filters.includeArchived }))}</a><button class="act del-view" data-view-id="${v.id}" title="Delete view">×</button>
   </span>`).join('')}
 </div>` : '';
 
