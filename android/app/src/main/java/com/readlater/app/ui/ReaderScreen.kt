@@ -7,7 +7,10 @@ import android.webkit.WebView
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.ui.geometry.Offset
@@ -25,6 +28,7 @@ import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -50,7 +54,6 @@ import androidx.compose.material.icons.filled.PushPin
 import androidx.compose.material.icons.filled.Remove
 import androidx.compose.material.icons.filled.SkipNext
 import androidx.compose.material.icons.filled.SkipPrevious
-import androidx.compose.material.icons.filled.Speed
 import androidx.compose.material.icons.filled.Stop
 import androidx.compose.material.icons.filled.Star
 import androidx.compose.material.icons.filled.Search
@@ -140,9 +143,17 @@ private suspend fun LazyListState.animateScrollToBlock(block: Int) =
     animateScrollToItem(blockToItem(block))
 
 /** What the reader's bottom sheet is currently showing. */
+/** Speech rate for the bottom bar: "1.65×", "1.5×", "2×". Trailing zeros are
+ *  trimmed — the control sits in a tight row and every character counts. */
+private fun formatRate(rate: Float): String =
+    String.format(Locale.US, "%.2f", rate).trimEnd('0').trimEnd('.') + "×"
+
 private sealed class SheetTarget {
     data class Create(val index: Int, val text: String) : SheetTarget()
     data class View(val index: Int) : SheetTarget()
+
+    /** Every highlight in the article, reachable straight from the reader menu. */
+    object All : SheetTarget()
 }
 
 /** A sub-paragraph highlight the user is building by press-hold-dragging across
@@ -469,6 +480,28 @@ fun ReaderScreen(articleId: String, onBack: () -> Unit, onOpenArticle: (String) 
                                 contentDescription = if (a.archived) "Unarchive" else "Archive"
                             )
                         }
+                        // Straight to the whole article's highlights (view + delete).
+                        // Only shown when there are any, so it costs no space
+                        // otherwise; the count makes it obvious there's something
+                        // to look at.
+                        if (highlights.isNotEmpty()) {
+                            TextButton(
+                                onClick = { sheetTarget = SheetTarget.All },
+                                contentPadding = PaddingValues(horizontal = 8.dp)
+                            ) {
+                                Icon(
+                                    Icons.Filled.Star,
+                                    contentDescription = "Highlights",
+                                    modifier = Modifier.size(18.dp)
+                                )
+                                Spacer(modifier = Modifier.width(4.dp))
+                                Text(
+                                    text = "${highlights.size}",
+                                    style = MaterialTheme.typography.labelLarge,
+                                    maxLines = 1
+                                )
+                            }
+                        }
                         Box {
                             IconButton(onClick = { menuOpen = true }) {
                                 Icon(Icons.Filled.MoreVert, contentDescription = "More")
@@ -637,16 +670,24 @@ fun ReaderScreen(articleId: String, onBack: () -> Unit, onOpenArticle: (String) 
                 var speedMenu by remember { mutableStateOf(false) }
                 var pendingRate by remember { mutableStateOf(speechRate) }
                 Box {
-                    TextButton(onClick = { pendingRate = speechRate; speedMenu = true }) {
-                        Icon(Icons.Filled.Speed, contentDescription = null, modifier = Modifier.size(18.dp))
-                        Spacer(modifier = Modifier.width(4.dp))
-                        Text(String.format(Locale.US, "%.2f×", speechRate), style = MaterialTheme.typography.labelLarge)
+                    // Rate only — no icon. The bottom bar is tight and the icon
+                    // squeezed the label into wrapping ("1.65×" over two lines).
+                    TextButton(
+                        onClick = { pendingRate = speechRate; speedMenu = true },
+                        contentPadding = PaddingValues(horizontal = 8.dp)
+                    ) {
+                        Text(
+                            text = formatRate(speechRate),
+                            style = MaterialTheme.typography.labelLarge,
+                            maxLines = 1,
+                            softWrap = false
+                        )
                     }
                     DropdownMenu(expanded = speedMenu, onDismissRequest = { speedMenu = false }) {
                         Column(modifier = Modifier.width(260.dp).padding(horizontal = 16.dp, vertical = 8.dp)) {
                             Text(
                                 text = (if (serverActive) "Server voice" else "Device voice") +
-                                    " · " + String.format(Locale.US, "%.2f×", pendingRate),
+                                    " · " + formatRate(pendingRate),
                                 style = MaterialTheme.typography.labelLarge
                             )
                             Slider(
@@ -976,8 +1017,21 @@ fun ReaderScreen(articleId: String, onBack: () -> Unit, onOpenArticle: (String) 
                 )
 
                 is SheetTarget.View -> ViewHighlightsSheet(
+                    title = "Highlights on this paragraph",
                     highlights = highlightsByPara[target.index].orEmpty(),
                     onDelete = { h -> repo.deleteHighlight(h.clientId, h.serverId) }
+                )
+
+                is SheetTarget.All -> ViewHighlightsSheet(
+                    title = "Highlights (${highlights.size})",
+                    // Reading order, so the list matches the article.
+                    highlights = highlights.sortedBy { it.paragraphIndex },
+                    onDelete = { h -> repo.deleteHighlight(h.clientId, h.serverId) },
+                    onJumpTo = { h ->
+                        sheetTarget = null
+                        followTts = false
+                        scope.launch { listState.scrollToBlock(h.paragraphIndex.coerceIn(0, blocks.size - 1)) }
+                    }
                 )
             }
         }
@@ -1323,8 +1377,11 @@ private const val MIN_SKIP_PHRASE = 8
 
 @Composable
 private fun ViewHighlightsSheet(
+    title: String,
     highlights: List<HighlightEntity>,
-    onDelete: (HighlightEntity) -> Unit
+    onDelete: (HighlightEntity) -> Unit,
+    /** When set, tapping a highlight scrolls the reader to it (whole-article list). */
+    onJumpTo: ((HighlightEntity) -> Unit)? = null
 ) {
     Column(
         modifier = Modifier
@@ -1333,32 +1390,48 @@ private fun ViewHighlightsSheet(
             .padding(bottom = 32.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp)
     ) {
-        Text("Highlights on this paragraph", style = MaterialTheme.typography.titleMedium)
+        Text(title, style = MaterialTheme.typography.titleMedium)
         if (highlights.isEmpty()) {
             Text(
-                text = "No highlights here anymore.",
+                text = "No highlights yet. Long-press a paragraph to add one.",
                 style = MaterialTheme.typography.bodyMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
         }
-        highlights.forEach { h ->
-            Row(verticalAlignment = Alignment.Top) {
-                Column(modifier = Modifier.weight(1f)) {
-                    Text(
-                        text = "“${h.text}”",
-                        style = MaterialTheme.typography.bodyMedium
-                    )
-                    h.note?.takeIf { it.isNotBlank() }?.let { note ->
+        // The list can get long on a heavily-highlighted article, so it scrolls
+        // within the sheet rather than pushing the delete buttons off-screen.
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .heightIn(max = 420.dp)
+                .verticalScroll(rememberScrollState()),
+            verticalArrangement = Arrangement.spacedBy(12.dp)
+        ) {
+            highlights.forEach { h ->
+                Row(verticalAlignment = Alignment.Top) {
+                    Column(
+                        modifier = Modifier
+                            .weight(1f)
+                            .then(
+                                if (onJumpTo != null) Modifier.clickable { onJumpTo(h) } else Modifier
+                            )
+                    ) {
                         Text(
-                            text = note,
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            modifier = Modifier.padding(top = 4.dp)
+                            text = "“${h.text}”",
+                            style = MaterialTheme.typography.bodyMedium
                         )
+                        h.note?.takeIf { it.isNotBlank() }?.let { note ->
+                            Text(
+                                text = note,
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                modifier = Modifier.padding(top = 4.dp)
+                            )
+                        }
                     }
-                }
-                IconButton(onClick = { onDelete(h) }) {
-                    Icon(Icons.Filled.Delete, contentDescription = "Delete highlight")
+                    IconButton(onClick = { onDelete(h) }) {
+                        Icon(Icons.Filled.Delete, contentDescription = "Delete highlight")
+                    }
                 }
             }
         }

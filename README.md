@@ -191,7 +191,8 @@ Run the test suite with `node test.js`.
 2. Open the extension's **Settings** and enter your server URL + token, then
    **Test connection**.
 3. Save any article via the toolbar button, right-click → *Save page to
-   ReadLater*, or **Alt+T**.
+   Earmark*, or **Alt+D** (the toolbar tooltip shows whatever key is actually
+   bound, so a rebind in `about:addons` stays discoverable).
 
 ### Why this beats paywalls
 
