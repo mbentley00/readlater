@@ -26,6 +26,11 @@ const NOTIF_SETUP = 'earmark-setup';
 const QUIET_MS = 2500;    // flush once nothing new has arrived for this long
 const MAX_WAIT_MS = 12000; // ...but never sit on a summary longer than this
 
+// Toolbar badge timings. The outcome badge ('✓' / '!') has to outlast a glance
+// away from the screen, so it holds well past the save itself.
+const BADGE_HOLD_MS = 5000;   // how long '✓' / '!' stay on the icon
+const BADGE_STUCK_MS = 60000; // safety net: never pin '…' to the icon forever
+
 // notificationId -> URL to open when the user clicks the notification.
 const notifUrls = new Map();
 
@@ -114,16 +119,26 @@ async function savePage(tabId) {
     return { ok: false, error: 'not configured' };
   }
 
-  const setBadge = (text, color) => {
+  // The badge is the primary "did that work?" signal, so it has to survive long
+  // enough to be seen. Each call cancels the previous auto-clear: '…' used to
+  // schedule its own wipe 2.5s after the save STARTED, which then fired on top
+  // of the '✓' that replaced it — so a save taking ~2s flashed the checkmark for
+  // a few hundred ms, and one taking 2.5s never showed it at all. Only terminal
+  // states auto-clear; '…' holds until the outcome replaces it.
+  let badgeTimer = null;
+  const setBadge = (text, color, holdMs) => {
     const a = browser.browserAction || browser.action;
     if (!a) return;
+    if (badgeTimer !== null) { clearTimeout(badgeTimer); badgeTimer = null; }
     try { a.setBadgeBackgroundColor({ color: color || '#3d6b52', tabId }); } catch (e) {}
     try { a.setBadgeText({ text, tabId }); } catch (e) {}
-    if (!text) return;
-    setTimeout(() => { try { a.setBadgeText({ text: '', tabId }); } catch (e) {} }, 2500);
+    if (!text || !holdMs) return;
+    badgeTimer = setTimeout(() => { try { a.setBadgeText({ text: '', tabId }); } catch (e) {} }, holdMs);
   };
   // Immediate feedback so a slow/cold server doesn't feel like nothing happened.
-  setBadge('…');
+  // Every path below replaces this; the long timer is only a safety net so an
+  // unforeseen throw can't leave '…' pinned to the icon forever.
+  setBadge('…', null, BADGE_STUCK_MS);
 
   let article;
   try {
@@ -138,12 +153,12 @@ async function savePage(tabId) {
     });
     article = results && results[0];
   } catch (e) {
-    setBadge('!', '#b3261e');
+    setBadge('!', '#b3261e', BADGE_HOLD_MS);
     notifyError('Earmark: cannot read this page', e.message || e);
     return { ok: false, error: `This page cannot be captured (${e.message || e})` };
   }
   if (!article || !article.html) {
-    setBadge('!', '#b3261e');
+    setBadge('!', '#b3261e', BADGE_HOLD_MS);
     notifyError('Earmark: nothing to save', 'Could not find article content on this page.');
     return { ok: false, error: 'no article content found' };
   }
@@ -161,13 +176,13 @@ async function savePage(tabId) {
       const body = await res.text();
       throw new Error(`server replied ${res.status}: ${body.slice(0, 200)}`);
     }
-    setBadge('✓');
+    setBadge('✓', null, BADGE_HOLD_MS);
     const data = await res.json().catch(() => ({}));
     const readUrl = data && data.id ? `${serverUrl}/read/${data.id}` : null;
     notifySaved(article.title, readUrl);
     return { ok: true, title: article.title };
   } catch (e) {
-    setBadge('!', '#b3261e');
+    setBadge('!', '#b3261e', BADGE_HOLD_MS);
     notifyError('Earmark: save failed', e.message || e);
     return { ok: false, error: String(e.message || e) };
   }
