@@ -30,6 +30,34 @@ History, Bookmarks, Tools, Help). Firefox swallows those before the extension
 sees them, and the match ignores Shift — so `Alt+T` and `Alt+Shift+S` both fail
 silently. Pick a letter outside that set.
 
+## Publish an update
+
+`./publish.sh` signs the extension (Mozilla "unlisted") and uploads the `.xpi` to
+the server, which advertises it at `/extension/updates.json` so installed copies
+auto-update.
+
+```sh
+export AMO_KEY="user:XXXXXXXX:XX"   # addons.mozilla.org → Developer Hub → API Keys
+export AMO_SECRET="<64-hex secret>"
+export EARMARK_TOKEN="<API token from /settings>"
+
+./publish.sh            # bump the patch version if needed, sign, upload, verify
+./publish.sh 1.1.0      # publish an explicit version
+./publish.sh --check    # is the tree what browsers actually run? (no creds needed)
+```
+
+**Don't bump `manifest.json` by hand — the script owns the version.** Bumping and
+publishing used to be separate steps, and they drifted: the tooltip-shortcut
+feature sat committed in the tree while every browser kept running the older
+signed build, because the manifest had been bumped but nothing was ever signed.
+Editing the code is not shipping it; only `publish.sh` is. The script bumps past
+whatever is already published (Mozilla rejects re-signing an existing version),
+verifies `updates.json` actually serves the new build afterwards, and reminds you
+to commit the bump.
+
+`--check` is the cheap way to catch drift — it compares the manifest against what
+the server publishes and exits non-zero if they differ.
+
 ## Files
 
 | File | Role |
