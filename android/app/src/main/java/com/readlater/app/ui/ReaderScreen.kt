@@ -24,11 +24,13 @@ import androidx.compose.foundation.layout.IntrinsicSize
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -122,6 +124,7 @@ import com.readlater.app.tts.TtsService
 import kotlinx.coroutines.FlowPreview
 import kotlinx.coroutines.flow.debounce
 import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.launch
 import java.util.Locale
 import kotlin.math.roundToInt
@@ -166,16 +169,20 @@ private fun sendTtsCommand(
     action: String,
     articleId: String? = null,
     startParagraph: Int? = null,
-    /** Start playback in "play through" mode: archive each article as it
-     *  finishes and roll on to the next. Only ever turns it ON. */
-    autoAdvance: Boolean = false
+    /** Queue mode to start playback in: true = "play through" (archive each and
+     *  roll on), false = plain single-article listen. null (the default) leaves
+     *  the current mode untouched — for resume/transport commands that shouldn't
+     *  flip it. Only meaningful with ACTION_PLAY. */
+    autoAdvance: Boolean? = null
 ) {
     val intent = Intent(context, TtsService::class.java).setAction(action)
     if (action == TtsService.ACTION_PLAY || action == TtsService.ACTION_SET_POSITION) {
         intent.putExtra(TtsService.EXTRA_ARTICLE_ID, articleId)
         intent.putExtra(TtsService.EXTRA_START_PARAGRAPH, startParagraph ?: -1)
     }
-    if (autoAdvance) intent.putExtra(TtsService.EXTRA_AUTO_ADVANCE, true)
+    if (autoAdvance != null && action == TtsService.ACTION_PLAY) {
+        intent.putExtra(TtsService.EXTRA_AUTO_ADVANCE, autoAdvance)
+    }
     if (action == TtsService.ACTION_PLAY) {
         // PLAY must go through startForegroundService so the service may promote itself.
         ContextCompat.startForegroundService(context, intent)
@@ -204,6 +211,16 @@ fun ReaderScreen(articleId: String, onBack: () -> Unit, onOpenArticle: (String) 
 
     val ttsState by TtsService.stateFlow.collectAsState()
     val isTtsThisArticle = ttsState.articleId == articleId
+
+    // While playing through a queue, surface what's next in the view the listener
+    // was on (Repository.playQueue), so the footer can say "Next up: …".
+    val queuedActive = isTtsThisArticle && ttsState.autoAdvance
+    val nextUpId = remember(articleId, queuedActive) {
+        if (queuedActive) repo.nextIdInView(articleId) else null
+    }
+    val nextUpArticle by remember(nextUpId) {
+        nextUpId?.let { repo.article(it) } ?: flowOf(null)
+    }.collectAsState(initial = null)
 
     val listState = rememberLazyListState()
     // Saveable, and that is the whole mechanism behind not re-asking "resume
@@ -450,16 +467,45 @@ fun ReaderScreen(articleId: String, onBack: () -> Unit, onOpenArticle: (String) 
                         Icon(Icons.Filled.Search, contentDescription = "Find in article")
                     }
                     if (a != null) {
+                        // Regular play: listen to just THIS article, no queue. Sits
+                        // to the left of the play-through button and is tinted while
+                        // a plain (non-queued) listen of this article is going. The
+                        // bottom bar keeps the play/pause transport; this is the
+                        // "start a single listen / show it's the active mode" control.
+                        val regularActive = isTtsThisArticle && ttsState.isPlaying && !ttsState.autoAdvance
+                        IconButton(
+                            enabled = a.html != null,
+                            onClick = {
+                                when {
+                                    regularActive -> sendTtsCommand(context, TtsService.ACTION_PAUSE)
+                                    isTtsThisArticle && !ttsState.isPlaying && !ttsState.autoAdvance ->
+                                        sendTtsCommand(context, TtsService.ACTION_RESUME)
+                                    else -> {
+                                        // Start (or switch to) a plain listen from the
+                                        // current scroll position, forcing queue OFF.
+                                        followTts = true
+                                        sendTtsCommand(
+                                            context, TtsService.ACTION_PLAY, articleId,
+                                            itemToBlock(listState.firstVisibleItemIndex)
+                                                .coerceIn(0, (blocks.size - 1).coerceAtLeast(0)),
+                                            autoAdvance = false
+                                        )
+                                    }
+                                }
+                            }
+                        ) {
+                            Icon(
+                                Icons.Filled.PlayArrow,
+                                contentDescription = if (regularActive) "Pause" else "Play this article",
+                                tint = if (regularActive) MaterialTheme.colorScheme.primary
+                                else LocalContentColor.current
+                            )
+                        }
                         // "Play through": start reading THIS article aloud and keep
                         // going — archive each one as it finishes and roll on to the
-                        // next. Tapping again while it's on turns it back into an
-                        // ordinary single-article listen.
-                        //
-                        // This used to archive the current article immediately and
-                        // jump to the next, which read as a second, mysterious play
-                        // button — it shared its icon with a bottom-bar toggle that
-                        // armed the same behaviour for later. There is now exactly
-                        // one control for playing through, and it starts here.
+                        // next in the view. Tapping again while it's on turns it back
+                        // into an ordinary single-article listen. Tinted while queued
+                        // playback of this article is going.
                         if (!a.archived) {
                             val playingThrough = isTtsThisArticle && ttsState.autoAdvance
                             IconButton(onClick = {
@@ -484,41 +530,28 @@ fun ReaderScreen(articleId: String, onBack: () -> Unit, onOpenArticle: (String) 
                             }
                         }
                         // Plain archive: archive/unarchive and return to the list.
-                        // If this article is the one playing, stop playback too.
+                        // One exception: if we're archiving the article that's
+                        // currently playing through a playlist, hand it to the
+                        // service to archive and roll on to the next inbox
+                        // article — so archiving mid-playlist continues the
+                        // session instead of stopping it. The reader follows to
+                        // the next article via the archived-article effect above.
                         IconButton(onClick = {
                             val wasArchived = a.archived
-                            repo.toggleArchive(a)
-                            if (!wasArchived) {
-                                if (isTtsThisArticle) sendTtsCommand(context, TtsService.ACTION_STOP)
-                                onBack()
+                            if (!wasArchived && isTtsThisArticle && ttsState.autoAdvance) {
+                                sendTtsCommand(context, TtsService.ACTION_ARCHIVE_AND_NEXT)
+                            } else {
+                                repo.toggleArchive(a)
+                                if (!wasArchived) {
+                                    if (isTtsThisArticle) sendTtsCommand(context, TtsService.ACTION_STOP)
+                                    onBack()
+                                }
                             }
                         }) {
                             Icon(
                                 if (a.archived) Icons.Filled.Unarchive else Icons.Filled.Archive,
                                 contentDescription = if (a.archived) "Unarchive" else "Archive"
                             )
-                        }
-                        // Straight to the whole article's highlights (view + delete).
-                        // Only shown when there are any, so it costs no space
-                        // otherwise; the count makes it obvious there's something
-                        // to look at.
-                        if (highlights.isNotEmpty()) {
-                            TextButton(
-                                onClick = { sheetTarget = SheetTarget.All },
-                                contentPadding = PaddingValues(horizontal = 8.dp)
-                            ) {
-                                Icon(
-                                    Icons.Filled.Star,
-                                    contentDescription = "Highlights",
-                                    modifier = Modifier.size(18.dp)
-                                )
-                                Spacer(modifier = Modifier.width(4.dp))
-                                Text(
-                                    text = "${highlights.size}",
-                                    style = MaterialTheme.typography.labelLarge,
-                                    maxLines = 1
-                                )
-                            }
                         }
                         Box {
                             IconButton(onClick = { menuOpen = true }) {
@@ -528,6 +561,17 @@ fun ReaderScreen(articleId: String, onBack: () -> Unit, onOpenArticle: (String) 
                                 expanded = menuOpen,
                                 onDismissRequest = { menuOpen = false }
                             ) {
+                                // Highlights (view + delete) — only when the article
+                                // has any; moved here from a dedicated top-bar button.
+                                if (highlights.isNotEmpty()) {
+                                    DropdownMenuItem(
+                                        text = { Text("Highlights (${highlights.size})") },
+                                        leadingIcon = {
+                                            Icon(Icons.Filled.Star, contentDescription = null)
+                                        },
+                                        onClick = { menuOpen = false; sheetTarget = SheetTarget.All }
+                                    )
+                                }
                                 DropdownMenuItem(
                                     text = { Text("View original") },
                                     leadingIcon = {
@@ -592,7 +636,15 @@ fun ReaderScreen(articleId: String, onBack: () -> Unit, onOpenArticle: (String) 
             )
         },
         bottomBar = {
-            BottomAppBar {
+            // Footer: the transport row, and — while playing through a queue — a
+            // "Next up" line beneath it. The nav-bar inset is applied once on the
+            // Column so that extra line sits above the system bar, not behind it.
+            Surface(color = MaterialTheme.colorScheme.surfaceContainer) {
+              Column(modifier = Modifier.navigationBarsPadding()) {
+                BottomAppBar(
+                    containerColor = Color.Transparent,
+                    windowInsets = WindowInsets(0, 0, 0, 0),
+                ) {
                 IconButton(onClick = { sendTtsCommand(context, TtsService.ACTION_PREV) }) {
                     Icon(Icons.Filled.SkipPrevious, contentDescription = "Previous paragraph")
                 }
@@ -710,6 +762,22 @@ fun ReaderScreen(articleId: String, onBack: () -> Unit, onOpenArticle: (String) 
                         }
                     }
                 }
+                }
+                // "Next up" — the next article in the view being played through.
+                if (queuedActive) {
+                    Text(
+                        text = nextUpArticle?.title?.let { "Next up: $it" }
+                            ?: "Next up: end of the list",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(start = 16.dp, end = 16.dp, bottom = 6.dp)
+                    )
+                }
+              }
             }
         }
     ) { padding ->
@@ -937,6 +1005,16 @@ fun ReaderScreen(articleId: String, onBack: () -> Unit, onOpenArticle: (String) 
                         LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
                     } else {
                         Text("What's wrong with how this article was parsed? We'll re-extract it from the original source.")
+                        // How it was saved — parse failures often correlate with the
+                        // save method (live-DOM capture vs. server fetch vs. email).
+                        article?.source?.let { src ->
+                            Spacer(modifier = Modifier.height(8.dp))
+                            Text(
+                                "Saved via: $src",
+                                style = MaterialTheme.typography.labelMedium,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
                         Spacer(modifier = Modifier.height(12.dp))
                         TextButton(onClick = { doReparse("too-short") }, modifier = Modifier.fillMaxWidth()) {
                             Text("Too short — text is missing")

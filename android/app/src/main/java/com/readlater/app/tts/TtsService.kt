@@ -5,8 +5,10 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
+import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.ServiceInfo
 import android.media.AudioAttributes
 import android.media.AudioFocusRequest
@@ -70,6 +72,11 @@ class TtsService : Service() {
         const val ACTION_SET_POSITION = "com.readlater.app.tts.action.SET_POSITION"
         const val ACTION_SET_SLEEP_TIMER = "com.readlater.app.tts.action.SET_SLEEP_TIMER"
         const val ACTION_TOGGLE_AUTO_ADVANCE = "com.readlater.app.tts.action.TOGGLE_AUTO_ADVANCE"
+        /** Archive the article currently playing and roll on to the next inbox
+         *  article, playing it — the UI equivalent of the headset triple-tap, so
+         *  archiving during a play-through continues the playlist instead of
+         *  stopping it. */
+        const val ACTION_ARCHIVE_AND_NEXT = "com.readlater.app.tts.action.ARCHIVE_AND_NEXT"
 
         const val EXTRA_ARTICLE_ID = "articleId"
         const val EXTRA_START_PARAGRAPH = "startParagraph"
@@ -227,6 +234,7 @@ class TtsService : Service() {
             ACTION_SET_POSITION -> handleSetPosition(intent)
             ACTION_SET_SLEEP_TIMER -> handleSetSleepTimer(intent.getIntExtra(EXTRA_SLEEP_MINUTES, 0))
             ACTION_TOGGLE_AUTO_ADVANCE -> handleToggleAutoAdvance()
+            ACTION_ARCHIVE_AND_NEXT -> handleArchiveAndNext()
             // System-delivered media buttons (MediaButtonReceiver in the
             // manifest) route into the session callback.
             Intent.ACTION_MEDIA_BUTTON -> MediaButtonReceiver.handleIntent(mediaSession, intent)
@@ -288,10 +296,22 @@ class TtsService : Service() {
         pausedByFocusLoss = false
     }
 
+    /**
+     * The user swiped the app out of Recents. The service can be torn down
+     * without warning from here, so bank the position now.
+     */
+    override fun onTaskRemoved(rootIntent: Intent?) {
+        articleId?.let { app.repository.saveTtsPosition(it, currentIndex) }
+        super.onTaskRemoved(rootIntent)
+    }
+
     override fun onDestroy() {
-        // Best-effort: persist the listening position if we're being torn down
-        // mid-playback (repository scope is app-lived, so this survives us).
-        if (isPlaying) articleId?.let { app.repository.saveTtsPosition(it, currentIndex) }
+        // Best-effort: persist the listening position as we're torn down (the
+        // repository scope is app-lived, so this survives us). Not gated on
+        // isPlaying — a paused service can still be holding a position the user
+        // moved with next/prev, and that is exactly the state the system is
+        // most likely to reclaim.
+        articleId?.let { app.repository.saveTtsPosition(it, currentIndex) }
         stateFlow.value = TtsPlaybackState()
         releaseWakeLock()
         abandonAudioFocus()
@@ -328,10 +348,14 @@ class TtsService : Service() {
                 return@launch
             }
             articleId = article.id
-            // "Play through" starts here: the reader asks for it on the first
-            // article, and every later hop inherits it (handleArchiveAndNext
-            // reuses this path without the extra, which must not clear it).
-            if (intent.getBooleanExtra(EXTRA_AUTO_ADVANCE, false)) autoAdvance = true
+            // Queue mode is set ONLY when the caller says so explicitly: the two
+            // reader buttons pass the extra (queued = true, regular = false) so
+            // starting a plain listen also turns play-through OFF. Every internal
+            // hop (handleArchiveAndNext) omits the extra and must inherit the mode
+            // it's running under, so absence means "leave autoAdvance unchanged".
+            if (intent.hasExtra(EXTRA_AUTO_ADVANCE)) {
+                autoAdvance = intent.getBooleanExtra(EXTRA_AUTO_ADVANCE, false)
+            }
             disarmArchive() // a pending confirmation never carries to a new article
             // Make this the cold-start resume target: if the process is killed
             // while listening, reopening returns to this article.
@@ -497,6 +521,10 @@ class TtsService : Service() {
     private val prevParagraphWordWindow = 7
     /** Past this fraction of an article, one triple-tap archives (no confirm). */
     private val nearEndFraction = 0.8f
+    /** In playlist ("play through") mode the accidental-skip guard is relaxed:
+     *  once you're this far in, a single triple-tap archives and advances, since
+     *  skipping to the next is the whole point of the mode. */
+    private val playlistSkipFraction = 0.30f
 
     private var lastButtonAt = 0L
     private val buttonDebounceMs = 500L
@@ -546,10 +574,11 @@ class TtsService : Service() {
      */
     private fun handleArchiveAndNextConfirmed() {
         val id = articleId ?: return
-        // Near the end you're effectively done, so a single triple-tap archives
-        // without the confirmation — the accidental-skip risk it guards against
-        // barely applies when there's little left to lose.
-        if (playbackProgress() >= nearEndFraction) {
+        // A single triple-tap archives without confirmation when there's little
+        // left to lose: near the end always, or — in playlist mode — once you're
+        // past playlistSkipFraction, since skipping on is exactly what you're doing.
+        val progress = playbackProgress()
+        if (progress >= nearEndFraction || (autoAdvance && progress >= playlistSkipFraction)) {
             disarmArchive()
             handleArchiveAndNext()
             return
@@ -641,13 +670,14 @@ class TtsService : Service() {
         return chars / avgCharsPerWord
     }
 
-    /** Archive the current article and advance to the next inbox article, playing
-     *  it (triple headset tap). */
+    /** Archive the current article and advance to the next article in the view the
+     *  listener was on (falls back to the inbox), playing it (triple headset tap /
+     *  play-through completion / archive-and-next). */
     private fun handleArchiveAndNext() {
         val id = articleId ?: return
         scope.launch {
             val current = withContext(Dispatchers.IO) { app.database.articleDao().getById(id) } ?: return@launch
-            val next = app.repository.nextInboxArticle(current)
+            val next = app.repository.nextAfterInView(current)
             if (!current.archived) app.repository.toggleArchive(current)
             Toast.makeText(this@TtsService, "Archived", Toast.LENGTH_SHORT).show()
             if (next != null) {
@@ -668,12 +698,77 @@ class TtsService : Service() {
      *  top and stop. This is the single choke point every completion path uses. */
     private fun handleArticleComplete() {
         if (autoAdvance) {
-            logDbg("auto-advance: article complete → archive & next")
+            logDbg("auto-advance: article complete → chime & next")
+            playChime() // gentle hand-off cue; only on natural completion in queue mode
             handleArchiveAndNext() // keeps autoAdvance on; stops if the inbox is empty
         } else {
             currentIndex = 0
             handleStop()
         }
+    }
+
+    /**
+     * A short cue played when an article finishes on its own during queued
+     * ("play through") playback — the hand-off to the next article. The sound is
+     * res/raw/openhat.wav, stored as 16-bit PCM so we can hand the bytes straight
+     * to an AudioTrack with no decoder involved. Played on its own one-shot track;
+     * we already hold audio focus, so it routes to the same output (e.g. your
+     * headphones) and lands in the short gap before the next article's audio
+     * begins. Best-effort — never let it disrupt playback.
+     */
+    private fun playChime() {
+        runCatching {
+            val bytes = resources.openRawResource(R.raw.openhat).use { it.readBytes() }
+
+            // Minimal RIFF walk: the asset is ours and known-16-bit, but read the
+            // format out of the file anyway so swapping the .wav can't desync this.
+            fun le16(o: Int) = (bytes[o].toInt() and 0xFF) or ((bytes[o + 1].toInt() and 0xFF) shl 8)
+            fun le32(o: Int) = le16(o) or (le16(o + 2) shl 16)
+            require(String(bytes, 0, 4, Charsets.US_ASCII) == "RIFF" &&
+                String(bytes, 8, 4, Charsets.US_ASCII) == "WAVE") { "openhat.wav is not RIFF/WAVE" }
+            var sr = 0; var channels = 0; var bits = 0
+            var dataOffset = -1; var dataLen = 0
+            var p = 12
+            while (p + 8 <= bytes.size) {
+                val id = String(bytes, p, 4, Charsets.US_ASCII)
+                val size = le32(p + 4)
+                if (size < 0) break
+                when (id) {
+                    "fmt " -> { channels = le16(p + 10); sr = le32(p + 12); bits = le16(p + 22) }
+                    "data" -> { dataOffset = p + 8; dataLen = minOf(size, bytes.size - dataOffset) }
+                }
+                p += 8 + size + (size and 1)
+            }
+            require(sr > 0 && channels > 0 && bits == 16 && dataOffset >= 0) {
+                "openhat.wav must be 16-bit PCM (got ${bits}-bit, ${channels}ch @ ${sr}Hz)"
+            }
+
+            val pcm = ShortArray(dataLen / 2) {
+                val o = dataOffset + it * 2
+                (((bytes[o].toInt() and 0xFF) or (bytes[o + 1].toInt() shl 8)).toShort())
+            }
+            val durationMs = (pcm.size.toLong() * 1000 / (sr.toLong() * channels)).toInt()
+
+            val track = android.media.AudioTrack.Builder()
+                .setAudioAttributes(playbackAudioAttributes)
+                .setAudioFormat(
+                    android.media.AudioFormat.Builder()
+                        .setEncoding(android.media.AudioFormat.ENCODING_PCM_16BIT)
+                        .setSampleRate(sr)
+                        .setChannelMask(
+                            if (channels >= 2) android.media.AudioFormat.CHANNEL_OUT_STEREO
+                            else android.media.AudioFormat.CHANNEL_OUT_MONO
+                        )
+                        .build()
+                )
+                .setTransferMode(android.media.AudioTrack.MODE_STATIC)
+                .setBufferSizeInBytes(pcm.size * 2)
+                .build()
+            track.write(pcm, 0, pcm.size)
+            track.play()
+            // static tracks don't self-release; tear down once it's finished
+            mainHandler.postDelayed({ runCatching { track.stop(); track.release() } }, (durationMs + 250).toLong())
+        }.onFailure { logDbg("chime failed: ${it.message}") }
     }
 
     /** Toggle binge mode. Turning it on while playing just arms the archive-on-
@@ -1990,12 +2085,46 @@ class TtsService : Service() {
                 acquire(6 * 60 * 60 * 1000L) // safety cap: 6 hours
             }
         }
+        registerNoisyReceiver()
     }
 
     private fun releaseWakeLock() {
         if (wakeLock?.isHeld == true) wakeLock?.release()
         wakeLock = null
         releaseWifiLock()
+        unregisterNoisyReceiver()
+    }
+
+    // ---- headset unplug -------------------------------------------------------
+    //
+    // Unplugging wired headphones (or dropping an A2DP link) reroutes audio to the
+    // phone's speaker. The system broadcasts ACTION_AUDIO_BECOMING_NOISY just
+    // before that happens; the expected behaviour — and what every media app does
+    // — is to pause, so a private article isn't suddenly read aloud out loud.
+    // Without this, playback simply continued through the speaker.
+    //
+    // The registration is scoped to playback via the wake-lock acquire/release
+    // pair, and it MUST be a runtime receiver — a manifest-declared one is ignored
+    // for this action.
+    private var noisyReceiver: BroadcastReceiver? = null
+
+    private fun registerNoisyReceiver() {
+        if (noisyReceiver != null) return
+        val receiver = object : BroadcastReceiver() {
+            override fun onReceive(context: Context?, intent: Intent?) {
+                if (intent?.action == AudioManager.ACTION_AUDIO_BECOMING_NOISY && isPlaying) {
+                    logDbg("audio becoming noisy (headset unplugged) → pause")
+                    handlePause()
+                }
+            }
+        }
+        registerReceiver(receiver, IntentFilter(AudioManager.ACTION_AUDIO_BECOMING_NOISY))
+        noisyReceiver = receiver
+    }
+
+    private fun unregisterNoisyReceiver() {
+        noisyReceiver?.let { runCatching { unregisterReceiver(it) } }
+        noisyReceiver = null
     }
 
     /**

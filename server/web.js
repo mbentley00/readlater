@@ -20,6 +20,18 @@ function escapeHtml(s) {
     .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 }
 
+/**
+ * JSON for embedding inside an inline <script>.
+ *
+ * JSON.stringify does not escape '<', so any value containing the literal
+ * "</script>" closes the tag early — the rest of the reader's JS is then parsed
+ * as HTML, silently killing highlights, archive and share, and injecting markup.
+ * That is reachable without touching the account: a hostile page can put
+ * anything in its og:url, and the extension saves it as the article URL. <
+ * is the same string to JSON.parse, but inert to the HTML parser.
+ */
+const jsonForScript = (v) => JSON.stringify(v).replace(/</g, '\\u003c');
+
 const FAVICON = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Ctext y='13' font-size='13'%3E%F0%9F%93%9A%3C/text%3E%3C/svg%3E";
 
 const CSS = `
@@ -30,13 +42,23 @@ const CSS = `
 * { box-sizing: border-box; }
 body { margin:0; background:var(--bg); color:var(--fg); font:16px/1.6 Georgia, 'Times New Roman', serif; }
 a { color: var(--accent); }
-header.site { display:flex; align-items:center; gap:1.25rem; padding:.8rem 1.2rem; border-bottom:1px solid var(--line); font-family: system-ui, sans-serif; }
-header.site .brand { font-weight:700; text-decoration:none; color:var(--fg); font-size:1.05rem; }
+/* Sticky: the reader puts Back and Highlights up here, and they are useless
+   3,000 words down an article if the header has scrolled away. Below the
+   highlights drawer (z-index 50) and the modals (80). */
+header.site { position:sticky; top:0; z-index:40; display:flex; align-items:center; gap:1.25rem; padding:.8rem 1.2rem; border-bottom:1px solid var(--line); font-family: system-ui, sans-serif; background:var(--bg); }
+header.site .brand { font-weight:700; text-decoration:none; color:var(--fg); font-size:1.05rem; white-space:nowrap; }
 header.site nav { display:flex; gap:.9rem; flex:1; }
 header.site nav a { text-decoration:none; color:var(--muted); font-size:.95rem; }
 header.site nav a.active { color:var(--fg); font-weight:600; }
 header.site .who { color:var(--muted); font-size:.85rem; display:flex; align-items:center; gap:.6rem; }
 header.site .who form { margin:0; }
+/* Per-page controls standing in for the nav links (see page()). */
+header.site .hdr-ctx { display:flex; align-items:center; gap:.75rem; flex:1; min-width:0; }
+header.site .hdr-ctx .back { color:var(--muted); white-space:nowrap; }
+/* The article title, shown only when there is room for it. */
+header.site .hdr-title { font-family:system-ui,sans-serif; font-size:.9rem; color:var(--muted); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+header.site .hdr-ctx .act { margin-left:auto; white-space:nowrap; }
+@media (max-width:700px) { header.site .hdr-title { display:none; } header.site { gap:.7rem; padding:.7rem .8rem; } }
 main { max-width: 46rem; margin: 0 auto; padding: 1.4rem 1.2rem 4rem; }
 h1 { font-size:1.5rem; }
 .empty { color:var(--muted); text-align:center; margin:4rem 0; font-style:italic; }
@@ -56,8 +78,9 @@ ul.skip-rules { list-style:none; padding:0; margin:.5rem 0 0; }
 ul.skip-rules li { display:flex; gap:.6rem; align-items:center; padding:.35rem 0; border-bottom:1px solid var(--line); }
 ul.skip-rules .phrase { flex:1; min-width:0; color:var(--fg); overflow-wrap:anywhere; }
 /* "Never import this text" editor, opened from the reader */
-#skip-dialog, #reparse-dialog { position:fixed; inset:0; z-index:80; background:rgba(0,0,0,.45); display:flex; align-items:center; justify-content:center; padding:1rem; }
-#skip-dialog[hidden], #reparse-dialog[hidden] { display:none; }
+#skip-dialog, #reparse-dialog, #share-dialog { position:fixed; inset:0; z-index:80; background:rgba(0,0,0,.45); display:flex; align-items:center; justify-content:center; padding:1rem; }
+#skip-dialog[hidden], #reparse-dialog[hidden], #share-dialog[hidden] { display:none; }
+.skip-box input.link { width:100%; box-sizing:border-box; padding:.5rem; border:1px solid var(--line); border-radius:6px; background:var(--card); color:var(--fg); font:.9rem/1.4 ui-monospace,SFMono-Regular,Menlo,monospace; }
 .reparse-actions { display:flex; flex-direction:column; gap:.4rem; }
 .reparse-actions .act { text-align:left; }
 .skip-box { background:var(--bg); border:1px solid var(--line); border-radius:10px; padding:1rem; width:min(34rem,100%); display:flex; flex-direction:column; gap:.6rem; box-shadow:0 8px 30px rgba(0,0,0,.35); }
@@ -101,12 +124,17 @@ mark.flash { animation: hlflash 1.6s ease; }
 .hl-count { font-size:.8rem; font-family:system-ui,sans-serif; color:var(--accent); white-space:nowrap; }
 code.token { background:var(--card); border:1px solid var(--line); border-radius:6px; padding:.25rem .5rem; font-size:.85rem; user-select:all; overflow-wrap:anywhere; }
 .reader-actions { margin-top:.6rem; }
+/* Public (shared) reader: a quiet strip saying where this came from. */
+.pub-note { font-family:system-ui,sans-serif; font-size:.8rem; color:var(--muted); border-top:1px solid var(--line); margin-top:2.5rem; padding-top:.8rem; }
+button.act.on { color:var(--accent); border-color:var(--accent); }
 /* article count on a view chip — present but never louder than the name */
 .chip-n { color:var(--muted); font-size:.85em; font-variant-numeric:tabular-nums; }
 .view-chip.active .chip-n { color:inherit; opacity:.75; }
 form.search { display:flex; gap:.5rem; align-items:center; flex-wrap:wrap; font-family:system-ui,sans-serif; font-size:.85rem; margin-bottom:1rem; }
 form.search input[type=search] { flex:1; min-width:12rem; padding:.4rem .6rem; border:1px solid var(--line); border-radius:6px; background:var(--card); color:var(--fg); }
 form.search select { padding:.35rem .4rem; border:1px solid var(--line); border-radius:6px; background:var(--card); color:var(--fg); max-width:14rem; }
+/* Domain combobox — matches the selects it sits beside. */
+form.search input[list] { width:13rem; padding:.4rem .6rem; border:1px solid var(--line); border-radius:6px; background:var(--card); color:var(--fg); font:inherit; }
 form.search label { color:var(--muted); display:flex; gap:.3rem; align-items:center; }
 .views { display:flex; gap:.5rem; flex-wrap:wrap; margin-bottom:.8rem; font-family:system-ui,sans-serif; }
 .view-chip { display:inline-flex; align-items:center; gap:.15rem; border:1px solid var(--line); border-radius:999px; padding:.15rem .3rem .15rem .7rem; font-size:.85rem; background:var(--card); }
@@ -129,29 +157,36 @@ body { transition:padding-right .2s ease; }
 .back { font-family:system-ui,sans-serif; font-size:.85rem; text-decoration:none; }
 `;
 
-function page({ title, body, user, active = '', nonce = '', script = '', articleCsp = false }) {
+/**
+ * [headerExtra] lets a page put its own controls in the sticky header in place
+ * of the nav links — the reader uses it for Back and Highlights. It replaces
+ * rather than joins the nav so the header stays a single line on a phone.
+ */
+function page({ title, body, user, active = '', nonce = '', script = '', articleCsp = false, headerExtra = '', brandLink = true, noindex = false }) {
   const nav = user ? `
     <nav>
       <a href="/" class="${active === 'inbox' ? 'active' : ''}">Inbox</a>
       <a href="/?view=archive" class="${active === 'archive' ? 'active' : ''}">Archive</a>
       <a href="/highlights" class="${active === 'highlights' ? 'active' : ''}">Highlights</a>
-    </nav>
+    </nav>` : '<nav></nav>';
+  const who = user ? `
     <div class="who">
       <a href="/settings" class="${active === 'settings' ? 'active' : ''}">${escapeHtml(user.username)}</a>
       <form method="post" action="/logout"><button class="act" type="submit">Log out</button></form>
-    </div>` : '<nav></nav>';
+    </div>` : '';
+  const middle = user && headerExtra ? headerExtra : nav;
   return `<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="referrer" content="no-referrer">
-<title>${escapeHtml(title)} — Earmark</title>
+${noindex ? '<meta name="robots" content="noindex, nofollow">\n' : ''}<title>${escapeHtml(title)} — Earmark</title>
 <link rel="icon" href="${FAVICON}">
 <style>${CSS}</style>
 </head>
 <body>
-<header class="site"><a class="brand" href="/">📖 Earmark</a>${nav}</header>
+<header class="site">${brandLink ? '<a class="brand" href="/">📖 Earmark</a>' : '<span class="brand">📖 Earmark</span>'}${middle}${who}</header>
 <main>${body}</main>
 ${script ? `<script nonce="${nonce}">${script}</script>` : ''}
 </body>
@@ -201,20 +236,62 @@ const LEN_BUCKETS = {
   long: { minWords: 4501 },
 };
 
+/**
+ * Resolve what was typed in the domain box against the domains this user
+ * actually has. An exact domain (or a parent of one, so "nytimes.com" still
+ * pulls in "cooking.nytimes.com") filters exactly as before; anything else is
+ * treated as a fragment and expands to every domain containing it, so "nyt"
+ * finds nytimes.com and nyti.ms. A fragment matching nothing stays exact, which
+ * keeps the empty state honest rather than silently showing everything.
+ */
+function domainFilter(typed, known) {
+  const d = String(typed || '').trim().toLowerCase().replace(/^www\./, '');
+  if (!d) return {};
+  if (known.some((k) => k === d || k.endsWith('.' + d))) return { domain: d };
+  const hits = known.filter((k) => k.includes(d));
+  return hits.length ? { domains: hits } : { domain: d };
+}
+
 /** Build searchArticles filters from web form params (q/domain/hl/len). */
-function filtersFromParams(get) {
+function filtersFromParams(get, knownDomains = []) {
   const hl = get('hl') || (get('highlighted') === '1' ? '1' : '');
   return {
     q: (get('q') || '').trim(),
-    domain: (get('domain') || '').trim(),
+    ...domainFilter(get('domain'), knownDomains),
     highlighted: hl === '1',
     minHighlights: hl && hl !== '1' ? (parseInt(hl, 10) || 0) : 0,
     ...(LEN_BUCKETS[get('len') || ''] || {}),
   };
 }
 
+/** A type-to-filter domain box: native combobox, no JS, substring matching. */
+function domainPicker(rows, current) {
+  const opts = rows.map(({ domain: d, n }) =>
+    `<option value="${escapeHtml(d)}">${escapeHtml(d)} (${n})</option>`).join('');
+  return `<input name="domain" list="domain-list" value="${escapeHtml(current)}"
+    placeholder="Any domain — type to filter" autocomplete="off" spellcheck="false">
+  <datalist id="domain-list">${opts}</datalist>`;
+}
+
 const PAGE_SIZE = 50;
-const SORTS = { newest: 'Newest', oldest: 'Oldest', longest: 'Longest', shortest: 'Shortest' };
+const SORTS = { newest: 'Newest', oldest: 'Oldest', longest: 'Longest', shortest: 'Shortest', random: 'Random' };
+
+/** A shuffle seed: kept in the URL so paging through a random order is stable. */
+const newSeed = () => crypto.randomBytes(4).toString('hex');
+const cleanSeed = (s) => (/^[a-z0-9]{1,16}$/i.test(s) ? s : '');
+
+/**
+ * Where "Back" should go, taken from ?from=. The list a reader was opened from
+ * has to travel in the URL because the site sends `no-referrer`, so there is no
+ * Referer to read it out of. This ends up in an href, so it must never be able
+ * to become an absolute URL: same-origin absolute paths only, and a leading
+ * `//` or `/\` (which browsers resolve as protocol-relative) is rejected.
+ */
+const safeBackTo = (v) => (/^\/(?![/\\])[^\s"'<>]*$/.test(v || '') ? v : '/');
+
+/** Article link that remembers the list it was opened from. */
+const readHref = (id, backTo) =>
+  `/read/${id}${backTo && backTo !== '/' ? `?from=${encodeURIComponent(backTo)}` : ''}`;
 
 function listPage(ctx, user, view, url) {
   const get = (k) => url.searchParams.get(k) || '';
@@ -226,18 +303,32 @@ function listPage(ctx, user, view, url) {
   const hl = get('hl') || (get('highlighted') === '1' ? '1' : '');
   const len = get('len');
   const sort = SORTS[get('sort')] ? get('sort') : 'newest';
+  // A fresh seed whenever Random is picked without one (i.e. straight from the
+  // sort dropdown); the pager then carries it so pages don't reshuffle.
+  const seed = sort === 'random' ? (cleanSeed(get('seed')) || newSeed()) : '';
   const searching = Boolean(q || domain || hl || len);
   const pageNum = Math.max(1, parseInt(get('page'), 10) || 1);
   const offset = (pageNum - 1) * PAGE_SIZE;
-  const paging = { sort, limit: PAGE_SIZE, offset };
+  const paging = { sort, seed, limit: PAGE_SIZE, offset };
+
+  // Every domain this user has saved from, with counts — both the picker's
+  // options and the list a typed fragment is resolved against.
+  const domainRows = ctx.store.domainCounts(user.id);
+  const knownDomains = domainRows.map((r) => r.domain);
 
   // Base filters that define the current view/search (used for both list + count).
   let baseFilters, empty;
   if (savedView) {
-    baseFilters = { ...savedView.filters, includeArchived: !!savedView.filters.includeArchived };
+    // Resolve the stored domain the same way the search box does, or a view
+    // saved from a typed fragment ("nyt") would come back empty.
+    baseFilters = {
+      ...savedView.filters,
+      ...domainFilter(savedView.filters.domain, knownDomains),
+      includeArchived: !!savedView.filters.includeArchived,
+    };
     empty = 'No articles match this view.';
   } else if (searching) {
-    baseFilters = { ...filtersFromParams(get), includeArchived: true }; // search spans all
+    baseFilters = { ...filtersFromParams(get, knownDomains), includeArchived: true }; // search spans all
     empty = 'No articles match this search.';
   } else if (view === 'favorites') { baseFilters = { favoriteOnly: true, includeArchived: true }; empty = 'No favorites yet — star an article to keep it here.'; }
   else if (view === 'archive') { baseFilters = { archivedOnly: true }; empty = 'Nothing archived yet.'; }
@@ -246,10 +337,6 @@ function listPage(ctx, user, view, url) {
   const total = ctx.countArticles(user, baseFilters);
   const list = ctx.searchArticles(user, { ...baseFilters, ...paging });
   const pageCount = Math.max(1, Math.ceil(total / PAGE_SIZE));
-
-  // domain dropdown: every domain this user has saved from, with counts
-  const domainOptions = ctx.store.domainCounts(user.id)
-    .map(({ domain: h, n }) => `<option value="${escapeHtml(h)}" ${h === domain ? 'selected' : ''}>${escapeHtml(h)} (${n})</option>`).join('');
 
   // How many articles each view holds, so a view's size is visible before you
   // open it. These are plain indexed COUNT(*)s (one per view, plus the inbox) —
@@ -270,7 +357,7 @@ function listPage(ctx, user, view, url) {
     <a href="/">Inbox${chipCount(inboxCount)}</a>
   </span>${savedViews.map((v) => `
   <span class="view-chip ${savedView && savedView.id === v.id ? 'active' : ''}">
-    <a href="/?view=v:${v.id}">${escapeHtml(v.name)}${chipCount(countFor({ ...v.filters, includeArchived: !!v.filters.includeArchived }))}</a><button class="act del-view" data-view-id="${v.id}" title="Delete view">×</button>
+    <a href="/?view=v:${v.id}">${escapeHtml(v.name)}${chipCount(countFor({ ...v.filters, ...domainFilter(v.filters.domain, knownDomains), includeArchived: !!v.filters.includeArchived }))}</a><button class="act del-view" data-view-id="${v.id}" title="Delete view">×</button>
   </span>`).join('')}
 </div>` : '';
 
@@ -288,7 +375,7 @@ function listPage(ctx, user, view, url) {
   const viewParam = get('view');
   // Build a URL preserving the current view/filters/sort with overrides.
   const buildQs = (overrides) => {
-    const cur = { view: viewParam, q, domain, len, hl, sort, ...overrides };
+    const cur = { view: viewParam, q, domain, len, hl, sort, seed, ...overrides };
     const p = new URLSearchParams();
     for (const [k, v] of Object.entries(cur)) if (v && !(k === 'sort' && v === 'newest')) p.set(k, String(v));
     const s = p.toString();
@@ -301,8 +388,8 @@ function listPage(ctx, user, view, url) {
 ${viewChips}
 <form class="search" method="get" action="/">
   ${viewParam ? `<input type="hidden" name="view" value="${escapeHtml(viewParam)}">` : ''}
-  <input type="search" name="q" value="${escapeHtml(q)}" placeholder="Search title, author, text…">
-  <select name="domain"><option value="">All domains</option>${domainOptions}</select>
+  <input type="search" name="q" value="${escapeHtml(q)}" placeholder="Search title, author, text, highlights…">
+  ${domainPicker(domainRows, domain)}
   <select name="len">
     <option value="">Any length</option>
     <option value="short" ${len === 'short' ? 'selected' : ''}>&lt; 5 min</option>
@@ -316,6 +403,7 @@ ${viewChips}
   </select>
   <select name="sort">${sortOptions}</select>
   <button class="act" type="submit">Search</button>
+  ${sort === 'random' ? `<a class="act" href="${buildQs({ seed: newSeed(), page: '' })}" title="Reshuffle">↻ Shuffle</a>` : ''}
   ${searching || savedView ? `<a class="back" href="${viewParam ? `/?view=${escapeHtml(viewParam)}` : '/'}">Clear</a>` : ''}
 </form>
 ${savedView ? `<div class="meta">${total.toLocaleString('en-US')} article${total === 1 ? '' : 's'} in “${escapeHtml(savedView.name)}”</div>` : ''}
@@ -329,6 +417,9 @@ ${!searching && !savedView ? `<div class="meta">${total.toLocaleString('en-US')}
 </div>` : '';
 
   const hlCounts = ctx.store.highlightCountsByArticle(user.id);
+  // Every article link carries this list back with it — view, filters, sort,
+  // shuffle seed and page — so the reader's Back returns to exactly this screen.
+  const backTo = buildQs({});
   const items = list.map((a) => {
     const hlCount = hlCounts.get(a.id) || 0;
     const meta = [
@@ -337,12 +428,15 @@ ${!searching && !savedView ? `<div class="meta">${total.toLocaleString('en-US')}
       a.wordCount > 0 ? `~${Math.max(1, Math.round(a.wordCount / 225))} min` : null,
       a.readParagraph > 0 ? `¶${a.readParagraph} in progress` : null,
       hlCount ? `${hlCount} highlight${hlCount > 1 ? 's' : ''}` : null,
+      // So it's visible from the list which articles are readable by anyone
+      // holding a link, without opening each one.
+      a.shareId ? 'shared' : null,
     ].filter(Boolean).map(escapeHtml).join(' · ');
     const thumb = a.imageUrl && /^https?:\/\//i.test(a.imageUrl)
       ? `<img class="thumb" src="${escapeHtml(a.imageUrl)}" alt="" loading="lazy" decoding="async" referrerpolicy="no-referrer">`
       : '';
     return `<li data-id="${a.id}">
-      <div class="main"><a class="title" href="/read/${a.id}">${escapeHtml(a.title)}</a>
+      <div class="main"><a class="title" href="${escapeHtml(readHref(a.id, backTo))}">${escapeHtml(a.title)}</a>
       <div class="meta">${meta}</div></div>
       ${thumb}
       <div class="actions">
@@ -433,8 +527,51 @@ if (pdfFile) pdfFile.addEventListener('change', async () => {
   return { body, script };
 }
 
-function readerPage(ctx, user, article) {
+/**
+ * The article as a stranger sees it at /p/<shareId>: the parsed text and
+ * nothing else.
+ *
+ * Everything personal is left out by construction rather than by hiding it —
+ * this builds its own body instead of reusing readerPage(), so highlights,
+ * notes, reading position, favorite/archive state, the "view original" copy of
+ * the captured source (which may be a page you were logged in to) and the
+ * owner's identity cannot leak by someone later adding a field to the reader.
+ * `savedAt` is left out for the same reason: when you filed something away is
+ * your business, not the reader's.
+ */
+function publicReaderPage(article) {
+  const meta = [
+    article.siteName || null,
+    article.byline || null,
+    article.publishedAt ? fmtDate(article.publishedAt) : null,
+  ].filter(Boolean).map(escapeHtml).join(' · ');
+  const original = /^https?:\/\//i.test(article.url || '')
+    ? `<a href="${escapeHtml(article.url)}" target="_blank" rel="noopener noreferrer nofollow">${escapeHtml(article.url)}</a>`
+    : '';
+
+  const body = `
+<article class="reader">
+  <header>
+    <h1>${escapeHtml(article.title)}</h1>
+    ${meta ? `<div class="meta">${meta}</div>` : ''}
+  </header>
+  <div class="content">${article.html || ''}</div>
+  <div class="pub-note">Shared read-only via Earmark.${original ? ` Original: ${original}` : ''}</div>
+</article>`;
+  return { body };
+}
+
+function readerPage(ctx, user, article, url) {
   const hls = ctx.store.highlightsForArticle(article.id);
+  const backTo = safeBackTo(url && url.searchParams.get('from'));
+  // These two live in the sticky header rather than in the article, so they stay
+  // reachable at any scroll depth.
+  const headerExtra = `
+    <div class="hdr-ctx">
+      <a class="back" href="${escapeHtml(backTo)}">&larr; Back</a>
+      <span class="hdr-title">${escapeHtml(article.title)}</span>
+      <button class="act" id="hl-toggle">Highlights (${hls.length})</button>
+    </div>`;
   const meta = [article.siteName, article.byline, fmtDate(article.savedAt)].filter(Boolean).map(escapeHtml).join(' · ');
   const hlItems = hls.map((h) => `<div class="hl-item" data-hl-id="${h.id}">
       <div class="hl-item-text">${escapeHtml(h.text)}</div>
@@ -443,7 +580,6 @@ function readerPage(ctx, user, article) {
     </div>`).join('\n');
 
   const body = `
-<a class="back" href="/">&larr; Back to list</a>
 <article class="reader">
   <header>
     <h1>${escapeHtml(article.title)}</h1>
@@ -451,7 +587,7 @@ function readerPage(ctx, user, article) {
     <div class="actions reader-actions">
       <button class="act fav" data-act="favorite" data-val="${article.favorite ? 'false' : 'true'}" title="Favorite">${article.favorite ? '★' : '☆'}</button>
       <button class="act" data-act="archive" data-val="${article.archived ? 'false' : 'true'}">${article.archived ? 'Unarchive' : 'Archive'}</button>
-      <button class="act" id="hl-toggle">Highlights (${hls.length})</button>
+      <button class="act${article.shareId ? ' on' : ''}" id="share-btn" title="Public link to the parsed article — your highlights are not shown">${article.shareId ? 'Shared ✓' : 'Share'}</button>
       <button class="act" id="reparse-btn" title="Re-extract this article if it was parsed wrong">Fix parsing</button>
     </div>
     <div class="meta">Select any text to highlight it.</div>
@@ -464,6 +600,20 @@ function readerPage(ctx, user, article) {
 </aside>
 <div id="hl-tip" hidden><button id="hl-save">Highlight</button><button id="skip-save" title="Drop this text from articles saved in future">Never import</button></div>
 <div id="hl-menu" hidden><button id="hl-menu-del">Delete highlight</button><button id="hl-menu-skip">Never import</button></div>
+<div id="share-dialog" hidden>
+  <div class="skip-box">
+    <strong>Public link</strong>
+    <div class="meta">Anyone with this link can read the parsed article — no account needed.
+    Your highlights, notes and reading position are not shown. Stop sharing to break the link.</div>
+    <input class="link" id="share-url" readonly value="">
+    <div id="share-msg" class="meta"></div>
+    <div class="skip-actions">
+      <button class="act" id="share-revoke" type="button">Stop sharing</button>
+      <button class="act" id="share-close" type="button">Close</button>
+      <button class="act" id="share-copy" type="button">Copy link</button>
+    </div>
+  </div>
+</div>
 <div id="reparse-dialog" hidden>
   <div class="skip-box">
     <strong>Fix parsing</strong>
@@ -495,8 +645,9 @@ function readerPage(ctx, user, article) {
 </div>`;
 
   const script = `
-const ARTICLE = ${JSON.stringify(article.id)};
-const ORIGINAL_URL = ${JSON.stringify(article.url || '')};
+const ARTICLE = ${jsonForScript(article.id)};
+const ORIGINAL_URL = ${jsonForScript(article.url || '')};
+const BACK_TO = ${jsonForScript(backTo)};
 
 // Keyboard shortcuts: o = open the original, e = archive and go back.
 document.addEventListener('keydown', (e) => {
@@ -510,7 +661,7 @@ document.addEventListener('keydown', (e) => {
     fetch('/api/articles/' + ARTICLE, {
       method: 'PATCH', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ archived: true }),
-    }).then(() => { location.href = '/'; });
+    }).then(() => { location.href = BACK_TO; });
   }
 });
 
@@ -520,7 +671,7 @@ document.addEventListener('keydown', (e) => {
 // whitespace the rendered HTML ("<em>Tribune</em>") lacks, and a highlight can
 // span inline elements. So we canonicalize both sides, match in canonical space,
 // map the offsets back to the DOM, and wrap the range even across text nodes.
-const HLS = ${JSON.stringify(hls.map((h) => ({ id: h.id, text: h.text })))};
+const HLS = ${jsonForScript(hls.map((h) => ({ id: h.id, text: h.text })))};
 const root = document.getElementById('content');
 function isWs(c) { const n = c.charCodeAt(0); return n === 32 || n === 9 || n === 10 || n === 13 || n === 160; }
 function canonChar(c) {
@@ -530,10 +681,22 @@ function canonChar(c) {
   if (n === 0x2013 || n === 0x2014 || n === 0x2212) return '-';
   return c;
 }
+// Markdown constructs the reader renders as something shorter than the source.
+// "[press release](https://…)" shows as "press release", so leaving the URL in
+// the needle means searching the article for text it does not contain — and the
+// whole highlight fails to anchor. Images vanish entirely; code keeps its text
+// but loses the backticks.
+function stripMarkdown(s) {
+  return String(s)
+    .replace(/!\\[[^\\]]*\\]\\([^\\s)]*(?:\\s+"[^"]*")?\\)/g, '')
+    .replace(/\\[([^\\]]*)\\]\\([^\\s)]*(?:\\s+"[^"]*")?\\)/g, '$1')
+    .replace(/\`+/g, '');
+}
 function canonNeedle(s) {
+  const src = stripMarkdown(s);
   let out = '', prevSpace = false;
-  for (let i = 0; i < s.length; i++) {
-    const c = s[i];
+  for (let i = 0; i < src.length; i++) {
+    const c = src[i];
     if (c === '*' || c === '_') continue; // markdown emphasis markers
     if (isWs(c)) { if (!prevSpace && out) { out += ' '; prevSpace = true; } }
     else { out += canonChar(c); prevSpace = false; }
@@ -571,13 +734,28 @@ function wrapRange(segs, from, to, id) {
     try { range.surroundContents(mark); } catch (err) {}
   }
 }
+// Wrap [text] where it occurs in the article, if it does. The index is rebuilt
+// per call so text already marked is excluded — which also stops a second
+// attempt from re-matching what the first one just wrapped.
+function anchor(text, id) {
+  const { segs, canon, map } = buildIndex();
+  const ci = canon.indexOf(text);
+  if (ci < 0) return false;
+  wrapRange(segs, map[ci], map[ci + text.length - 1] + 1, id);
+  return true;
+}
 for (const h of HLS) {
   const needle = canonNeedle(h.text);
   if (!needle) continue;
-  const { segs, canon, map } = buildIndex(); // rebuilt per highlight so earlier marks are excluded
-  const ci = canon.indexOf(needle);
-  if (ci < 0) continue;
-  wrapRange(segs, map[ci], map[ci + needle.length - 1] + 1, h.id);
+  if (anchor(needle, h.id)) continue;
+  // The stored text still doesn't line up with the rendered article — some
+  // markdown we don't know about, an edit upstream, a reparse. Rather than show
+  // nothing at all, mark whichever sentences do line up. Short fragments are
+  // skipped: "Yes." would match almost anywhere.
+  for (const chunk of (needle.match(/[^.!?]+[.!?]*/g) || [])) {
+    const c = chunk.trim();
+    if (c.length >= 24) anchor(c, h.id);
+  }
 }
 
 // Highlights side panel: toggle (pushes the page aside), jump-to, and delete.
@@ -719,6 +897,71 @@ document.getElementById('skip-cancel').addEventListener('click', closeSkipDialog
 dlg.addEventListener('click', (e) => { if (e.target === dlg) closeSkipDialog(); });
 document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && !dlg.hidden) closeSkipDialog(); });
 
+// ---- "Share": mint (or reuse) a public link to the parsed article -----------
+// POST is idempotent server-side, so reopening the dialog shows the same link
+// rather than quietly invalidating one you already sent.
+const shareDlg = document.getElementById('share-dialog');
+const shareBtn = document.getElementById('share-btn');
+const shareUrl = document.getElementById('share-url');
+const shareMsg = document.getElementById('share-msg');
+const shareRevoke = document.getElementById('share-revoke');
+const closeShare = () => { shareDlg.hidden = true; };
+
+function setShared(on) {
+  shareBtn.textContent = on ? 'Shared ✓' : 'Share';
+  shareBtn.classList.toggle('on', on);
+  shareRevoke.hidden = !on;
+}
+
+shareBtn.addEventListener('click', async () => {
+  shareMsg.textContent = '';
+  shareUrl.value = '';
+  shareDlg.hidden = false;
+  try {
+    const res = await fetch('/api/articles/' + ARTICLE + '/share', { method: 'POST' });
+    if (!res.ok) throw new Error('server replied ' + res.status);
+    const d = await res.json();
+    shareUrl.value = d.url;
+    setShared(true);
+    shareUrl.focus();
+    shareUrl.select();
+  } catch (err) {
+    shareMsg.textContent = "Couldn't create a link: " + err.message;
+  }
+});
+
+document.getElementById('share-copy').addEventListener('click', async () => {
+  if (!shareUrl.value) return;
+  shareUrl.select();
+  try {
+    // navigator.clipboard needs a secure context — absent when the server is
+    // reached over plain http on a LAN, so keep the old command as a fallback.
+    if (navigator.clipboard) await navigator.clipboard.writeText(shareUrl.value);
+    else document.execCommand('copy');
+    shareMsg.textContent = 'Copied.';
+  } catch (err) {
+    shareMsg.textContent = 'Copy that link from the box above.';
+  }
+});
+
+shareRevoke.addEventListener('click', async () => {
+  shareMsg.textContent = '';
+  try {
+    const res = await fetch('/api/articles/' + ARTICLE + '/share', { method: 'DELETE' });
+    if (!res.ok) throw new Error('server replied ' + res.status);
+    shareUrl.value = '';
+    setShared(false);
+    shareMsg.textContent = 'Sharing stopped — that link no longer works.';
+  } catch (err) {
+    shareMsg.textContent = "Couldn't stop sharing: " + err.message;
+  }
+});
+
+document.getElementById('share-close').addEventListener('click', closeShare);
+shareDlg.addEventListener('click', (e) => { if (e.target === shareDlg) closeShare(); });
+document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && !shareDlg.hidden) closeShare(); });
+setShared(${article.shareId ? 'true' : 'false'});
+
 // ---- "Fix parsing": pick what's wrong, reparse, reload on success -----------
 const reparseDlg = document.getElementById('reparse-dialog');
 const reparseMsg = document.getElementById('reparse-msg');
@@ -785,42 +1028,44 @@ dlgOk.addEventListener('click', async () => {
     : 'Added.';
   setTimeout(closeSkipDialog, data.existingMatches ? 2200 : 800);
 });`;
-  return { body, script };
+  return { body, script, headerExtra };
 }
 
 function highlightsPage(ctx, user, url) {
   // Grouped by article: which articles have highlights and how many. The
   // highlights themselves live on each article's reader page.
-  const HL_SORTS = { recent: 'Recently highlighted', oldest: 'Oldest highlighted', most: 'Most highlights', title: 'Title A–Z' };
+  const HL_SORTS = { recent: 'Recently highlighted', oldest: 'Oldest highlighted', most: 'Most highlights', title: 'Title A–Z', random: 'Random' };
   const get = (k) => (url && url.searchParams.get(k)) || '';
   const q = get('q').trim();
   const domain = get('domain').trim();
   const sort = HL_SORTS[get('sort')] ? get('sort') : 'recent';
+  const seed = sort === 'random' ? (cleanSeed(get('seed')) || newSeed()) : '';
   const pageNum = Math.max(1, parseInt(get('page'), 10) || 1);
   const offset = (pageNum - 1) * PAGE_SIZE;
 
-  const total = ctx.store.highlightedArticlesCount(user.id, { q, domain });
-  const arts = ctx.store.highlightedArticles(user.id, { q, domain, sort, limit: PAGE_SIZE, offset });
+  const domainRows = ctx.store.highlightedDomains(user.id);
+  const dom = domainFilter(domain, domainRows.map((r) => r.domain));
+  const total = ctx.store.highlightedArticlesCount(user.id, { q, ...dom });
+  const arts = ctx.store.highlightedArticles(user.id, { q, ...dom, sort, seed, limit: PAGE_SIZE, offset });
   const pageCount = Math.max(1, Math.ceil(total / PAGE_SIZE));
   const buildQs = (o) => {
     const p = new URLSearchParams();
-    for (const [k, v] of Object.entries({ q, domain, sort, ...o })) if (v && !(k === 'sort' && v === 'recent')) p.set(k, String(v));
+    for (const [k, v] of Object.entries({ q, domain, sort, seed, ...o })) if (v && !(k === 'sort' && v === 'recent')) p.set(k, String(v));
     const s = p.toString();
     return s ? `/highlights?${s}` : '/highlights';
   };
-  const domainOpts = ctx.store.highlightedDomains(user.id)
-    .map(({ domain: d, n }) => `<option value="${escapeHtml(d)}" ${d === domain ? 'selected' : ''}>${escapeHtml(d)} (${n})</option>`).join('');
   const sortOpts = Object.entries(HL_SORTS)
     .map(([k, label]) => `<option value="${k}" ${k === sort ? 'selected' : ''}>${label}</option>`).join('');
 
+  const backTo = buildQs({}); // reader's Back returns to this filtered page
   const items = arts.map((a) => {
     const meta = [
-      a.siteName,
+      a.siteName || a.domain || null, // same fallback the inbox uses
       a.wordCount > 0 ? `~${Math.max(1, Math.round(a.wordCount / 225))} min` : null,
       `highlighted ${fmtDate(a.lastHighlightAt)}`,
     ].filter(Boolean).map(escapeHtml).join(' · ');
     return `<li>
-      <div class="main"><a class="title" href="/read/${a.id}">${escapeHtml(a.title)}</a>
+      <div class="main"><a class="title" href="${escapeHtml(readHref(a.id, backTo))}">${escapeHtml(a.title)}</a>
       <div class="meta">${meta}</div></div>
       <div class="actions"><span class="hl-count">${a.n} highlight${a.n > 1 ? 's' : ''}</span></div>
     </li>`;
@@ -833,10 +1078,11 @@ function highlightsPage(ctx, user, url) {
 </div>` : '';
 
   const searchForm = `<form class="search" method="get" action="/highlights">
-  <input type="search" name="q" value="${escapeHtml(q)}" placeholder="Search highlighted articles…">
-  <select name="domain"><option value="">All domains</option>${domainOpts}</select>
+  <input type="search" name="q" value="${escapeHtml(q)}" placeholder="Search highlight text, titles…">
+  ${domainPicker(domainRows, domain)}
   <select name="sort">${sortOpts}</select>
   <button class="act" type="submit">Apply</button>
+  ${sort === 'random' ? `<a class="act" href="${buildQs({ seed: newSeed(), page: '' })}" title="Reshuffle">↻ Shuffle</a>` : ''}
   ${q || domain || sort !== 'recent' ? '<a class="back" href="/highlights">Clear</a>' : ''}
 </form>`;
 
@@ -852,7 +1098,7 @@ ${total ? `<div class="meta">${total.toLocaleString('en-US')} article${total ===
 function settingsPage(ctx, user, url, req) {
   const msg = url.searchParams.get('msg');
   const rules = ctx.store.listSkipRules(user.id);
-  const origin = `${(req.headers['x-forwarded-proto'] || '').split(',')[0].trim() || 'http'}://${req.headers.host || 'localhost'}`;
+  const origin = ctx.originOf(req);
   // Two ways in: an IMAP mailbox the server polls (one shared address, so it
   // takes precedence when configured), or a per-account alias via the
   // inbound-email webhook.
@@ -968,6 +1214,28 @@ async function handle(ctx, req, res, url) {
     const body = JSON.stringify({ addons: { 'readlater@selfhosted.local': { updates } } });
     res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Content-Length': Buffer.byteLength(body) });
     return res.end(body);
+  }
+
+  // ---- shared article (PUBLIC — holding the link is the whole authorization).
+  // Sits above the session gate on purpose; the slug is looked up across all
+  // users, and only an article whose owner has published it can be found this
+  // way. Highlights and everything else personal are never rendered here.
+  if (req.method === 'GET' && parts[0] === 'p' && parts.length === 2) {
+    const article = parts[1] && ctx.store.articleByShareId(parts[1]);
+    if (!article) {
+      return send(res, 404, page({
+        title: 'Not shared',
+        body: '<div class="empty">This link is not valid — it may have been revoked by whoever shared it.</div>',
+        user: null, nonce, brandLink: false, noindex: true,
+      }), { nonce });
+    }
+    const made = publicReaderPage(article);
+    return send(res, 200, page({
+      title: article.title, body: made.body,
+      // No session context at all: no nav, no username, and the logo is not a
+      // link into someone else's library.
+      user: null, nonce, brandLink: false, noindex: true,
+    }), { nonce, headers: { 'X-Robots-Tag': 'noindex, nofollow' } });
   }
 
   // ---- account routes
@@ -1104,7 +1372,7 @@ async function handle(ctx, req, res, url) {
     title = active[0].toUpperCase() + active.slice(1);
   } else if (route.startsWith('GET /read/') && parts.length === 2) {
     const article = ctx.store.getArticle(parts[1], user.id);
-    if (article) { made = readerPage(ctx, user, article); title = article.title; active = ''; }
+    if (article) { made = readerPage(ctx, user, article, url); title = article.title; active = ''; }
   } else if (route === 'GET /highlights') {
     made = highlightsPage(ctx, user, url); title = 'Highlights'; active = 'highlights';
   } else if (route === 'GET /settings') {
@@ -1116,7 +1384,9 @@ async function handle(ctx, req, res, url) {
   if (!made) {
     return send(res, 404, page({ title: 'Not found', body: '<div class="empty">Page not found. <a href="/">Back to your articles</a></div>', user, nonce }), { nonce });
   }
-  return send(res, 200, page({ title, body: made.body, user, active, nonce, script: made.script }), { nonce });
+  return send(res, 200, page({
+    title, body: made.body, user, active, nonce, script: made.script, headerExtra: made.headerExtra || '',
+  }), { nonce });
 }
 
 module.exports = { handle };

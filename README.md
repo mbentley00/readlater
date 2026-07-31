@@ -45,6 +45,21 @@ text to add a new one), archive/favorite from the reader, search everything
 (full text, with domain and has-highlights filters), browse and export
 highlights, and manage your API token.
 
+### Sharing an article
+
+**Share** in the reader hands you a link like `https://…/p/<slug>` that anyone
+can open without an account. They get the parsed article and nothing else — no
+highlights, no notes, no reading position, no archive/favorite state, no
+account name, and no way into the rest of your library. The public page is
+`noindex`, and the slug is 144 random bits, so the link is only as public as
+you make it.
+
+Clicking **Share** again returns the same link rather than minting a new one, so
+you can re-open the dialog to copy a link you already sent. **Stop sharing**
+clears the slug: every copy of that link dies at once, and sharing again gives a
+different one. Deleting the article does the same. Shared articles are marked
+`shared` in the article list.
+
 ### Email articles in (newsletters)
 
 Forward a newsletter to a mailbox and it shows up in your list. There are two
@@ -193,6 +208,9 @@ Run the test suite with `node test.js`.
 3. Save any article via the toolbar button, right-click → *Save page to
    Earmark*, or **Alt+D** (the toolbar tooltip shows whatever key is actually
    bound, so a rebind in `about:addons` stays discoverable).
+4. To keep a quote instead of the whole page, select the text and right-click →
+   *Save highlight to Earmark* (or **Alt+Shift+R**). This works on **any** page,
+   saved or not — see [the extension README](firefox-extension/README.md#highlights-on-any-page).
 
 ### Why this beats paywalls
 
@@ -265,7 +283,9 @@ works). Timestamps are epoch milliseconds.
 | `GET /api/articles/{id}` | Full article incl. HTML |
 | `PATCH /api/articles/{id}` | Update `archived` / `favorite` / `readParagraph` |
 | `DELETE /api/articles/{id}` | Delete article + its highlights |
+| `GET/POST/DELETE /api/articles/{id}/share` | Read / publish / revoke the article's public link. POST is idempotent (returns the slug already in force); DELETE breaks every copy of it |
 | `GET/POST /api/articles/{id}/highlights` | List / add highlights (idempotent via `clientId`) |
+| `POST /api/highlights` | Save a highlight against a **URL** rather than an article id (`{url, text, note?, title?, clientId?}`). Attaches to the article if there is one; otherwise keeps a quotes-only stub, archived on arrival, that a later real save of the same URL takes over in place |
 | `GET /api/highlights` | All highlights with article titles |
 | `GET /api/highlights/export.md` | Markdown export of all highlights |
 | `DELETE /api/highlights/{id}` | Remove a highlight |

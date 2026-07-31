@@ -216,7 +216,7 @@ fun ArticleListScreen(
         }.groupingBy { it }.eachCount().entries.sortedByDescending { it.value }.take(15).map { it.key }
     }
 
-    val articles = remember(unsorted, sortMode, selectedView, hlCounts, searchQuery, searchActive, shuffleSeed) {
+    val articles = remember(unsorted, sortMode, selectedView, hlCounts, searchQuery, searchActive, shuffleSeed, showArchived) {
         val counts = hlCounts.associate { it.articleId to it.n }
         val view = selectedView
         var filtered = if (view != null) {
@@ -233,13 +233,28 @@ fun ArticleListScreen(
                     it.url.contains(q, ignoreCase = true)
             }
         }
+        // On the plain Archive tab, "newest/oldest" means most-/least-recently
+        // archived, so it defaults to what you just archived. Elsewhere it's by
+        // when the article was saved. (archivedAt falls back to updatedAt for rows
+        // archived before it was tracked, or archived on another device.)
+        val archiveOrder = showArchived && view == null && !searchActive
+        val timeKey: (ArticleEntity) -> Long =
+            if (archiveOrder) { a -> a.archivedAt ?: a.updatedAt } else { a -> a.savedAt }
         when (sortMode) {
-            SortMode.NEWEST -> filtered.sortedByDescending { it.savedAt }
-            SortMode.OLDEST -> filtered.sortedBy { it.savedAt }
+            SortMode.NEWEST -> filtered.sortedByDescending(timeKey)
+            SortMode.OLDEST -> filtered.sortedBy(timeKey)
             SortMode.LONGEST -> filtered.sortedByDescending { it.wordCount }
             SortMode.SHORTEST -> filtered.sortedBy { it.wordCount }
             SortMode.RANDOM -> filtered.shuffled(kotlin.random.Random(shuffleSeed))
         }
+    }
+
+    // Open an article, first capturing the exact order currently on screen so that
+    // queued ("play through") playback started from it follows THIS view rather
+    // than the global inbox (see Repository.playQueue / nextAfterInView).
+    fun openArticle(id: String) {
+        repo.playQueue = articles.map { it.id }
+        onOpenArticle(id)
     }
 
     // Saved views come from the server; offline we just don't show new ones.
@@ -368,7 +383,7 @@ fun ArticleListScreen(
                         verticalAlignment = Alignment.CenterVertically,
                         modifier = Modifier
                             .fillMaxWidth()
-                            .clickable { onOpenArticle(playingId) }
+                            .clickable { openArticle(playingId) }
                             .padding(start = 14.dp, end = 4.dp, top = 4.dp, bottom = 4.dp)
                     ) {
                         Icon(
@@ -552,7 +567,7 @@ fun ArticleListScreen(
                         if (i > 0) HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f))
                         ArticleCard(
                             article = article,
-                            onOpen = { onOpenArticle(article.id) },
+                            onOpen = { openArticle(article.id) },
                             onToggleArchive = { repo.toggleArchive(article) },
                             onToggleFavorite = { repo.toggleFavorite(article) },
                             onDelete = { repo.deleteArticle(article) }
@@ -565,12 +580,15 @@ fun ArticleListScreen(
 }
 
 /** Uppercase source label like Readwise (domain / EMAIL / PDF). */
+// Newsletters have no host to show (email:<id>, mailto:reader-forwarded-email/…),
+// so the server works out which publication they came from and puts it in
+// siteName. Prefer that over a bare "EMAIL", which says nothing.
 private fun sourceLabel(article: ArticleEntity): String = when {
-    article.url.startsWith("email:") -> "EMAIL"
     article.url.startsWith("pdf:") -> "PDF"
     else -> runCatching { Uri.parse(article.url).host }.getOrNull()
         ?.removePrefix("www.")?.uppercase()
-        ?: article.siteName?.uppercase() ?: ""
+        ?: article.siteName?.uppercase()
+        ?: if (article.url.startsWith("email:") || article.url.startsWith("mailto:")) "EMAIL" else ""
 }
 
 private val cardDateFmt = java.text.SimpleDateFormat("MMM d", java.util.Locale.US)

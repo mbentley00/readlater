@@ -27,7 +27,10 @@ data class RemoteArticle(
     val wordCount: Int,
     val imageUrl: String?,
     val publishedAt: Long?,
-    val html: String?
+    val html: String?,
+    /** How the article was saved (browser-page / browser-link / android-share /
+     *  email / …), for diagnosing parse failures. Null on older articles. */
+    val source: String?
 )
 
 /** Saved filter view as returned by the server. */
@@ -272,7 +275,7 @@ class ApiClient(private val settings: Settings) {
     /** POST /api/save-url — server fetches + extracts the page. Returns the
      *  saved article's title, or throws on failure. */
     suspend fun saveUrl(sharedText: String): String {
-        val json = JSONObject().put("url", sharedText)
+        val json = JSONObject().put("url", sharedText).put("source", "android-share")
         val body = execute(
             builder("/api/save-url")
                 .post(json.toString().toRequestBody(jsonMediaType))
@@ -385,7 +388,8 @@ class ApiClient(private val settings: Settings) {
         wordCount = o.optInt("wordCount", 0),
         imageUrl = o.stringOrNull("imageUrl"),
         publishedAt = if (o.has("publishedAt") && !o.isNull("publishedAt")) o.optLong("publishedAt") else null,
-        html = o.stringOrNull("html")
+        html = o.stringOrNull("html"),
+        source = o.stringOrNull("source")
     )
 
     private fun parseHighlight(o: JSONObject): RemoteHighlight = RemoteHighlight(

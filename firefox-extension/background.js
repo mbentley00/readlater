@@ -20,6 +20,7 @@ async function getSettings() {
 // shown once the saves stop arriving.
 
 const NOTIF_SAVED = 'earmark-saved';
+const NOTIF_HIGHLIGHT = 'earmark-highlight';
 const NOTIF_ERROR = 'earmark-error';
 const NOTIF_SETUP = 'earmark-setup';
 
@@ -95,10 +96,31 @@ const queueError = batcher(async (errors) => {
   show(NOTIF_ERROR, `Earmark: ${errors.length} saves failed`, reasons.join('\n'));
 });
 
+// Highlights get their own channel rather than sharing the page-save summary:
+// "Saved 3 articles" would be a lie, and a quote saved right after a page save
+// would silently replace that notification.
+const queueHighlight = batcher(async (hls) => {
+  const { serverUrl, notifyMode } = await getSettings();
+  if (notifyMode !== 'summary') return;
+  if (hls.length === 1) {
+    const h = hls[0];
+    // The quote itself is the useful confirmation — you can see at a glance
+    // whether you grabbed the right words.
+    const quote = h.text.length > 120 ? `${h.text.slice(0, 120)}…` : h.text;
+    show(NOTIF_HIGHLIGHT, `Highlight saved — ${h.title}`, `“${quote}”`, h.url);
+    return;
+  }
+  show(NOTIF_HIGHLIGHT, `Saved ${hls.length} highlights to Earmark`,
+    [...new Set(hls.map((h) => `• ${h.title}`))].slice(0, 3).join('\n'),
+    `${serverUrl}/highlights`);
+});
+
 /** A save that failed. Always surfaced (unless notifications are off). */
 const notifyError = (title, message) => queueError({ title, message: String(message) });
 /** A save that worked. Coalesced; suppressed entirely in 'errors'/'none' mode. */
 const notifySaved = (title, url) => queueSaved({ title, url });
+/** A highlight that stuck. Same coalescing rules as a page save. */
+const notifyHighlight = (title, text, url) => queueHighlight({ title, text, url });
 
 // Clicking a notification opens the article (or the article list, for a batch).
 browser.notifications.onClicked.addListener((id) => {
@@ -110,6 +132,29 @@ browser.notifications.onClicked.addListener((id) => {
   browser.notifications.clear(id);
 });
 
+/**
+ * A per-tab badge writer, shared by every save path.
+ *
+ * The badge is the primary "did that work?" signal, so it has to survive long
+ * enough to be seen. Each call cancels the previous auto-clear: '…' used to
+ * schedule its own wipe 2.5s after the save STARTED, which then fired on top
+ * of the '✓' that replaced it — so a save taking ~2s flashed the checkmark for
+ * a few hundred ms, and one taking 2.5s never showed it at all. Only terminal
+ * states auto-clear; '…' holds until the outcome replaces it.
+ */
+function badgeFor(tabId) {
+  let badgeTimer = null;
+  return (text, color, holdMs) => {
+    const a = browser.browserAction || browser.action;
+    if (!a) return;
+    if (badgeTimer !== null) { clearTimeout(badgeTimer); badgeTimer = null; }
+    try { a.setBadgeBackgroundColor({ color: color || '#3d6b52', tabId }); } catch (e) {}
+    try { a.setBadgeText({ text, tabId }); } catch (e) {}
+    if (!text || !holdMs) return;
+    badgeTimer = setTimeout(() => { try { a.setBadgeText({ text: '', tabId }); } catch (e) {} }, holdMs);
+  };
+}
+
 /** Extract the article from the tab's live DOM and POST it to the server. */
 async function savePage(tabId) {
   const { serverUrl, token } = await getSettings();
@@ -119,22 +164,7 @@ async function savePage(tabId) {
     return { ok: false, error: 'not configured' };
   }
 
-  // The badge is the primary "did that work?" signal, so it has to survive long
-  // enough to be seen. Each call cancels the previous auto-clear: '…' used to
-  // schedule its own wipe 2.5s after the save STARTED, which then fired on top
-  // of the '✓' that replaced it — so a save taking ~2s flashed the checkmark for
-  // a few hundred ms, and one taking 2.5s never showed it at all. Only terminal
-  // states auto-clear; '…' holds until the outcome replaces it.
-  let badgeTimer = null;
-  const setBadge = (text, color, holdMs) => {
-    const a = browser.browserAction || browser.action;
-    if (!a) return;
-    if (badgeTimer !== null) { clearTimeout(badgeTimer); badgeTimer = null; }
-    try { a.setBadgeBackgroundColor({ color: color || '#3d6b52', tabId }); } catch (e) {}
-    try { a.setBadgeText({ text, tabId }); } catch (e) {}
-    if (!text || !holdMs) return;
-    badgeTimer = setTimeout(() => { try { a.setBadgeText({ text: '', tabId }); } catch (e) {} }, holdMs);
-  };
+  const setBadge = badgeFor(tabId);
   // Immediate feedback so a slow/cold server doesn't feel like nothing happened.
   // Every path below replaces this; the long timer is only a safety net so an
   // unforeseen throw can't leave '…' pinned to the icon forever.
@@ -170,7 +200,9 @@ async function savePage(tabId) {
         'Content-Type': 'application/json',
         Authorization: `Bearer ${token}`,
       },
-      body: JSON.stringify(article),
+      // Tag how this was saved (live-DOM capture of the open tab) so parse
+      // failures can be diagnosed by save method on the server.
+      body: JSON.stringify({ ...article, source: 'browser-page' }),
     });
     if (!res.ok) {
       const body = await res.text();
@@ -188,6 +220,89 @@ async function savePage(tabId) {
   }
 }
 
+/**
+ * Save the tab's current text selection as a highlight on whatever page it is.
+ *
+ * The page itself is never captured: the server attaches the quote to the
+ * article if it already has one for this URL, and otherwise keeps a stub that
+ * holds nothing but the quotes. So this works on any page you happen to be
+ * reading, not just ones already in the library.
+ */
+async function saveHighlight(tabId, { withNote = false } = {}) {
+  const { serverUrl, token } = await getSettings();
+  if (!serverUrl || !token) {
+    show(NOTIF_SETUP, 'Earmark: not configured', 'Set your server URL and token in the extension options first.');
+    browser.runtime.openOptionsPage();
+    return { ok: false, error: 'not configured' };
+  }
+
+  const setBadge = badgeFor(tabId);
+  setBadge('…', null, BADGE_STUCK_MS);
+
+  let sel;
+  try {
+    const results = await browser.tabs.executeScript(tabId, {
+      file: 'selection.js',
+      runAt: 'document_idle',
+    });
+    sel = results && results[0];
+  } catch (e) {
+    setBadge('!', '#b3261e', BADGE_HOLD_MS);
+    notifyError('Earmark: cannot read this page', e.message || e);
+    return { ok: false, error: `This page cannot be read (${e.message || e})` };
+  }
+  if (!sel || !sel.text) {
+    setBadge('!', '#b3261e', BADGE_HOLD_MS);
+    notifyError('Earmark: nothing selected', 'Select some text on the page first, then save it as a highlight.');
+    return { ok: false, error: 'no text selected' };
+  }
+
+  let note = null;
+  if (withNote) {
+    // Asked for after the selection is in hand — a modal can clear it.
+    try {
+      const results = await browser.tabs.executeScript(tabId, { file: 'note-prompt.js' });
+      const answer = (results && results[0]) || {};
+      if (answer.cancelled) { setBadge('', null, 0); return { ok: false, error: 'cancelled' }; }
+      note = answer.note || null;
+    } catch (e) {
+      // Prompting failed (a page that blocked dialogs, say) — the quote is
+      // still worth keeping, so fall through and save it without a note.
+    }
+  }
+
+  try {
+    const res = await fetch(`${serverUrl}/api/highlights`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify({
+        url: sel.url,
+        title: sel.title,
+        siteName: sel.siteName,
+        text: sel.text,
+        note,
+        source: 'browser-highlight',
+      }),
+    });
+    if (!res.ok) {
+      const body = await res.text();
+      throw new Error(`server replied ${res.status}: ${body.slice(0, 200)}`);
+    }
+    setBadge('✓', null, BADGE_HOLD_MS);
+    const data = await res.json().catch(() => ({}));
+    const readUrl = data && data.articleId ? `${serverUrl}/read/${data.articleId}` : `${serverUrl}/highlights`;
+    notifyHighlight(sel.title, sel.text, readUrl);
+    return { ok: true, title: sel.title };
+  } catch (e) {
+    setBadge('!', '#b3261e', BADGE_HOLD_MS);
+    notifyError('Earmark: highlight failed', e.message || e);
+    return { ok: false, error: String(e.message || e) };
+  }
+}
+
 /** Save a URL (e.g. a right-clicked link) — the server fetches + extracts it. */
 async function saveLink(linkUrl) {
   const { serverUrl, token } = await getSettings();
@@ -200,7 +315,7 @@ async function saveLink(linkUrl) {
     const res = await fetch(`${serverUrl}/api/save-url`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
-      body: JSON.stringify({ url: linkUrl }),
+      body: JSON.stringify({ url: linkUrl, source: 'browser-link' }),
     });
     if (!res.ok) throw new Error(`server replied ${res.status}`);
     const data = await res.json().catch(() => ({}));
@@ -223,8 +338,21 @@ browser.contextMenus.create({
   title: 'Save page to Earmark',
   contexts: ['page', 'selection'],
 });
+// On a selection, the quote is usually what you want — not the whole page.
+browser.contextMenus.create({
+  id: 'earmark-save-highlight',
+  title: 'Save highlight to Earmark',
+  contexts: ['selection'],
+});
+browser.contextMenus.create({
+  id: 'earmark-save-highlight-note',
+  title: 'Save highlight with note…',
+  contexts: ['selection'],
+});
 browser.contextMenus.onClicked.addListener((info, tab) => {
   if (info.menuItemId === 'earmark-save-link' && info.linkUrl) saveLink(info.linkUrl);
+  else if (info.menuItemId === 'earmark-save-highlight' && tab) saveHighlight(tab.id);
+  else if (info.menuItemId === 'earmark-save-highlight-note' && tab) saveHighlight(tab.id, { withNote: true });
   else if (info.menuItemId === 'earmark-save-page' && tab) savePage(tab.id);
 });
 
@@ -232,9 +360,11 @@ browser.contextMenus.onClicked.addListener((info, tab) => {
 // menubar access keys, which swallow the keypress before the extension sees it
 // — and the match ignores Shift, so Alt+Shift+S is taken by History too.
 browser.commands.onCommand.addListener(async (command) => {
-  if (command !== 'save-page') return;
+  if (command !== 'save-page' && command !== 'save-highlight') return;
   const [tab] = await browser.tabs.query({ active: true, currentWindow: true });
-  if (tab) savePage(tab.id);
+  if (!tab) return;
+  if (command === 'save-highlight') saveHighlight(tab.id);
+  else savePage(tab.id);
 });
 
 // Toolbar icon: save the current page immediately (no popup / extra click).
@@ -264,6 +394,7 @@ browser.runtime.onStartup.addListener(refreshToolbarTitle);
 // Messages from the popup.
 browser.runtime.onMessage.addListener((msg) => {
   if (msg && msg.type === 'save-page') return savePage(msg.tabId);
+  if (msg && msg.type === 'save-highlight') return saveHighlight(msg.tabId, { withNote: msg.withNote === true });
   if (msg && msg.type === 'get-settings') return getSettings();
   return undefined;
 });

@@ -14,12 +14,35 @@ function absolutizeUrls(html, base) {
 }
 
 /**
+ * Condé Nast sites (The New Yorker, Wired, Vanity Fair, …) split an article body
+ * into several sibling "chunks", each its own `div.body__inner-container`, with
+ * ad / newsletter / embed units wedged between them. Readability scores whole
+ * containers and keeps only the top-scoring one, so every chunk after the first
+ * is silently dropped — which is why some New Yorker pieces come out a paragraph
+ * or two short, missing the final paragraph and its ♦ end-of-article mark.
+ *
+ * Hoist the later chunks' children into the first chunk so Readability sees one
+ * continuous body. A no-op on any page without at least two such containers, so
+ * it can't affect non-Condé-Nast articles.
+ */
+function mergeChunkedBody(document) {
+  const chunks = [...document.querySelectorAll('div.body__inner-container')];
+  if (chunks.length < 2) return;
+  const first = chunks[0];
+  for (const chunk of chunks.slice(1)) {
+    while (chunk.firstChild) first.appendChild(chunk.firstChild);
+    chunk.remove();
+  }
+}
+
+/**
  * Extract the main article from raw page HTML. Returns null when Readability
  * can't find a substantial article (caller falls back to a cruder path / LLM).
  */
 function extractReadable(pageHtml, url) {
   try {
     const { document } = parseHTML(pageHtml);
+    mergeChunkedBody(document);
     const article = new Readability(document, { charThreshold: 200 }).parse();
     if (!article) return null;
     const textContent = String(article.textContent || '').replace(/\s+/g, ' ').trim();
@@ -37,4 +60,4 @@ function extractReadable(pageHtml, url) {
   }
 }
 
-module.exports = { extractReadable, absolutizeUrls };
+module.exports = { extractReadable, absolutizeUrls, mergeChunkedBody };

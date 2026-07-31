@@ -1,5 +1,6 @@
 package com.readlater.app.data
 
+import androidx.room.withTransaction
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -15,7 +16,7 @@ import java.util.UUID
  * opportunistic pushes and surfaced as a [Result] failure only from explicit sync.
  */
 class Repository(
-    db: AppDatabase,
+    private val db: AppDatabase,
     private val api: ApiClient,
     private val settings: Settings
 ) {
@@ -97,6 +98,43 @@ class Repository(
     suspend fun nextInboxArticle(current: ArticleEntity): ArticleEntity? =
         withContext(Dispatchers.IO) { articleDao.nextInboxAfter(current.savedAt, current.id) }
 
+    /**
+     * Ordered article ids of the view the user last opened an article from — the
+     * inbox/archive tab, a saved view, search results, in the current sort order.
+     * Queued ("play through") playback walks THIS order so it follows the view you
+     * were on rather than the global inbox. Set by the list screen when it opens an
+     * article; read by both the service (to advance) and the reader (to show what's
+     * next up).
+     */
+    @Volatile
+    var playQueue: List<String> = emptyList()
+
+    /** The id after [currentId] in the captured view order, or null if it's last
+     *  or the view isn't captured. Cheap enough for the reader's "next up" line. */
+    fun nextIdInView(currentId: String): String? {
+        val q = playQueue
+        val i = q.indexOf(currentId)
+        return if (i in 0 until q.lastIndex) q[i + 1] else null
+    }
+
+    /**
+     * The next article to auto-play after [current] when playing through. Prefers
+     * the captured view order ([playQueue]) so queued playback stays within the
+     * view you were on; falls back to the global inbox order when [current] isn't
+     * part of a captured view (e.g. opened from a deep link or notification).
+     */
+    suspend fun nextAfterInView(current: ArticleEntity): ArticleEntity? =
+        withContext(Dispatchers.IO) {
+            val q = playQueue
+            val i = q.indexOf(current.id)
+            if (i < 0) return@withContext nextInboxArticle(current)
+            for (j in i + 1 until q.size) {
+                val a = articleDao.getById(q[j])
+                if (a != null) return@withContext a
+            }
+            null // reached the end of the view
+        }
+
     fun highlightsFor(articleId: String): Flow<List<HighlightEntity>> =
         highlightDao.byArticle(articleId)
 
@@ -116,7 +154,8 @@ class Repository(
         runCatching {
             val syncStartedAt = System.currentTimeMillis()
 
-            // 1. Push local metadata changes.
+            // 1. Push local metadata changes. Clear each dirty flag only if the
+            //    row still matches what we sent — see clearDirtyIfUnchanged.
             for (a in articleDao.getDirty()) {
                 api.patchArticle(
                     a.id,
@@ -125,7 +164,9 @@ class Repository(
                     readParagraph = a.readParagraph,
                     ttsParagraph = a.ttsParagraph
                 )
-                articleDao.clearDirty(a.id)
+                articleDao.clearDirtyIfUnchanged(
+                    a.id, a.readParagraph, a.ttsParagraph, a.archived, a.favorite
+                )
             }
 
             // 2. Push unsynced highlights.
@@ -148,44 +189,63 @@ class Repository(
                 articleDao.getByIds(remoteArticles.map { it.id }).associateBy { it.id }
             }
             val needsBody = mutableListOf<String>()
-            val changed = mutableListOf<ArticleEntity>()
 
-            for (r in remoteArticles) {
-                val local = localById[r.id]
-                val merged = ArticleEntity(
-                    id = r.id,
-                    url = r.url,
-                    title = r.title,
-                    byline = r.byline,
-                    siteName = r.siteName,
-                    excerpt = r.excerpt,
-                    // Preserve the cached body; step 5 refreshes it when stale.
-                    html = local?.html,
-                    savedAt = r.savedAt,
-                    updatedAt = r.updatedAt,
-                    archived = r.archived,
-                    favorite = r.favorite,
-                    readParagraph = r.readParagraph,
-                    ttsParagraph = r.ttsParagraph,
-                    dirty = false,
-                    wordCount = r.wordCount,
-                    paragraphCount = local?.paragraphCount ?: 0,
-                    imageUrl = r.imageUrl,
-                    publishedAt = r.publishedAt
-                )
-                if (local == null || local.copy(html = null, paragraphCount = 0) !=
-                    merged.copy(html = null, paragraphCount = 0)
-                ) {
-                    changed.add(merged)
+            // The merge runs in one transaction so a local write cannot slip in
+            // between reading the dirty set and applying the pull. Both orderings
+            // are then safe: a write that lands first is seen as pending below, and
+            // one that lands after simply overwrites the row and re-marks it dirty.
+            db.withTransaction {
+                // Anything still dirty here changed locally *after* step 1 pushed —
+                // typically the listening position, which TTS advances every
+                // paragraph while this sync is doing network I/O. The server copy we
+                // just pulled is older than these, so local wins and the row stays
+                // dirty for the next push. Without this, a sync during playback
+                // silently rewinds it to wherever it was when the sync started.
+                val pendingById = articleDao.getDirty().associateBy { it.id }
+                val changed = mutableListOf<ArticleEntity>()
+
+                for (r in remoteArticles) {
+                    val local = localById[r.id]
+                    val pending = pendingById[r.id]
+                    val merged = ArticleEntity(
+                        id = r.id,
+                        url = r.url,
+                        title = r.title,
+                        byline = r.byline,
+                        siteName = r.siteName,
+                        excerpt = r.excerpt,
+                        // Preserve the cached body; step 5 refreshes it when stale.
+                        html = local?.html,
+                        savedAt = r.savedAt,
+                        updatedAt = r.updatedAt,
+                        // Unpushed local edits outrank the server's older copy.
+                        archived = pending?.archived ?: r.archived,
+                        favorite = pending?.favorite ?: r.favorite,
+                        readParagraph = pending?.readParagraph ?: r.readParagraph,
+                        ttsParagraph = pending?.ttsParagraph ?: r.ttsParagraph,
+                        dirty = pending != null,
+                        wordCount = r.wordCount,
+                        paragraphCount = local?.paragraphCount ?: 0,
+                        imageUrl = r.imageUrl,
+                        publishedAt = r.publishedAt,
+                        source = r.source,
+                        // archivedAt is local-only; keep whatever we recorded on archive.
+                        archivedAt = local?.archivedAt
+                    )
+                    if (local == null || local.copy(html = null, paragraphCount = 0) !=
+                        merged.copy(html = null, paragraphCount = 0)
+                    ) {
+                        changed.add(merged)
+                    }
+                    // Only inbox articles get their bodies eagerly; archived ones
+                    // load on demand in the reader (keeps a large imported library
+                    // from downloading hundreds of MB to the phone).
+                    if (!merged.archived && (local?.html == null || r.updatedAt > local.updatedAt)) {
+                        needsBody.add(r.id)
+                    }
                 }
-                // Only inbox articles get their bodies eagerly; archived ones
-                // load on demand in the reader (keeps a large imported library
-                // from downloading hundreds of MB to the phone).
-                if (!r.archived && (local?.html == null || r.updatedAt > local.updatedAt)) {
-                    needsBody.add(r.id)
-                }
+                if (changed.isNotEmpty()) articleDao.upsertAll(changed)
             }
-            if (changed.isNotEmpty()) articleDao.upsertAll(changed)
 
             // 4. Deletions can only be detected against the complete list.
             if (full) {
@@ -229,12 +289,16 @@ class Repository(
         val result = api.reparse(id, hint)
         val r = result.article
         if (result.ok && r != null) {
+            // Reparse rebuilds the row from the server; carry the local-only
+            // archivedAt forward so a reparsed archived article keeps its order.
+            val archivedAt = articleDao.getById(r.id)?.archivedAt
             articleDao.upsertAll(listOf(ArticleEntity(
                 id = r.id, url = r.url, title = r.title, byline = r.byline, siteName = r.siteName,
                 excerpt = r.excerpt, html = r.html, savedAt = r.savedAt, updatedAt = r.updatedAt,
                 archived = r.archived, favorite = r.favorite, readParagraph = r.readParagraph,
                 ttsParagraph = r.ttsParagraph, dirty = false, wordCount = r.wordCount,
-                paragraphCount = paragraphCountOf(r.html), imageUrl = r.imageUrl, publishedAt = r.publishedAt
+                paragraphCount = paragraphCountOf(r.html), imageUrl = r.imageUrl, publishedAt = r.publishedAt,
+                source = r.source, archivedAt = archivedAt
             )))
         }
         result
@@ -245,7 +309,10 @@ class Repository(
 
     fun toggleArchive(article: ArticleEntity) {
         bgScope.launch {
-            articleDao.setArchived(article.id, !article.archived)
+            val nowArchived = !article.archived
+            // Stamp when it was archived so the Archive tab can order by it;
+            // clear it on unarchive.
+            articleDao.setArchived(article.id, nowArchived, if (nowArchived) System.currentTimeMillis() else null)
             pushMetadata(article.id)
         }
     }
@@ -347,7 +414,11 @@ class Repository(
                 readParagraph = a.readParagraph,
                 ttsParagraph = a.ttsParagraph
             )
-            articleDao.clearDirty(a.id)
+            // Only if nothing moved while the PATCH was in flight; otherwise the
+            // row stays dirty so the newer value still gets pushed.
+            articleDao.clearDirtyIfUnchanged(
+                a.id, a.readParagraph, a.ttsParagraph, a.archived, a.favorite
+            )
         } catch (_: Exception) {
             // Offline — stays dirty and is pushed on the next syncNow().
         }

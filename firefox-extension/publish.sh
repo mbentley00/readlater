@@ -84,12 +84,29 @@ fi
 
 echo "Signing Earmark $TARGET …"
 rm -rf signed
+# web-ext zips this whole directory and uploads it to Mozilla, so anything here
+# that isn't extension code MUST be excluded — most importantly any file that
+# could carry a secret. A credentials file that slipped into the package once got
+# the AMO key auto-revoked by Mozilla's "api_key_detected" scanner, so this list
+# is a safety boundary, not just tidiness. Keep secret-bearing files OUT of this
+# directory entirely; this is the second line of defence.
 npx --yes web-ext sign \
   --channel=unlisted \
   --api-key="$AMO_KEY" \
   --api-secret="$AMO_SECRET" \
   --artifacts-dir=./signed \
-  --ignore-files 'readlater-firefox-extension-*.zip'
+  --ignore-files \
+    'readlater-firefox-extension-*.zip' \
+    'publish.sh' \
+    'publish.local.bat' \
+    '*.bat' \
+    '*.sh' \
+    '*.env' \
+    '.env*' \
+    'README.md' \
+    '.amo-upload-uuid' \
+    'signed' \
+    'signed/**'
 
 XPI=$(ls signed/*.xpi | head -1)
 echo "Uploading $XPI to $BASE …"

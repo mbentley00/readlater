@@ -1,6 +1,15 @@
 # server runtime data
 server/data/
 
+# Local publishing credentials: AMO signing key/secret + the server API token.
+# Never commit. Kept at the repo root, deliberately outside firefox-extension/,
+# because web-ext zips that whole directory and uploads it to Mozilla — whose
+# scanner revokes any API key it finds in a package.
+publish.local.bat
+
+# Local data exports written by backup.sh (your whole library, in the clear)
+server/backups/
+
 # Android build outputs
 android/.gradle/
 android/build/

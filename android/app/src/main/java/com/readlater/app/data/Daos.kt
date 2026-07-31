@@ -69,14 +69,30 @@ interface ArticleDao {
     @Upsert
     suspend fun upsertAll(articles: List<ArticleEntity>)
 
-    @Query("UPDATE articles SET dirty = 0 WHERE id = :id")
-    suspend fun clearDirty(id: String)
+    /**
+     * Clear the dirty flag only if the row still holds exactly what we pushed.
+     * Playback advances the listening position from another coroutine while a
+     * PATCH is in flight; clearing unconditionally would drop that newer value
+     * on the floor — it would never be pushed, and the next pull would
+     * overwrite it with the older server copy.
+     */
+    @Query(
+        "UPDATE articles SET dirty = 0 WHERE id = :id AND readParagraph = :readParagraph " +
+            "AND ttsParagraph = :ttsParagraph AND archived = :archived AND favorite = :favorite"
+    )
+    suspend fun clearDirtyIfUnchanged(
+        id: String,
+        readParagraph: Int,
+        ttsParagraph: Int,
+        archived: Boolean,
+        favorite: Boolean
+    )
 
     @Query("UPDATE articles SET html = :html, paragraphCount = :paragraphCount WHERE id = :id")
     suspend fun setHtml(id: String, html: String?, paragraphCount: Int)
 
-    @Query("UPDATE articles SET archived = :archived, dirty = 1 WHERE id = :id")
-    suspend fun setArchived(id: String, archived: Boolean)
+    @Query("UPDATE articles SET archived = :archived, archivedAt = :archivedAt, dirty = 1 WHERE id = :id")
+    suspend fun setArchived(id: String, archived: Boolean, archivedAt: Long?)
 
     @Query("UPDATE articles SET favorite = :favorite, dirty = 1 WHERE id = :id")
     suspend fun setFavorite(id: String, favorite: Boolean)

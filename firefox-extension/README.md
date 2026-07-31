@@ -14,7 +14,25 @@ cookies / client-side rendering) — rather than re-fetching the URL.
 - Toolbar button → **Save this page**
 - Right-click a page → **Save page to Earmark**
 - Right-click a link → **Save link to Earmark** (the server fetches the target)
-- Keyboard: **Alt+D** (the toolbar tooltip shows whatever key is actually bound)
+- Select text, right-click → **Save highlight to Earmark** (or **…with note…**)
+- Keyboard: **Alt+R** to save the page, **Alt+Shift+R** to save the selection as a
+  highlight (the toolbar tooltip shows whatever key is actually bound; rebind at
+  `about:addons` → gear → **Manage Extension Shortcuts**)
+
+### Highlights on any page
+
+A highlight keeps only the words you selected — it does **not** capture the page.
+That makes it usable anywhere you happen to be reading, not just on articles
+already in your library:
+
+- If the page *is* in your library, the quote attaches to that article.
+- If it isn't, the server keeps a **stub** for the URL: an article whose whole
+  body is the quotes you saved from it, created straight into the archive so it
+  never clutters the inbox. It still shows up under **Highlights** on the web UI
+  and syncs to the Android app.
+- Save the page properly later (toolbar button, or **Save link**) and the stub is
+  taken over in place: real content replaces the quotes, it comes back out of the
+  archive, and the highlights you already had stay attached.
 
 The toolbar icon is the primary feedback: **…** while saving, then **✓** or
 **!**. Notifications are secondary and coalesced — saving twenty tabs raises one
@@ -25,10 +43,16 @@ notification id, so a new one replaces the old rather than queueing behind it.
 Options → **Notifications**: one summary per batch (default), only on failure,
 or never. The article appears in the Android app on the next sync.
 
-Note: `Alt+{F,E,V,S,B,T,H}` are Firefox's menubar access keys (File, Edit, View,
-History, Bookmarks, Tools, Help). Firefox swallows those before the extension
-sees them, and the match ignores Shift — so `Alt+T` and `Alt+Shift+S` both fail
-silently. Pick a letter outside that set.
+Note on shortcut choices: Firefox reserves combinations before the extension
+ever sees them, so a bad default fails silently.
+- `Alt+D` (and `Alt+Shift+D`) focus the address bar — this was the old default,
+  which is why the shortcut appeared to do nothing but jump to the URL bar.
+- `Alt+{F,E,V,S,B,T,H}` are the menubar access keys (File, Edit, View, History,
+  Bookmarks, Tools, Help). Firefox swallows those, and the match ignores Shift —
+  so `Alt+T` and `Alt+Shift+S` fail too.
+The `Ctrl+Shift+…` family is the safe one for a default. Whatever you pick,
+`about:addons` → gear → **Manage Extension Shortcuts** lets each user rebind it
+and flags conflicts live.
 
 ## Publish an update
 
@@ -63,7 +87,9 @@ the server publishes and exits non-zero if they differ.
 | File | Role |
 |---|---|
 | `extractor.js` | Content script: picks the article container from the rendered DOM, strips nav/ads/forms/scripts, absolutizes links and lazy-loaded images, returns `{url, title, byline, siteName, excerpt, html, textContent}` |
-| `background.js` | Runs the extractor on demand, POSTs the result to `{server}/api/articles`, shows notifications, wires the context menu and keyboard shortcut |
+| `selection.js` | Content script: returns the live selection plus page identity, `{url, title, siteName, text}` — read from the DOM rather than the context menu's `selectionText`, which truncates long selections |
+| `note-prompt.js` | Content script: `prompt()`s for the optional note (a background page has no window to prompt from) |
+| `background.js` | Runs the extractor on demand, POSTs the result to `{server}/api/articles` (or a selection to `/api/highlights`), shows notifications, wires the context menu and keyboard shortcuts |
 | `popup.html/js` | Toolbar popup with the save button |
 | `options.html/js` | Server URL + token settings with connection test |
 

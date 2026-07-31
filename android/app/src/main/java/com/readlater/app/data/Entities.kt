@@ -30,7 +30,13 @@ data class ArticleEntity(
     /** Thumbnail image URL (og:image), null if none. */
     val imageUrl: String? = null,
     /** Original publish date (ms), null if the page didn't expose one. */
-    val publishedAt: Long? = null
+    val publishedAt: Long? = null,
+    /** How the article was saved (browser-page / browser-link / android-share /
+     *  email / …). A debugging aid for parse failures; null on older articles. */
+    val source: String? = null,
+    /** When this was archived (ms), so the Archive tab can order by it. Local
+     *  only; set on archive, cleared on unarchive, null if never archived. */
+    val archivedAt: Long? = null
 )
 
 @Entity(tableName = "highlights")

@@ -1,8 +1,8 @@
 {
   "manifest_version": 2,
   "name": "Earmark — Save to your reader",
-  "version": "1.0.9",
-  "description": "Save the current page — exactly as rendered in your browser — to your self-hosted Earmark server for reading in the Android app.",
+  "version": "1.0.12",
+  "description": "Save the current page — exactly as rendered in your browser — to your self-hosted Earmark server, or keep just a selected quote as a highlight.",
   "icons": {
     "48": "icons/icon.svg",
     "96": "icons/icon.svg"
@@ -26,8 +26,12 @@
   },
   "commands": {
     "save-page": {
-      "suggested_key": { "default": "Alt+D" },
+      "suggested_key": { "default": "Alt+R" },
       "description": "Save the current page to Earmark"
+    },
+    "save-highlight": {
+      "suggested_key": { "default": "Alt+Shift+R" },
+      "description": "Save the selected text to Earmark as a highlight"
     }
   },
   "browser_specific_settings": {

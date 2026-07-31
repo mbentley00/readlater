@@ -14,10 +14,126 @@ const fs = require('fs');
 const path = require('path');
 const Database = require('better-sqlite3');
 
-/** Hostname of an article URL, lowercased, without www. Emailed articles get 'email'. */
+/**
+ * Hostname of an article URL, lowercased, without www. Emailed articles get
+ * 'email' — both our own IMAP saves (email:<message-id>) and Readwise's
+ * forwarded newsletters (mailto:reader-forwarded-email/<hash>), neither of
+ * which has a hostname to parse.
+ */
 function hostOf(u) {
-  if (String(u).startsWith('email:')) return 'email';
+  const s = String(u);
+  if (s.startsWith('email:') || s.startsWith('mailto:')) return 'email';
   try { return new URL(u).hostname.toLowerCase().replace(/^www\./, ''); } catch { return ''; }
+}
+
+// ---------------------------------------------------------------- newsletters
+// A forwarded newsletter carries no usable URL, so every one of them would file
+// under a single 'email' bucket — 1,500 articles from dozens of publications,
+// indistinguishable. The body knows better: a newsletter's links are
+// overwhelmingly its own. What follows recovers the publication from them.
+
+/** Hosts that never identify a publication: send/click infrastructure, CDNs,
+ *  platform chrome, and the big sites every newsletter merely links out to. */
+const INFRA_HOSTS = new Set([
+  'substack.com', 'substackcdn.com', 'ghost.org', 'buttondown.com', 'buttondown.email',
+  'beehiiv.com', 'beehiivstatus.com', 'awstrack.me', 'mjt.lu', 'list-manage.com',
+  'mailchimp.com', 'sendgrid.net', 'mailgun.org', 'sparkpostmail.com',
+  'passport.online', 'imgproxy.readwise.io', 'readwise.io', 'imagekit.io',
+  'googleusercontent.com', 'gstatic.com', 'cloudfront.net', 'amazonaws.com',
+  'spacergif.org', 'ytimg.com', 'gravatar.com', 'doubleclick.net',
+  'google.com', 'youtube.com', 'x.com', 'twitter.com', 't.co', 'facebook.com',
+  'instagram.com', 'linkedin.com', 'reddit.com', 'wikipedia.org', 'wiktionary.org',
+  'spotify.com', 'goodreads.com', 'apple.com', 'amazon.com', 'github.com',
+  'patreon.com', 'paypal.com', 'bit.ly', 'tinyurl.com',
+  'domain.com', 'example.com', 'yourdomain.com', 'mysite.com', // template placeholders
+]);
+
+/** Subdomains an email service puts in front of the publisher's own domain
+ *  (links.tedium.co → tedium.co). Stripped, not rejected. */
+const WRAPPER_SUBS = new Set(['link', 'links', 'linkst', 'email', 'e', 'mail', 'click',
+  'track', 'message', 'go', 'r', 'url', 'view', 'ct']);
+
+/** Platform subdomains that are the platform itself, not a publication. */
+const PLATFORM_SUBS = new Set(['open', 'email', 'eotrx', 'mg', 'mg2', 'mg-d0', 'mg-d1',
+  'on', 'static', 'cdn', 'assets', 'www']);
+
+const NEWSLETTER_PLATFORMS = ['substack.com', 'beehiiv.com', 'ghost.io', 'buttondown.email', 'kit.com'];
+
+function normalizeHost(host) {
+  let parts = String(host || '').toLowerCase().replace(/^www\./, '').split('.');
+  while (parts.length > 2 && WRAPPER_SUBS.has(parts[0])) parts = parts.slice(1);
+  return parts.join('.');
+}
+
+/** Can [h] stand as a publication's identity? */
+function usableHost(h) {
+  const parts = String(h || '').split('.');
+  if (parts.length < 2) return false;
+  if (INFRA_HOSTS.has(h)) return false;
+  for (let i = 1; i < parts.length - 1; i++) {
+    const suffix = parts.slice(i).join('.');
+    if (!INFRA_HOSTS.has(suffix)) continue;
+    // …unless it's a publication hosted ON a newsletter platform: keep
+    // boondoggle.substack.com, drop open.substack.com.
+    return NEWSLETTER_PLATFORMS.includes(suffix) && i === 1 && !PLATFORM_SUBS.has(parts[0]);
+  }
+  return true;
+}
+
+/**
+ * Substack routes every link through substack.com/redirect/2/<base64>, whose
+ * payload is JSON holding the real destination — including the publication's
+ * own custom domain. Undecoded, a Substack newsletter looks like nothing but
+ * links to substack.com. open.substack.com/pub/<slug> names it directly.
+ */
+function substackHosts(html) {
+  const out = [];
+  for (const m of html.matchAll(/substack\.com\/redirect\/2\/([A-Za-z0-9_+/=-]+)/g)) {
+    let decoded;
+    try { decoded = Buffer.from(m[1], 'base64').toString('utf8'); } catch { continue; }
+    // The payload is often cut short at the href boundary, so pull the url out
+    // by pattern rather than requiring the JSON to parse.
+    const url = (decoded.match(/"e"\s*:\s*"(https?:\/\/[^"]+)"/)
+      || decoded.match(/(https?:\/\/[^"\\\s]+)/) || [])[1];
+    if (url) out.push(url);
+  }
+  for (const m of html.matchAll(/open\.substack\.com\/pub\/([a-z0-9-]+)/gi)) {
+    out.push(`https://${m[1].toLowerCase()}.substack.com/`);
+  }
+  return out;
+}
+
+/** The publication a newsletter came from, or '' if nothing stands out. */
+function newsletterHost(html) {
+  const src = String(html || '');
+  const counts = new Map();
+  const add = (u, weight) => {
+    let h;
+    try { h = normalizeHost(new URL(u).hostname); } catch { return; }
+    if (usableHost(h)) counts.set(h, (counts.get(h) || 0) + weight);
+  };
+  for (const m of src.matchAll(/href\s*=\s*["']?(https?:\/\/[^"'\s>]+)/gi)) add(m[1], 1);
+  // A decoded platform redirect is far better evidence than the wrapper around it.
+  for (const u of substackHosts(src)) add(u, 3);
+  let best = '', bestN = 0;
+  for (const [h, n] of counts) if (n > bestN) { best = h; bestN = n; }
+  return bestN >= 2 ? best : ''; // one stray citation shouldn't name the publication
+}
+
+/**
+ * How to file an article: its host, or for a newsletter the publication we can
+ * recover from the body. Also supplies a siteName when the article has none, so
+ * every client shows the source without needing to know about any of this.
+ */
+function articleIdentity(a) {
+  const host = hostOf(a.url);
+  if (host !== 'email') return { domain: host, siteName: a.siteName ?? null };
+  const pub = newsletterHost(a.html);
+  // Our IMAP path stamps a literal "Email" as the site name; that is a
+  // placeholder, not a source, so a publication we recognise outranks it.
+  const existing = String(a.siteName || '').trim();
+  const keep = existing && !/^e-?mail$/i.test(existing);
+  return { domain: pub || 'email', siteName: (keep ? existing : pub) || existing || null };
 }
 
 const SCHEMA = `
@@ -58,7 +174,15 @@ CREATE TABLE IF NOT EXISTS articles (
   -- and its original shown. Large; never sent in list/full-article responses,
   -- only via the dedicated source getter.
   sourceHtml TEXT,
+  -- how the article got here: 'browser-page' (extension, live DOM), 'browser-link'
+  -- (extension, server-fetched link), 'android-share', 'email', 'url', … — kept
+  -- as a debugging aid for diagnosing parse failures per save method.
+  source TEXT,
   wordCount INTEGER NOT NULL DEFAULT 0,
+  -- unguessable slug that makes the parsed article readable at /p/<shareId>
+  -- without a session. NULL = not shared. Revoking clears it, which breaks
+  -- every copy of the old link; re-sharing mints a fresh one.
+  shareId TEXT,
   updatedAt INTEGER NOT NULL
 );
 CREATE UNIQUE INDEX IF NOT EXISTS articles_user_url ON articles(userId, url);
@@ -121,6 +245,24 @@ CREATE TRIGGER IF NOT EXISTS articles_au AFTER UPDATE ON articles BEGIN
   INSERT INTO articles_fts(rowid, title, byline, siteName, excerpt, textContent)
   VALUES (new.rowid, new.title, new.byline, new.siteName, new.excerpt, new.textContent);
 END;
+
+-- Highlights are searched too: the words you chose to keep are the strongest
+-- signal you left on an article, and they are often nowhere in its title.
+CREATE VIRTUAL TABLE IF NOT EXISTS highlights_fts USING fts5(
+  text, note, content='highlights', content_rowid='rowid'
+);
+CREATE TRIGGER IF NOT EXISTS highlights_ai AFTER INSERT ON highlights BEGIN
+  INSERT INTO highlights_fts(rowid, text, note) VALUES (new.rowid, new.text, new.note);
+END;
+CREATE TRIGGER IF NOT EXISTS highlights_ad AFTER DELETE ON highlights BEGIN
+  INSERT INTO highlights_fts(highlights_fts, rowid, text, note)
+  VALUES ('delete', old.rowid, old.text, old.note);
+END;
+CREATE TRIGGER IF NOT EXISTS highlights_au AFTER UPDATE ON highlights BEGIN
+  INSERT INTO highlights_fts(highlights_fts, rowid, text, note)
+  VALUES ('delete', old.rowid, old.text, old.note);
+  INSERT INTO highlights_fts(rowid, text, note) VALUES (new.rowid, new.text, new.note);
+END;
 `;
 
 const rowUser = (r) => r || null;
@@ -131,7 +273,7 @@ const rowArticle = (r) => r && { ...r, archived: !!r.archived, favorite: !!r.fav
 // GET or Android sync, which would otherwise double every article's payload.
 const ARTICLE_COLS = 'id, userId, url, domain, savedAt, archived, favorite, readParagraph, '
   + 'ttsParagraph, title, byline, siteName, excerpt, html, textContent, imageUrl, publishedAt, '
-  + 'wordCount, updatedAt';
+  + 'source, wordCount, shareId, updatedAt';
 
 // Extract readable text for word counting. Crucially, remove the CONTENT of
 // script/style/head/noscript/svg blocks — not just their tags — or embedded
@@ -147,16 +289,42 @@ const countWords = (s) => {
 };
 const articleWordCount = (a) => countWords(a.textContent || htmlToText(a.html));
 
+/**
+ * The body text to store for search. Clients may sync `html` without a matching
+ * `textContent` (imports especially); since the FTS index reads textContent and
+ * not html, taking that at face value would leave the article findable by title
+ * alone. Fall back to the html's own text.
+ */
+const searchText = (a) => {
+  if (String(a.textContent || '').trim()) return a.textContent;
+  const derived = htmlToText(a.html).replace(/\s+/g, ' ').trim();
+  return derived ? derived.slice(0, 400000) : (a.textContent ?? null);
+};
+
+/** Stable 32-bit hash (FNV-1a) of a string. */
+function hash32(s) {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = Math.imul(h, 0x01000193);
+  }
+  return h >>> 0;
+}
+
 const ARTICLE_SORTS = {
   newest: 'a.savedAt DESC',
   oldest: 'a.savedAt ASC',
   longest: 'a.wordCount DESC',
   shortest: 'a.wordCount ASC',
+  // Shuffled, but repeatably so: the caller supplies a seed and gets the same
+  // order back for every page of that result set. ORDER BY RANDOM() would
+  // reshuffle on each request and make pagination drop/repeat articles.
+  random: 'shuffle(@seed, a.id) ASC',
 };
 
 /** Shared WHERE builder for searchArticles + countArticles. */
 function buildArticleWhere(userId, {
-  q = '', domain = '', highlighted = false, includeArchived = false, since = 0,
+  q = '', domain = '', domains = null, highlighted = false, includeArchived = false, since = 0,
   favoriteOnly = false, archivedOnly = false, minWords = 0, maxWords = 0, minHighlights = 0,
 } = {}) {
   const where = ['a.userId = @userId'];
@@ -165,7 +333,12 @@ function buildArticleWhere(userId, {
   else if (!includeArchived) where.push('a.archived = 0');
   if (favoriteOnly) where.push('a.favorite = 1');
   if (since) { where.push('a.updatedAt > @since'); args.since = since; }
-  if (domain) {
+  if (domains && domains.length) {
+    // An explicit set, resolved by the caller (the web UI expands a typed
+    // fragment into the domains that contain it).
+    where.push(`a.domain IN (${domains.map((_, i) => `@dom${i}`).join(', ')})`);
+    domains.forEach((d, i) => { args[`dom${i}`] = String(d).toLowerCase(); });
+  } else if (domain) {
     const d = String(domain).toLowerCase().replace(/^www\./, '');
     where.push("(a.domain = @domain OR a.domain LIKE '%.' || @domain)");
     args.domain = d;
@@ -178,10 +351,10 @@ function buildArticleWhere(userId, {
   } else if (highlighted) {
     where.push('EXISTS (SELECT 1 FROM highlights h WHERE h.articleId = a.id)');
   }
-  const match = ftsQuery(q);
-  if (match) {
-    where.push('a.rowid IN (SELECT rowid FROM articles_fts WHERE articles_fts MATCH @match)');
-    args.match = match;
+  const m = ftsMatch(q);
+  if (m) {
+    where.push(m.clause);
+    Object.assign(args, m.args);
   }
   return { where, args };
 }
@@ -191,15 +364,19 @@ const HL_SORTS = {
   oldest: 'lastHighlightAt ASC',
   most: 'n DESC',
   title: 'a.title COLLATE NOCASE ASC',
+  random: 'shuffle(@seed, a.id) ASC',
 };
 
 /** Shared WHERE for highlighted-articles queries (userId + optional q/domain). */
-function hlWhere(userId, q, domain) {
+function hlWhere(userId, q, domain, domains = null) {
   const parts = ['h.userId = @userId'];
   const args = { userId };
-  const match = ftsQuery(q);
-  if (match) { parts.push('a.rowid IN (SELECT rowid FROM articles_fts WHERE articles_fts MATCH @match)'); args.match = match; }
-  if (domain) {
+  const m = ftsMatch(q);
+  if (m) { parts.push(m.clause); Object.assign(args, m.args); }
+  if (domains && domains.length) {
+    parts.push(`a.domain IN (${domains.map((_, i) => `@dom${i}`).join(', ')})`);
+    domains.forEach((d, i) => { args[`dom${i}`] = String(d).toLowerCase(); });
+  } else if (domain) {
     const d = String(domain).toLowerCase().replace(/^www\./, '');
     parts.push("(a.domain = @domain OR a.domain LIKE '%.' || @domain)");
     args.domain = d;
@@ -207,11 +384,29 @@ function hlWhere(userId, q, domain) {
   return { where: parts.join(' AND '), args };
 }
 
-/** Turn a user query into an FTS5 MATCH expression: each term quoted, prefix-matched, ANDed. */
-function ftsQuery(q) {
+/**
+ * WHERE fragment (plus its bindings) matching a query against an article's own
+ * text and the text of its highlights. Every term is required, but each may land
+ * in either place — searching "marcos duterte" finds an article titled for
+ * Marcos with Duterte in a highlight — so this emits one clause per term rather
+ * than a single MATCH over the whole query.
+ *
+ * Terms are quoted and prefix-matched. Assumes the articles table is aliased
+ * `a`; the highlights subquery needs no user check of its own, since `a` is
+ * always already scoped to one user. Returns null when there are no terms.
+ */
+function ftsMatch(q) {
   const terms = String(q).split(/\s+/).filter(Boolean);
   if (!terms.length) return null;
-  return terms.map((t) => `"${t.replace(/"/g, '""')}"*`).join(' ');
+  const args = {};
+  const clause = terms.map((t, i) => {
+    const k = `match${i}`;
+    args[k] = `"${t.replace(/"/g, '""')}"*`;
+    return `(a.rowid IN (SELECT rowid FROM articles_fts WHERE articles_fts MATCH @${k})
+      OR a.id IN (SELECT hq.articleId FROM highlights hq
+                  WHERE hq.rowid IN (SELECT rowid FROM highlights_fts WHERE highlights_fts MATCH @${k})))`;
+  }).join(' AND ');
+  return { clause, args };
 }
 
 function open(dataDir) {
@@ -221,6 +416,9 @@ function open(dataDir) {
   sqlite.pragma('busy_timeout = 5000');
   sqlite.pragma('foreign_keys = ON');
   sqlite.exec(SCHEMA);
+
+  // Deterministic per-(seed, id) shuffle key for the `random` sorts.
+  sqlite.function('shuffle', { deterministic: true }, (seed, id) => hash32(`${seed}:${id}`));
 
   // Recompute wordCount for every article WITHOUT loading all bodies into
   // memory at once (24k full HTML bodies via .all() OOMs a small VM). Stream
@@ -257,11 +455,110 @@ function open(dataDir) {
   if (!articleCols.includes('sourceHtml')) {
     sqlite.exec("ALTER TABLE articles ADD COLUMN sourceHtml TEXT");
   }
+  // how the article was saved (browser-page / browser-link / android-share / …)
+  if (!articleCols.includes('source')) {
+    sqlite.exec("ALTER TABLE articles ADD COLUMN source TEXT");
+  }
+  // public share slug (/p/<shareId>)
+  if (!articleCols.includes('shareId')) {
+    sqlite.exec("ALTER TABLE articles ADD COLUMN shareId TEXT");
+  }
+  // Created here rather than in SCHEMA: on a database predating the column, the
+  // CREATE INDEX in SCHEMA would run before the ALTER above and fail outright.
+  // Unique so a slug can never resolve to two articles; SQLite treats NULLs as
+  // distinct, so any number of unshared articles coexist.
+  sqlite.exec('CREATE UNIQUE INDEX IF NOT EXISTS articles_share ON articles(shareId)');
   // one-time recompute after the script/style-stripping fix (imported
   // articles were over-counted by embedded JSON-LD / scripts).
   if (sqlite.pragma('user_version', { simple: true }) < 2) {
     recomputeAllWordCounts();
     sqlite.pragma('user_version = 2');
+  }
+
+  // Search used to see only textContent, so an article that arrived with a body
+  // in `html` but no `textContent` (imports, and any client that syncs one
+  // without the other) was findable by its title alone. Backfill the text from
+  // the stored html, then rebuild both indexes — highlights_fts is brand new and
+  // starts empty on an existing database, and the backfill's UPDATEs fire the
+  // articles triggers against rows that may never have been indexed.
+  //
+  // updatedAt is deliberately left untouched: bumping it would make every client
+  // re-download the entire library on its next delta sync.
+  if (sqlite.pragma('user_version', { simple: true }) < 3) {
+    const stale = sqlite.prepare(`SELECT id FROM articles
+      WHERE (textContent IS NULL OR textContent = '') AND html IS NOT NULL AND html != ''`).all();
+    const getHtml = sqlite.prepare('SELECT html FROM articles WHERE id = ?');
+    const upd = sqlite.prepare('UPDATE articles SET textContent = ? WHERE id = ?');
+    let filled = 0;
+    // One body at a time — 24k inline htmls will not fit in memory at once.
+    sqlite.transaction(() => {
+      for (const { id } of stale) {
+        const text = htmlToText((getHtml.get(id) || {}).html).replace(/\s+/g, ' ').trim();
+        if (text) { upd.run(text.slice(0, 400000), id); filled++; }
+      }
+    })();
+    sqlite.exec("INSERT INTO articles_fts(articles_fts) VALUES('rebuild')");
+    sqlite.exec("INSERT INTO highlights_fts(highlights_fts) VALUES('rebuild')");
+    sqlite.pragma('user_version = 3');
+    if (filled) console.log(`search: recovered body text for ${filled} article(s)`);
+  }
+
+  // Newsletters saved before we could tell them apart all sit under 'email' (or
+  // under no domain at all, for Readwise's mailto: imports). Recover the
+  // publication from each body. Only these rows are touched — a few thousand at
+  // most — and updatedAt IS bumped here, unlike the backfill above: the point is
+  // for phones to pick the new source label up on their next sync.
+  if (sqlite.pragma('user_version', { simple: true }) < 4) {
+    const rows = sqlite.prepare(
+      "SELECT id FROM articles WHERE domain = '' OR domain = 'email'"
+    ).all();
+    const get = sqlite.prepare('SELECT id, url, html, siteName FROM articles WHERE id = ?');
+    const upd = sqlite.prepare(
+      'UPDATE articles SET domain = @domain, siteName = @siteName, updatedAt = @now WHERE id = @id'
+    );
+    const now = Date.now();
+    let named = 0;
+    sqlite.transaction(() => {
+      for (const { id } of rows) {
+        const a = get.get(id);
+        if (!a) continue;
+        const { domain, siteName } = articleIdentity(a);
+        // Unrecognised newsletters still land in 'email' rather than keeping the
+        // empty domain a mailto: import left them with — an empty domain shows
+        // up nowhere at all in the picker.
+        if (domain === a.domain && (siteName || null) === (a.siteName || null)) continue;
+        upd.run({ id, domain, siteName, now });
+        if (domain !== 'email') named++;
+      }
+    })();
+    sqlite.pragma('user_version = 4');
+    if (named) console.log(`sources: identified the publication for ${named} newsletter(s)`);
+  }
+
+  // Re-run for rows whose site name was the literal placeholder "Email"; those
+  // kept it the first time round instead of taking the publication we found.
+  if (sqlite.pragma('user_version', { simple: true }) < 5) {
+    const rows = sqlite.prepare(
+      "SELECT id FROM articles WHERE siteName = 'Email' COLLATE NOCASE"
+    ).all();
+    const get = sqlite.prepare('SELECT id, url, html, siteName FROM articles WHERE id = ?');
+    const upd = sqlite.prepare(
+      'UPDATE articles SET domain = @domain, siteName = @siteName, updatedAt = @now WHERE id = @id'
+    );
+    const now = Date.now();
+    let fixed = 0;
+    sqlite.transaction(() => {
+      for (const { id } of rows) {
+        const a = get.get(id);
+        if (!a) continue;
+        const { domain, siteName } = articleIdentity(a);
+        if (domain === a.domain && (siteName || null) === (a.siteName || null)) continue;
+        upd.run({ id, domain, siteName, now });
+        fixed++;
+      }
+    })();
+    sqlite.pragma('user_version = 5');
+    if (fixed) console.log(`sources: replaced the "Email" placeholder on ${fixed} article(s)`);
   }
 
   migrateLegacyJson(sqlite, dataDir);
@@ -305,17 +602,33 @@ function open(dataDir) {
       (prep('ags', 'SELECT sourceHtml FROM articles WHERE id = ? AND userId = ?').get(id, userId) || {}).sourceHtml || '',
     articleByUrl: (userId, url) =>
       rowArticle(prep('abu', `SELECT ${ARTICLE_COLS} FROM articles WHERE userId = ? AND url = ?`).get(userId, url)),
+    // Deliberately NOT scoped to a user: the whole point of a share slug is
+    // that whoever holds it can read the article without being anyone.
+    articleByShareId: (shareId) =>
+      rowArticle(prep('abs', `SELECT ${ARTICLE_COLS} FROM articles WHERE shareId = ?`).get(shareId)),
+    /** Publish (shareId) or revoke (null). Scoped to the owner. */
+    setArticleShareId: (id, userId, shareId) =>
+      prep('assh', 'UPDATE articles SET shareId = ? WHERE id = ? AND userId = ?').run(shareId, id, userId),
     insertArticle: (a) => prep('ai', `INSERT INTO articles
-      (id, userId, url, domain, savedAt, archived, favorite, readParagraph, title, byline, siteName, excerpt, html, textContent, sourceHtml, imageUrl, publishedAt, wordCount, updatedAt)
-      VALUES (@id, @userId, @url, @domain, @savedAt, @archived, @favorite, @readParagraph, @title, @byline, @siteName, @excerpt, @html, @textContent, @sourceHtml, @imageUrl, @publishedAt, @wordCount, @updatedAt)`)
-      .run({ imageUrl: null, publishedAt: null, sourceHtml: null, ...a, domain: hostOf(a.url), archived: a.archived ? 1 : 0, favorite: a.favorite ? 1 : 0, wordCount: articleWordCount(a) }),
+      (id, userId, url, domain, savedAt, archived, favorite, readParagraph, title, byline, siteName, excerpt, html, textContent, sourceHtml, imageUrl, publishedAt, source, wordCount, updatedAt)
+      VALUES (@id, @userId, @url, @domain, @savedAt, @archived, @favorite, @readParagraph, @title, @byline, @siteName, @excerpt, @html, @textContent, @sourceHtml, @imageUrl, @publishedAt, @source, @wordCount, @updatedAt)`)
+      .run({ imageUrl: null, publishedAt: null, sourceHtml: null, source: null, ...a, ...articleIdentity(a), archived: a.archived ? 1 : 0, favorite: a.favorite ? 1 : 0, textContent: searchText(a), wordCount: articleWordCount(a) }),
     // Update content; only overwrites imageUrl/publishedAt/sourceHtml when new ones are provided.
     updateArticleContent: (id, f) => prep('auc', `UPDATE articles SET
       title = @title, byline = @byline, siteName = @siteName, excerpt = @excerpt,
       html = @html, textContent = @textContent, imageUrl = COALESCE(@imageUrl, imageUrl),
       publishedAt = COALESCE(@publishedAt, publishedAt), sourceHtml = COALESCE(@sourceHtml, sourceHtml),
       wordCount = @wordCount, updatedAt = @updatedAt WHERE id = @id`)
-      .run({ imageUrl: null, publishedAt: null, sourceHtml: null, ...f, id, wordCount: articleWordCount(f) }),
+      .run({ imageUrl: null, publishedAt: null, sourceHtml: null, ...f, id, textContent: searchText(f), wordCount: articleWordCount(f) }),
+    // Adopt a new canonical URL (e.g. after resolving an email tracking
+    // redirect to the publisher's real link). Keeps `domain` in step with it.
+    setArticleUrl: (id, url) => prep('asu', 'UPDATE articles SET url = @url, domain = @domain WHERE id = @id')
+      .run({ id, url, domain: hostOf(url) }),
+    // How the content currently in the row got there. Normally fixed at insert,
+    // but a highlight-only stub that later receives a real save is no longer a
+    // stub, and the server keys off `source` to tell the two apart.
+    setArticleSource: (id, source) => prep('ass', 'UPDATE articles SET source = @source WHERE id = @id')
+      .run({ id, source }),
     patchArticle: (id, { archived, favorite, readParagraph, ttsParagraph, updatedAt }) =>
       prep('ap', `UPDATE articles SET
         archived = COALESCE(@archived, archived),
@@ -347,9 +660,12 @@ function open(dataDir) {
      */
     searchArticles: (userId, filters = {}) => {
       const { where, args } = buildArticleWhere(userId, filters);
-      const order = ARTICLE_SORTS[filters.sort] || ARTICLE_SORTS.newest;
+      const sortKey = ARTICLE_SORTS[filters.sort] ? filters.sort : 'newest';
+      if (sortKey === 'random') args.seed = String(filters.seed || '');
+      const order = ARTICLE_SORTS[sortKey];
       let sql = `SELECT a.id, a.userId, a.url, a.domain, a.savedAt, a.archived, a.favorite, a.readParagraph,
-          a.ttsParagraph, a.title, a.byline, a.siteName, a.excerpt, a.imageUrl, a.publishedAt, a.wordCount, a.updatedAt
+          a.ttsParagraph, a.title, a.byline, a.siteName, a.excerpt, a.imageUrl, a.publishedAt, a.wordCount,
+          a.shareId, a.updatedAt
         FROM articles a WHERE ${where.join(' AND ')} ORDER BY ${order}`;
       const lim = Number(filters.limit) || 0;
       if (lim > 0) {
@@ -378,9 +694,11 @@ function open(dataDir) {
       FROM highlights h LEFT JOIN articles a ON a.id = h.articleId
       WHERE h.userId = ? ORDER BY h.createdAt DESC`).all(userId),
     /** Articles that have highlights, with counts — for the highlights page. */
-    highlightedArticles: (userId, { q = '', domain = '', sort = 'recent', limit = 0, offset = 0 } = {}) => {
-      const { where, args } = hlWhere(userId, q, domain);
-      const order = HL_SORTS[sort] || HL_SORTS.recent;
+    highlightedArticles: (userId, { q = '', domain = '', domains = null, sort = 'recent', seed = '', limit = 0, offset = 0 } = {}) => {
+      const { where, args } = hlWhere(userId, q, domain, domains);
+      const sortKey = HL_SORTS[sort] ? sort : 'recent';
+      if (sortKey === 'random') args.seed = String(seed || '');
+      const order = HL_SORTS[sortKey];
       let sql = `SELECT a.id, a.title, a.siteName, a.domain, a.savedAt, a.wordCount,
           COUNT(h.id) AS n, MAX(h.createdAt) AS lastHighlightAt
         FROM highlights h JOIN articles a ON a.id = h.articleId
@@ -388,8 +706,8 @@ function open(dataDir) {
       if (limit > 0) { sql += ' LIMIT @limit OFFSET @offset'; args.limit = limit; args.offset = Math.max(0, offset); }
       return sqlite.prepare(sql).all(args);
     },
-    highlightedArticlesCount: (userId, { q = '', domain = '' } = {}) => {
-      const { where, args } = hlWhere(userId, q, domain);
+    highlightedArticlesCount: (userId, { q = '', domain = '', domains = null } = {}) => {
+      const { where, args } = hlWhere(userId, q, domain, domains);
       return sqlite.prepare(`SELECT COUNT(*) c FROM (SELECT a.id FROM highlights h
         JOIN articles a ON a.id = h.articleId WHERE ${where} GROUP BY a.id)`).get(args).c;
     },
@@ -519,6 +837,7 @@ function migrateLegacyJson(sqlite, dataDir) {
         archived: a.archived ? 1 : 0,
         favorite: a.favorite ? 1 : 0,
         readParagraph: a.readParagraph || 0,
+        textContent: searchText(a),
         wordCount: articleWordCount(a),
         updatedAt: a.updatedAt || a.savedAt || Date.now(),
       });

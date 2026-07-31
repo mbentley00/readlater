@@ -117,9 +117,26 @@ async function main() {
   const mockPage = await new Promise((resolve) => {
     const s = http.createServer((req, res) => {
       res.writeHead(200, { 'Content-Type': 'text/html' });
+      // A substantial article so Readability extracts it confidently and the
+      // weak-parse LLM rescue does NOT fire — otherwise the mock LLM's canned
+      // "rescued" text would asynchronously overwrite this, and the assertion
+      // below would race that overwrite.
       res.end('<html><head><title>Shared Page Title</title>' +
         '<meta property="og:image" content="/thumb.jpg"></head><body><nav>menu</nav>' +
-        '<article><p>The shared article body text goes here.</p></article></body></html>');
+        '<article><p>The shared article body text goes here, and it continues for ' +
+        'several sentences so that Readability treats it as a real article rather ' +
+        'than a thin fragment. Newsletters and blog posts have paragraphs of prose, ' +
+        'so the extractor needs a genuine body to lock onto. This paragraph exists ' +
+        'to give it exactly that: enough words, in enough sentences, to clear the ' +
+        'character threshold comfortably and settle on a single deterministic parse. ' +
+        'No language-model rescue should be needed here, and none should run, because ' +
+        'the readable text is already well past the weak-parse cutoff. We add a few ' +
+        'more lines of ordinary prose to be safe, since the rescue trigger compares ' +
+        'against a fixed character count and we want to clear it without any doubt. ' +
+        'That keeps this test deterministic: Readability wins, the parse is stable, ' +
+        'and the assertions below check the extracted article rather than a fleeting ' +
+        'intermediate state that some slower or faster machine might race past.</p>' +
+        '</article></body></html>');
     });
     s.listen(MOCK_PAGE_PORT, '127.0.0.1', () => resolve(s));
   });
@@ -318,6 +335,94 @@ async function main() {
     res = await fetch(BASE + '/settings', { headers: { Cookie: aliceCookie } });
     html = await res.text();
     assert.ok(html.includes(TOKEN), 'settings shows the API token');
+
+    // ---- public share link -----------------------------------------------
+    r = await api('GET', `/api/articles/${articleId}/share`);
+    assert.strictEqual(r.body.shareId, null, 'articles start unshared');
+    r = await api('POST', `/api/articles/${articleId}/share`);
+    assert.strictEqual(r.status, 201);
+    const shareId = r.body.shareId;
+    assert.ok(shareId && shareId.length >= 20, 'share slug is long enough not to be guessed');
+    assert.strictEqual(r.body.url, `${BASE}/p/${shareId}`, 'share url built from the request origin');
+    r = await api('POST', `/api/articles/${articleId}/share`);
+    assert.strictEqual(r.status, 200);
+    assert.strictEqual(r.body.shareId, shareId, 'sharing twice keeps the link already handed out');
+
+    // the whole point: no session, no cookie, still readable
+    res = await fetch(BASE + `/p/${shareId}`);
+    assert.strictEqual(res.status, 200, 'shared article readable without logging in');
+    html = await res.text();
+    assert.ok(html.includes('<p>Updated content.</p>'), 'public page renders the parsed article');
+    assert.ok(html.includes('A Great Story (updated)'), 'public page shows the title');
+    assert.ok(!html.includes('It was a dark and stormy night.'), 'public page hides highlights');
+    assert.ok(!html.includes('classic opener'), 'public page hides highlight notes');
+    assert.ok(!html.includes('alice'), 'public page does not name the owner');
+    assert.ok(!html.includes('/highlights'), 'public page has no nav into the library');
+    assert.ok(!html.includes('/read/'), 'public page does not link to the private reader');
+    assert.ok(html.includes('noindex'), 'public page asks not to be indexed');
+    assert.strictEqual(res.headers.get('x-robots-tag'), 'noindex, nofollow');
+
+    // owner-facing surfaces show that it is shared
+    res = await fetch(BASE + `/read/${articleId}`, { headers: { Cookie: aliceCookie } });
+    html = await res.text();
+    assert.ok(html.includes('Shared ✓'), 'reader shows the article is shared');
+    res = await fetch(BASE + '/?view=archive', { headers: { Cookie: aliceCookie } });
+    html = await res.text();
+    assert.ok(html.includes('shared'), 'article list marks shared articles');
+
+    // only the owner can publish or revoke
+    r = await api('POST', `/api/articles/${articleId}/share`, undefined, BOB);
+    assert.strictEqual(r.status, 404, "bob can't share alice's article");
+    r = await api('DELETE', `/api/articles/${articleId}/share`, undefined, BOB);
+    assert.strictEqual(r.status, 404, "bob can't revoke alice's share");
+    res = await fetch(BASE + `/p/${shareId}`, { headers: { Cookie: bobCookie } });
+    assert.strictEqual(res.status, 200, 'a share link works for any visitor, logged in or not');
+
+    // revoking breaks every copy of the link, and re-sharing mints a new one
+    r = await api('DELETE', `/api/articles/${articleId}/share`);
+    assert.strictEqual(r.status, 200);
+    res = await fetch(BASE + `/p/${shareId}`);
+    assert.strictEqual(res.status, 404, 'revoked link stops working');
+    r = await api('POST', `/api/articles/${articleId}/share`);
+    assert.notStrictEqual(r.body.shareId, shareId, 're-sharing does not resurrect the old link');
+    const shareId2 = r.body.shareId;
+
+    res = await fetch(BASE + '/p/not-a-real-slug');
+    assert.strictEqual(res.status, 404, 'unknown slug is a 404, not a peek at someone else');
+
+    // deleting the article takes the public link with it
+    r = await api('POST', '/api/articles', {
+      url: 'https://example.com/ephemeral', title: 'Ephemeral', html: '<p>Here briefly.</p>',
+    });
+    const ephemeralId = r.body.id;
+    r = await api('POST', `/api/articles/${ephemeralId}/share`);
+    const ephemeralShare = r.body.shareId;
+    res = await fetch(BASE + `/p/${ephemeralShare}`);
+    assert.strictEqual(res.status, 200);
+    await api('DELETE', `/api/articles/${ephemeralId}`);
+    res = await fetch(BASE + `/p/${ephemeralShare}`);
+    assert.strictEqual(res.status, 404, 'deleting the article kills its share link');
+
+    await api('DELETE', `/api/articles/${articleId}/share`); // leave it unshared for later assertions
+    assert.ok(shareId2, 'second slug was issued');
+
+    // ---- reader script can't be closed early by article data ---------------
+    // JSON.stringify leaves '<' alone, so a value containing "</script>" used to
+    // end the inline script tag and take the whole reader's JS with it. Hostile
+    // pages control the URL (via og:url), so this is not only self-inflicted.
+    r = await api('POST', '/api/articles', {
+      url: 'https://example.com/</script><b>x</b>',
+      title: 'Breakout </script> attempt',
+      html: '<p>Body.</p>',
+    });
+    const breakoutId = r.body.id;
+    await api('POST', `/api/articles/${breakoutId}/highlights`, { text: 'quote with </script> inside' });
+    res = await fetch(BASE + `/read/${breakoutId}`, { headers: { Cookie: aliceCookie } });
+    html = await res.text();
+    assert.strictEqual(html.split('</script>').length - 1, 1,
+      'article data cannot close the reader\'s script tag early');
+    assert.ok(html.includes('\\u003c/script>'), 'the dangerous sequence is escaped, not dropped');
+    await api('DELETE', `/api/articles/${breakoutId}`);
 
     // session cookie works on /api (used by the web UI's buttons)
     r = await api('PATCH', `/api/articles/${articleId}`, { archived: false }, { Cookie: aliceCookie, 'Content-Type': 'application/json' });
@@ -697,6 +802,92 @@ async function main() {
     });
     assert.strictEqual(res.status, 400, 'invalid apk name rejected');
 
+    // ---- highlight an arbitrary page (extension "save selection") --------
+    // No page capture involved: the quote arrives with only a URL, and the
+    // server keeps a stub article for pages it has never seen.
+    const quotedUrl = `http://127.0.0.1:${MOCK_PAGE_PORT}/quoted`;
+    r = await api('POST', '/api/highlights', {
+      url: quotedUrl, title: 'A Page I Was Reading',
+      text: 'The first thing worth keeping.', clientId: 'sel-uuid-1',
+    });
+    assert.strictEqual(r.status, 201, 'highlight saved against a bare URL');
+    assert.ok(r.body.createdArticle, 'an unsaved page gets a stub article');
+    const stubId = r.body.articleId;
+    const stubHlId = r.body.id;
+
+    r = await api('GET', `/api/articles/${stubId}`);
+    assert.strictEqual(r.body.archived, true, 'the stub is filed away, not queued to read');
+    assert.strictEqual(r.body.title, 'A Page I Was Reading');
+    assert.ok(r.body.html.includes('The first thing worth keeping.'), 'stub body is the quote');
+
+    // idempotent re-post by clientId — and no second stub left behind
+    r = await api('POST', '/api/highlights', {
+      url: quotedUrl, text: 'The first thing worth keeping.', clientId: 'sel-uuid-1',
+    });
+    assert.strictEqual(r.body.id, stubHlId, 'clientId dedupes URL highlights');
+
+    // a second quote from the same page joins the same article
+    r = await api('POST', '/api/highlights', {
+      url: quotedUrl, text: 'And a second thing.', note: 'why it matters',
+    });
+    assert.strictEqual(r.status, 201);
+    assert.strictEqual(r.body.articleId, stubId, 'same page, same article');
+    assert.strictEqual(r.body.createdArticle, false);
+    r = await api('GET', `/api/articles/${stubId}/highlights`);
+    assert.strictEqual(r.body.highlights.length, 2, 'both quotes kept');
+    r = await api('GET', `/api/articles/${stubId}`);
+    assert.ok(r.body.html.includes('And a second thing.'), 'stub body grows with each quote');
+    assert.ok(r.body.html.includes('why it matters'), 'the note is in the body too');
+    assert.ok((r.body.textContent || '').includes('second thing'), 'quotes are searchable');
+    r = await api('GET', '/api/articles?q=keeping&includeArchived=1');
+    assert.ok(r.body.articles.some((a) => a.id === stubId), 'stub found by quote text');
+
+    r = await api('POST', '/api/highlights', { url: quotedUrl, text: '   ' });
+    assert.strictEqual(r.status, 400, 'empty selection rejected');
+    r = await api('POST', '/api/highlights', { url: 'not a url', text: 'hi' });
+    assert.strictEqual(r.status, 400, 'non-URL rejected');
+
+    // saving the page for real later takes the stub over: same article, so the
+    // quotes survive, and it comes back out of the archive.
+    r = await api('POST', '/api/articles', {
+      url: quotedUrl, title: 'A Page I Was Reading',
+      html: '<p>The first thing worth keeping. And a second thing. Plus the rest of the page.</p>',
+    });
+    assert.strictEqual(r.body.id, stubId, 'full save reuses the stub article');
+    assert.strictEqual(r.body.archived, false, 'and pulls it back into the inbox');
+    r = await api('GET', `/api/articles/${stubId}`);
+    assert.ok(r.body.html.includes('Plus the rest of the page.'), 'real content replaced the quotes');
+    r = await api('GET', `/api/articles/${stubId}/highlights`);
+    assert.strictEqual(r.body.highlights.length, 2, 'highlights survive the upgrade');
+    // ...and a later quote no longer overwrites the page with quotes
+    r = await api('POST', '/api/highlights', { url: quotedUrl, text: 'Plus the rest of the page.' });
+    assert.strictEqual(r.status, 201);
+    r = await api('GET', `/api/articles/${stubId}`);
+    assert.ok(r.body.html.includes('Plus the rest of the page.'), 'article body left alone');
+    assert.ok(!r.body.html.includes('<blockquote>'), 'no longer treated as a stub');
+
+    // save-url on a stub fetches the page instead of claiming it is already saved
+    const stubUrl2 = `http://127.0.0.1:${MOCK_PAGE_PORT}/quoted-2`;
+    r = await api('POST', '/api/highlights', { url: stubUrl2, text: 'Just this line.' });
+    const stubId2 = r.body.articleId;
+    r = await api('POST', '/api/save-url', { url: stubUrl2 });
+    assert.strictEqual(r.status, 200);
+    assert.ok(!r.body.alreadySaved, 'a stub is not "already saved"');
+    assert.strictEqual(r.body.id, stubId2, 'and keeps its id, so the quote stays attached');
+    let stubFilled = null;
+    for (let i = 0; i < 50; i++) {
+      r = await api('GET', `/api/articles/${stubId2}`);
+      if (r.body.title === 'Shared Page Title') { stubFilled = r.body; break; }
+      await new Promise((res2) => setTimeout(res2, 100));
+    }
+    assert.ok(stubFilled, 'save-url filled the stub in the background');
+    assert.strictEqual(stubFilled.archived, false, 'and unarchived it');
+    r = await api('GET', `/api/articles/${stubId2}/highlights`);
+    assert.strictEqual(r.body.highlights.length, 1, 'quote still attached after the fetch');
+
+    await api('DELETE', `/api/articles/${stubId}`);
+    await api('DELETE', `/api/articles/${stubId2}`);
+
     // ---- deletes (as alice, token auth still fine) ----------------------
     r = await api('DELETE', `/api/highlights/${hlId}`);
     assert.strictEqual(r.body.ok, true);
@@ -891,8 +1082,61 @@ function testEconomistEndMark() {
   console.log('  Economist end-of-article mark ✔');
 }
 
+/**
+ * Condé Nast (New Yorker, Wired, …) split a body into sibling
+ * `div.body__inner-container` chunks; Readability keeps only the top-scoring
+ * one, dropping later chunks and the ♦ end mark. mergeChunkedBody hoists them
+ * into the first so the whole article survives.
+ */
+function testChunkedBodyMerge() {
+  const { parseHTML } = require('linkedom');
+  const { mergeChunkedBody, extractReadable } = require('./extract');
+
+  // Two chunks in separate wrappers, ad wedged between; ending + ♦ in chunk two.
+  // Real prose (well past Readability's character threshold) so the end-to-end
+  // extraction below produces an article rather than rejecting a thin fixture.
+  const html = '<html><body><div class="page">'
+    + '<div class="GridWrapper"><div class="body__inner-container">'
+    + '<p>Opening paragraph one carries the real prose that anchors the piece and '
+    + 'gives the extractor a substantial first chunk to lock onto and score highly.</p>'
+    + '<p>The second paragraph keeps the argument moving with more sentences of '
+    + 'ordinary editorial prose so that the container reads unmistakably as body copy.</p>'
+    + '</div></div>'
+    + '<div class="ad"><p>Sign up for our newsletter.</p></div>'
+    + '<div class="GridWrapper"><div class="body__inner-container">'
+    + '<p>The middle of the piece continues here across another few sentences, the '
+    + 'kind of passage Readability would otherwise strand in a dropped sibling chunk.</p>'
+    + '<p>The final paragraph brings the essay to its close and ends with the mark. ♦</p>'
+    + '</div></div>'
+    + '</div></body></html>';
+
+  const { document } = parseHTML(html);
+  mergeChunkedBody(document);
+  const containers = document.querySelectorAll('div.body__inner-container');
+  assert.strictEqual(containers.length, 1, 'chunks collapse into one container');
+  const merged = containers[0].textContent;
+  assert.ok(/Opening paragraph one/.test(merged), 'first chunk kept');
+  assert.ok(/brings the essay to its close/.test(merged), 'last chunk hoisted in');
+  assert.ok(/♦/.test(merged), 'the end-of-article mark survives');
+
+  // A page with fewer than two such containers is left untouched.
+  const single = parseHTML('<html><body><div class="body__inner-container"><p>Solo.</p></div></body></html>').document;
+  mergeChunkedBody(single);
+  assert.strictEqual(single.querySelectorAll('div.body__inner-container').length, 1, 'single container untouched');
+
+  // End to end: the merged body extracts with the closing paragraph and its ♦
+  // mark intact (rather than truncated at the first chunk).
+  const article = extractReadable(html, 'https://www.newyorker.com/news/the-lede/x');
+  assert.ok(article, 'chunked page still extracts an article');
+  assert.ok(/brings the essay to its close/.test(article.textContent), 'final paragraph survives extraction');
+  assert.ok(/♦/.test(article.textContent), 'the end-of-article mark survives extraction');
+
+  console.log('  Condé Nast chunked-body merge ✔');
+}
+
 testEmailNormalization();
 testEconomistEndMark();
+testChunkedBodyMerge();
 testReparseEngine().catch((e) => { console.error(e); process.exit(1); });
 checkDockerfileCopiesEveryModule();
 main().catch((e) => { console.error(e); process.exit(1); });

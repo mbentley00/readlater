@@ -40,14 +40,58 @@ const { reparse, textOf } = require('./reparse');
 // can't blow the data volume. Big enough for any real newsletter or page.
 const SOURCE_CAP = 3 * 1024 * 1024;
 
+// Browser-like headers. Many publishers sit behind bot filters (Cloudflare,
+// Akamai) that answer 429/403 to an obvious bot UA or a request with no
+// Accept-Language — e.g. aeon.co serves 200 only when both a real UA and
+// Accept-Language are present. Since we're fetching an article the user
+// explicitly asked to save, present as a normal browser so the read succeeds.
+const FETCH_HEADERS = {
+  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+  Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+  'Accept-Language': 'en-US,en;q=0.9',
+};
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/**
+ * Fetch a page, following redirects and returning the final URL after them.
+ *
+ * Email newsletters wrap every article link in a tracking redirector (Mailchimp
+ * list-manage, Substack, Beehiiv, …). Those endpoints 302 to the real article
+ * but rate-limit hard — under load they answer 429 *instead of* the redirect,
+ * so a save that lands on the wrong side of a throttle looks permanently
+ * un-fetchable. Retry 429/503 (honouring Retry-After) to ride out the throttle,
+ * and hand back `finalUrl` so callers can canonicalise away the tracker link and
+ * never hit it again.
+ */
+async function fetchPage(url) {
+  let status = 0;
+  let finalUrl = url; // last URL fetch resolved to — a redirect may have moved us
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const resp = await fetch(url, { headers: FETCH_HEADERS, redirect: 'follow', signal: AbortSignal.timeout(25000) });
+    if (resp.url) finalUrl = resp.url;
+    if (resp.ok) {
+      const html = (await resp.text()).slice(0, SOURCE_CAP);
+      return { ok: true, status: resp.status, html, finalUrl };
+    }
+    status = resp.status;
+    if ((resp.status === 429 || resp.status === 503) && attempt < 2) {
+      const ra = parseInt(resp.headers.get('retry-after') || '', 10);
+      await sleep(Number.isFinite(ra) ? Math.min(Math.max(ra, 1), 10) * 1000 : (attempt + 1) * 1500);
+      continue;
+    }
+    break;
+  }
+  // Even on failure, finalUrl may be the publisher's real article (the tracker
+  // redirected, the destination then errored) — worth adopting so a retry skips
+  // the tracker. It stays the tracker only when the tracker itself refused.
+  return { ok: false, status, html: '', finalUrl };
+}
+
 /** Fetch a page's HTML (shared by save-by-URL, reparse and "view original"). */
 async function fetchPageHtml(url) {
-  const resp = await fetch(url, {
-    headers: { 'User-Agent': 'Mozilla/5.0 (compatible; EarmarkBot/1.0)', Accept: 'text/html' },
-    redirect: 'follow', signal: AbortSignal.timeout(25000),
-  });
-  if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-  return (await resp.text()).slice(0, SOURCE_CAP);
+  const r = await fetchPage(url);
+  if (!r.ok) throw new Error(`HTTP ${r.status}`);
+  return r.html;
 }
 
 const PORT = parseInt(process.env.PORT || '8090', 10);
@@ -103,6 +147,15 @@ const ttsFailedAt = new Map(); // articleId -> ms of last failure (backoff)
 const TTS_FAIL_COOLDOWN = 5 * 60 * 1000;
 let ttsRunning = false;
 
+// Whether to pre-generate the Kokoro (server) voice automatically when an
+// article is saved/updated. Pre-generating on every save is the biggest
+// recurring cost of the server voice, so it's OFF by default for now — the
+// on-device voice is the daily driver. Set TTS_GENERATE_ON_SAVE=1 to bring back
+// save-time pre-generation. On-demand generation is unaffected: opening an
+// article with the server voice selected, or POST /articles/:id/audio, still
+// synthesizes on request.
+const TTS_GENERATE_ON_SAVE = process.env.TTS_GENERATE_ON_SAVE === '1';
+
 function enqueueTts(articleId, userId, force = false) {
   if (!tts.enabled()) return false;
   if (ttsQueued.has(articleId)) return true;
@@ -117,6 +170,14 @@ function enqueueTts(articleId, userId, force = false) {
   ttsPending.push({ articleId, userId });
   pumpTts();
   return true;
+}
+
+// Save-time pre-generation, gated by TTS_GENERATE_ON_SAVE. Every "generate audio
+// because an article was just saved or updated" path goes through here, so the
+// switch has one obvious home and on-demand generation stays untouched.
+function enqueueTtsOnSave(articleId, userId, force = false) {
+  if (!TTS_GENERATE_ON_SAVE) return false;
+  return enqueueTts(articleId, userId, force);
 }
 
 async function pumpTts() {
@@ -202,6 +263,21 @@ function withSkipRules(userId, fields, url) {
   return clean;
 }
 
+// Adopt the URL a fetch actually resolved to. Newsletter tracking links
+// (Mailchimp list-manage, Substack, …) redirect to the publisher's real
+// article; keeping the resolved link means reparse / "view original" go
+// straight to the publisher instead of re-triggering the rate-limited tracker,
+// and the title/site name reflect the publisher rather than the mailer. Guarded
+// by the (userId, url) unique index — if the resolved URL is already saved, keep
+// the original so we don't collide. Returns the URL callers should go on using.
+function canonicalizeArticleUrl(articleId, userId, artUrl, finalUrl) {
+  if (finalUrl && finalUrl !== artUrl && /^https?:\/\//i.test(finalUrl)
+      && !store.articleByUrl(userId, finalUrl)) {
+    try { store.setArticleUrl(articleId, finalUrl); return finalUrl; } catch { /* keep original */ }
+  }
+  return artUrl;
+}
+
 // Background page fetch + extraction for save-by-URL, so the client isn't kept
 // waiting on a slow page. Updates the placeholder article in place.
 async function fillSavedUrl(articleId, userId, artUrl) {
@@ -215,12 +291,13 @@ async function fillSavedUrl(articleId, userId, artUrl) {
   };
   let pageHtml = '';
   try {
-    const resp = await fetch(artUrl, {
-      headers: { 'User-Agent': 'Mozilla/5.0 (compatible; EarmarkBot/1.0)', Accept: 'text/html' },
-      redirect: 'follow', signal: AbortSignal.timeout(25000),
-    });
-    if (!resp.ok) { setContent({ title: hostOf(artUrl) || artUrl, excerpt: `Fetch failed (${resp.status})`, html: `<p>Couldn't fetch this page (HTTP ${resp.status}). Original: ${escapeText(artUrl)}</p>`, textContent: '' }); return; }
-    pageHtml = (await resp.text()).slice(0, 3 * 1024 * 1024);
+    const r = await fetchPage(artUrl);
+    // Adopt the resolved URL even on failure: if the tracker redirected and the
+    // publisher then errored, we still want to store the publisher's link so a
+    // later reparse retries it directly instead of the rate-limited tracker.
+    artUrl = canonicalizeArticleUrl(articleId, userId, artUrl, r.finalUrl);
+    if (!r.ok) { setContent({ title: hostOf(artUrl) || artUrl, excerpt: `Fetch failed (${r.status})`, html: `<p>Couldn't fetch this page (HTTP ${r.status}). Original: ${escapeText(artUrl)}</p>`, textContent: '' }); return; }
+    pageHtml = r.html;
   } catch (e) {
     setContent({ title: hostOf(artUrl) || artUrl, excerpt: 'Could not fetch the page', html: `<p>Couldn't fetch this page. Original: ${escapeText(artUrl)}</p>`, textContent: '' });
     return;
@@ -254,7 +331,7 @@ async function fillSavedUrl(articleId, userId, artUrl) {
     };
   }
   if (!setContent(fields)) return;
-  enqueueTts(articleId, userId);
+  enqueueTtsOnSave(articleId, userId);
 
   // LLM rescue only when extraction was weak (Readability failed or thin) — no
   // point paying for it when Readability already produced a clean article.
@@ -270,7 +347,7 @@ async function fillSavedUrl(articleId, userId, artUrl) {
           excerpt: better.textContent.slice(0, 300),
           html: better.html, textContent: better.textContent, updatedAt: Date.now(),
         }, artUrl));
-        enqueueTts(articleId, userId, true);
+        enqueueTtsOnSave(articleId, userId, true);
         console.log(`save-url LLM-upgraded ${articleId} (${(cur.textContent || '').length} → ${better.textContent.length})`);
       })
       .catch((e) => console.error(`save-url LLM upgrade failed for ${articleId}: ${e.message}`));
@@ -341,6 +418,15 @@ function createUser(username, password) {
 // ---------------------------------------------------------------- sessions
 const isHttps = (req) => (req.headers['x-forwarded-proto'] || '').split(',')[0].trim() === 'https';
 
+/**
+ * The origin a browser reached us on, for building links we hand back to the
+ * user (share links, the email-in address). Behind fly.io the TLS terminates
+ * at the proxy, so the scheme has to come from x-forwarded-proto, not the
+ * socket — otherwise every share link would come out as http://.
+ */
+const originOf = (req) =>
+  `${(req.headers['x-forwarded-proto'] || '').split(',')[0].trim() || 'http'}://${req.headers.host || 'localhost'}`;
+
 function parseCookies(req) {
   const out = {};
   for (const part of String(req.headers.cookie || '').split(';')) {
@@ -394,6 +480,32 @@ function pubArticle(a) {
 function pubHighlight(h) {
   const { userId, ...pub } = h;
   return pub;
+}
+
+// A highlight always hangs off an article, but "save this quote" from the
+// extension is explicitly *not* a request to save the page. Pages that aren't
+// in the library get a stub article to hang it off: archived on arrival (the
+// point was the quote, not another thing to read) and with no body of its own
+// beyond the quotes, rebuilt from them each time one is added — so the reader
+// and full-text search still show something. `source` marks the stub, so a
+// later real save of the same URL can take the article over.
+const HIGHLIGHT_STUB = 'browser-highlight';
+
+function rebuildStubBody(article) {
+  const hs = store.highlightsForArticle(article.id);
+  const para = (s) => String(s).split(/\n+/).map((l) => l.trim()).filter(Boolean)
+    .map((l) => `<p>${escapeText(l)}</p>`).join('');
+  const html = hs.map((h) =>
+    `<blockquote>${para(h.text)}</blockquote>${h.note ? para(h.note) : ''}`).join('\n');
+  store.updateArticleContent(article.id, {
+    title: article.title,
+    byline: article.byline,
+    siteName: article.siteName,
+    excerpt: (hs.length ? hs[0].text : '').slice(0, 300),
+    html,
+    textContent: null, // derived from the html above
+    updatedAt: Date.now(),
+  });
 }
 
 const searchArticles = (user, opts) => store.searchArticles(user.id, opts);
@@ -493,10 +605,12 @@ function saveEmailArticle({ userId, messageId, subject, from, date, html, text }
     // Keep the raw email HTML: it can't be re-fetched, so it's the only way to
     // reparse a mis-parsed newsletter or show its original.
     sourceHtml: typeof html === 'string' && html.trim() ? html.slice(0, SOURCE_CAP) : null,
+    source: 'email',
     updatedAt: Date.now(),
   });
   store.insertArticle(article);
-  enqueueTts(article.id, userId); // emailed newsletters get audio like any other save
+  console.log(`article saved [email] ${url}`);
+  enqueueTtsOnSave(article.id, userId); // emailed newsletters get audio like any other save
   return { article, created: true };
 }
 
@@ -585,7 +699,7 @@ const ctx = {
   store, newId, sanitizeString, readBody, parseBody,
   createUser, verifyPassword, findUserByName, newEmailAlias,
   createSession, sessionCookie, getSessionUser, destroySession,
-  searchArticles, countArticles, hostOf,
+  searchArticles, countArticles, hostOf, originOf,
   ALLOW_SIGNUP, INBOUND_DOMAIN, APK_FILE, EXT_XPI_FILE, EXT_META_FILE,
   INBOUND_MAILBOX: inbound.enabled() ? inbound.cfg.user : '',
 };
@@ -859,20 +973,39 @@ const server = http.createServer(async (req, res) => {
         let a = store.articleByUrl(user.id, artUrl);
         if (a) {
           store.updateArticleContent(a.id, fields);
+          // The row may have been a highlight stub (quotes only, no page). It
+          // now holds a real capture, so stop treating it as one — otherwise
+          // the next highlight saved here would overwrite the page with quotes.
+          if (a.source === HIGHLIGHT_STUB) {
+            const src = sanitizeString(b.source, 40) || 'browser-page';
+            store.setArticleSource(a.id, src);
+            // Stubs are archived on arrival; this save asked for the page, so
+            // put it back in the inbox rather than leaving it filed away.
+            if (a.archived && b.archived !== true) {
+              store.patchArticle(a.id, { archived: false, updatedAt: now });
+            }
+            a = { ...a, source: src, archived: b.archived === true };
+          }
         } else {
           a = {
             id: newId(), userId: user.id, url: artUrl,
             savedAt: b.savedAt || now,
             archived: b.archived === true, // importers can create straight into the archive
             favorite: false, readParagraph: 0,
+            // how it was saved — the extension's page-save posts here; default to
+            // that when a client doesn't say. Recorded to help diagnose parse
+            // failures (live-DOM captures parse differently from server fetches).
+            source: sanitizeString(b.source, 40) || 'browser-page',
             ...fields,
           };
           store.insertArticle(a);
+          console.log(`article saved [${a.source}] ${artUrl}`);
         }
 
         // Pre-compute the server voice for freshly-saved articles (skips
-        // archived imports and no-ops when TTS isn't configured).
-        if (!(b.archived === true)) enqueueTts(a.id, user.id);
+        // archived imports, no-ops when TTS isn't configured, and — for now —
+        // when save-time pre-generation is switched off).
+        if (!(b.archived === true)) enqueueTtsOnSave(a.id, user.id);
 
         // LLM rescue: the extension flags saves it thinks it parsed badly by
         // attaching the stripped page HTML. Respond fast with what we have,
@@ -927,17 +1060,35 @@ const server = http.createServer(async (req, res) => {
       if (!artUrl || !/^https?:\/\//i.test(artUrl)) return json(res, 400, { error: 'a http(s) url is required' });
 
       const existing = store.articleByUrl(user.id, artUrl);
-      if (existing) return json(res, 200, { ...pubArticleMeta(existing), alreadySaved: true });
+      if (existing) {
+        // A highlight stub holds quotes, not the page — "already saved" would
+        // be a lie and the page would never be fetched. Fill it in instead,
+        // keeping the id (and so the highlights already hanging off it).
+        if (existing.source === HIGHLIGHT_STUB) {
+          const src = sanitizeString(b.source, 40) || 'url';
+          store.setArticleSource(existing.id, src);
+          store.patchArticle(existing.id, { archived: false, updatedAt: Date.now() });
+          fillSavedUrl(existing.id, user.id, artUrl); // background fetch + extract
+          return json(res, 200, pubArticleMeta(store.getArticle(existing.id, user.id)));
+        }
+        return json(res, 200, { ...pubArticleMeta(existing), alreadySaved: true });
+      }
 
       const now = Date.now();
+      // Both the Android share sheet and the extension's "save link" post here;
+      // the client says which via `source` (android-share / browser-link). Falls
+      // back to a generic 'url'. Recorded to help diagnose parse failures.
+      const source = sanitizeString(b.source, 40) || 'url';
       const a = {
         id: newId(), userId: user.id, url: artUrl, savedAt: now,
         archived: false, favorite: false, readParagraph: 0,
         title: hostOf(artUrl) || artUrl, byline: null, siteName: hostOf(artUrl),
         excerpt: 'Fetching…', html: '<p>Fetching the article…</p>', textContent: 'Fetching…',
+        source,
         updatedAt: now,
       };
       store.insertArticle(a);
+      console.log(`article saved [${source}] ${artUrl}`);
       fillSavedUrl(a.id, user.id, artUrl); // background fetch + extract
       return json(res, 201, pubArticleMeta(store.getArticle(a.id, user.id)));
     }
@@ -1032,7 +1183,15 @@ const server = http.createServer(async (req, res) => {
         // different measure entirely — for emails it's the message's plain-text
         // part, not the rendered body — which would make "too short" unfixable.
         currentTextLen: textOf(a.html).length,
-        fetchUrl: fetchPageHtml,
+        // Resolve + adopt the real URL on the way through, so reparsing a save
+        // that got stuck on a rate-limited tracker link (429) both fetches the
+        // publisher's article and stops pointing at the tracker afterwards.
+        fetchUrl: async (u) => {
+          const r = await fetchPage(u);
+          if (!r.ok) throw new Error(`HTTP ${r.status}`);
+          canonicalizeArticleUrl(a.id, user.id, u, r.finalUrl);
+          return r.html;
+        },
       });
       if (!result.ok) return json(res, 200, { ok: false, reason: result.reason });
       const art = result.article;
@@ -1063,6 +1222,33 @@ const server = http.createServer(async (req, res) => {
         try { source = await fetchPageHtml(a.url); kind = 'web'; } catch { source = ''; }
       }
       return json(res, 200, { url: a.url, kind, hasSource: !!source, source: source || null });
+    }
+
+    // ---- public share link for an article
+    //
+    // POST mints an unguessable slug (or returns the one already in force, so
+    // the button is idempotent and a second click can't silently invalidate a
+    // link you already sent). DELETE revokes it: the slug is cleared, so every
+    // copy of that link dies at once and re-sharing gives a different one.
+    if (parts[1] === 'articles' && parts.length === 4 && parts[3] === 'share') {
+      const a = store.getArticle(parts[2], user.id);
+      if (!a) return json(res, 404, { error: 'article not found' });
+      const link = (shareId) => ({ shareId, url: `${originOf(req)}/p/${shareId}` });
+      if (req.method === 'GET') {
+        return json(res, 200, a.shareId ? link(a.shareId) : { shareId: null, url: null });
+      }
+      if (req.method === 'POST') {
+        if (a.shareId) return json(res, 200, link(a.shareId));
+        // 18 bytes ≈ 144 bits of base64url: not enumerable, and short enough
+        // to paste into a message without wrapping.
+        const shareId = crypto.randomBytes(18).toString('base64url');
+        store.setArticleShareId(a.id, user.id, shareId);
+        return json(res, 201, link(shareId));
+      }
+      if (req.method === 'DELETE') {
+        store.setArticleShareId(a.id, user.id, null);
+        return json(res, 200, { ok: true, shareId: null });
+      }
     }
 
     // ---- highlights nested under an article
@@ -1130,9 +1316,11 @@ const server = http.createServer(async (req, res) => {
         a = {
           id: newId(), userId: user.id, url: artUrl,
           savedAt: now, archived: false, favorite: false, readParagraph: 0,
+          source: 'pdf',
           ...fields,
         };
         store.insertArticle(a);
+        console.log(`article saved [pdf] ${filename}`);
       }
       return json(res, 201, pubArticle(store.getArticle(a.id, user.id)));
     }
@@ -1200,6 +1388,62 @@ const server = http.createServer(async (req, res) => {
 
     // ---- highlights collection / export / delete
     if (parts[1] === 'highlights') {
+      // Save a highlight against a URL rather than an article id — the
+      // extension's "save selection" path, for a page that was never saved.
+      // Attaches to the article if we already have it, otherwise mints a stub.
+      if (req.method === 'POST' && parts.length === 2) {
+        const b = parseBody(await readBody(req), req.headers['content-type']);
+        const text = (sanitizeString(b.text, 20000) || '').trim();
+        if (!text) return json(res, 400, { error: 'text is required' });
+        let artUrl = sanitizeString(b.url, 4000);
+        if (!artUrl || !/^https?:\/\//i.test(artUrl)) {
+          return json(res, 400, { error: 'a http(s) url is required' });
+        }
+        artUrl = artUrl.trim();
+        // Dedupe before touching the article, so a retried save can't leave a
+        // second stub behind.
+        const clientId = sanitizeString(b.clientId);
+        if (clientId) {
+          const dup = store.highlightByClientId(user.id, clientId);
+          if (dup) return json(res, 200, { ...pubHighlight(dup), alreadySaved: true });
+        }
+
+        const now = Date.now();
+        let a = store.articleByUrl(user.id, artUrl);
+        const createdArticle = !a;
+        if (!a) {
+          a = {
+            id: newId(), userId: user.id, url: artUrl, savedAt: now,
+            archived: true, favorite: false, readParagraph: 0,
+            title: sanitizeString(b.title) || hostOf(artUrl) || artUrl,
+            byline: null, siteName: sanitizeString(b.siteName) || hostOf(artUrl),
+            excerpt: text.slice(0, 300),
+            html: '', textContent: '',
+            source: HIGHLIGHT_STUB,
+            updatedAt: now,
+          };
+          store.insertArticle(a);
+          console.log(`highlight stub created ${artUrl}`);
+        }
+        const h = {
+          id: newId(),
+          userId: user.id,
+          clientId: clientId || null,
+          articleId: a.id,
+          text,
+          note: sanitizeString(b.note, 20000),
+          paragraphIndex: null,
+          createdAt: Number.isFinite(b.createdAt) ? b.createdAt : now,
+        };
+        store.insertHighlight(h);
+        if (a.source === HIGHLIGHT_STUB) rebuildStubBody(a);
+        return json(res, 201, {
+          ...pubHighlight(h),
+          articleTitle: a.title,
+          articleUrl: a.url,
+          createdArticle,
+        });
+      }
       if (req.method === 'GET' && parts.length === 2) {
         return json(res, 200, { highlights: store.highlightsForUser(user.id).map(pubHighlight) });
       }
