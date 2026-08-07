@@ -32,6 +32,57 @@ function escapeHtml(s) {
  */
 const jsonForScript = (v) => JSON.stringify(v).replace(/</g, '\\u003c');
 
+/**
+ * Reading-type settings, as a <head> script.
+ *
+ * Four CSS custom properties on <html> are the entire model; the Aa panel just
+ * writes them. This has to run in the head, before first paint: applying it
+ * from the body script instead would render the article at the default size and
+ * then visibly reflow it on every page load.
+ *
+ * Per-device (localStorage) rather than per-account on purpose — the size that
+ * suits a tablet on the sofa is not the size that suits a desktop monitor.
+ */
+const TYPE_SCRIPT = `
+(function () {
+  var KEY = 'earmark-type';
+  var DEFAULTS = { family: 'serif', size: 19, lead: 165, width: 46 };
+  var FAMILIES = {
+    serif: "Georgia, 'Times New Roman', serif",
+    sans: "system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif",
+    humanist: "'Iowan Old Style', 'Palatino Linotype', Palatino, 'Book Antiqua', Georgia, serif",
+    mono: "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace"
+  };
+  function clamp(v, lo, hi, dflt) {
+    v = Number(v);
+    return (isFinite(v) && v >= lo && v <= hi) ? Math.round(v) : dflt;
+  }
+  function read() {
+    var s = {};
+    try { s = JSON.parse(localStorage.getItem(KEY) || '{}') || {}; } catch (e) { s = {}; }
+    return {
+      family: FAMILIES[s.family] ? s.family : DEFAULTS.family,
+      size: clamp(s.size, 14, 30, DEFAULTS.size),
+      lead: clamp(s.lead, 130, 220, DEFAULTS.lead),
+      width: clamp(s.width, 30, 70, DEFAULTS.width)
+    };
+  }
+  function apply(s) {
+    var r = document.documentElement.style;
+    r.setProperty('--read-family', FAMILIES[s.family] || FAMILIES.serif);
+    r.setProperty('--read-size', s.size + 'px');
+    r.setProperty('--read-lead', String(s.lead / 100));
+    r.setProperty('--read-width', s.width + 'rem');
+  }
+  function save(s) {
+    try { localStorage.setItem(KEY, JSON.stringify(s)); } catch (e) {}
+    apply(s);
+  }
+  window.__type = { read: read, save: save, apply: apply, DEFAULTS: DEFAULTS };
+  apply(read());
+})();
+`;
+
 const FAVICON = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Ctext y='13' font-size='13'%3E%F0%9F%93%9A%3C/text%3E%3C/svg%3E";
 
 const CSS = `
@@ -52,6 +103,18 @@ header.site nav a { text-decoration:none; color:var(--muted); font-size:.95rem; 
 header.site nav a.active { color:var(--fg); font-weight:600; }
 header.site .who { color:var(--muted); font-size:.85rem; display:flex; align-items:center; gap:.6rem; }
 header.site .who form { margin:0; }
+/* Quick search, on every page. Sits between the nav (or the reader's own
+   controls) and the account block, and grows when you focus it. */
+header.site .hdr-search { margin:0; display:flex; flex:0 1 auto; min-width:0; }
+header.site .hdr-search input { width:min(20ch,30vw); padding:.35rem .7rem; border:1px solid var(--line); border-radius:999px; background:var(--card); color:var(--fg); font:inherit; font-size:.85rem; font-family:system-ui,sans-serif; min-width:0; }
+header.site .hdr-search input:focus { width:min(32ch,55vw); outline:2px solid var(--accent); outline-offset:1px; }
+/* On a phone the reader header runs out of room first; the article title is
+   the one thing already visible in the article itself, so it goes. */
+@media (max-width:760px) {
+  header.site { gap:.7rem; padding:.7rem .8rem; }
+  header.site .hdr-title { display:none; }
+  header.site .hdr-search input { width:min(12ch,26vw); }
+}
 /* Per-page controls standing in for the nav links (see page()). */
 header.site .hdr-ctx { display:flex; align-items:center; gap:.75rem; flex:1; min-width:0; }
 header.site .hdr-ctx .back { color:var(--muted); white-space:nowrap; }
@@ -78,8 +141,13 @@ ul.skip-rules { list-style:none; padding:0; margin:.5rem 0 0; }
 ul.skip-rules li { display:flex; gap:.6rem; align-items:center; padding:.35rem 0; border-bottom:1px solid var(--line); }
 ul.skip-rules .phrase { flex:1; min-width:0; color:var(--fg); overflow-wrap:anywhere; }
 /* "Never import this text" editor, opened from the reader */
-#skip-dialog, #reparse-dialog, #share-dialog { position:fixed; inset:0; z-index:80; background:rgba(0,0,0,.45); display:flex; align-items:center; justify-content:center; padding:1rem; }
-#skip-dialog[hidden], #reparse-dialog[hidden], #share-dialog[hidden] { display:none; }
+#skip-dialog, #reparse-dialog, #share-dialog, #type-dialog { position:fixed; inset:0; z-index:80; background:rgba(0,0,0,.45); display:flex; align-items:center; justify-content:center; padding:1rem; }
+#skip-dialog[hidden], #reparse-dialog[hidden], #share-dialog[hidden], #type-dialog[hidden] { display:none; }
+/* Reading-type controls. Rows stay finger-sized: this is mostly used on a tablet. */
+.type-row { display:flex; align-items:center; gap:.6rem; font-family:system-ui,sans-serif; font-size:.85rem; color:var(--muted); flex-wrap:wrap; }
+.type-row input[type=range] { flex:1; min-width:9rem; accent-color:var(--accent); height:1.9rem; }
+.type-row select { padding:.4rem .5rem; border:1px solid var(--line); border-radius:6px; background:var(--card); color:var(--fg); font-size:.9rem; margin-left:auto; }
+.type-row output { color:var(--fg); font-variant-numeric:tabular-nums; min-width:3.2rem; }
 .skip-box input.link { width:100%; box-sizing:border-box; padding:.5rem; border:1px solid var(--line); border-radius:6px; background:var(--card); color:var(--fg); font:.9rem/1.4 ui-monospace,SFMono-Regular,Menlo,monospace; }
 .reparse-actions { display:flex; flex-direction:column; gap:.4rem; }
 .reparse-actions .act { text-align:left; }
@@ -104,7 +172,12 @@ button.act.fav { border:none; font-size:1rem; }
 article.reader header { margin-bottom:1.6rem; border-bottom:1px solid var(--line); padding-bottom:1rem; }
 article.reader h1 { margin:.2rem 0 .4rem; line-height:1.25; }
 article.reader img { max-width:100%; height:auto; }
-article.reader .content { overflow-wrap:break-word; }
+/* Reading type. The four custom properties are the whole settings model: the
+   Aa panel writes them onto <html>, and an inline head script replays the saved
+   values before first paint so the article never visibly reflows. */
+body.reading main { max-width: var(--read-width, 46rem); }
+article.reader .content { overflow-wrap:break-word; font-family:var(--read-family, Georgia, 'Times New Roman', serif); font-size:var(--read-size, 16px); line-height:var(--read-lead, 1.6); }
+article.reader h1 { font-family:var(--read-family, Georgia, 'Times New Roman', serif); }
 article.reader .content pre { overflow-x:auto; background:var(--card); padding:.8rem; border-radius:8px; font-size:.85rem; }
 article.reader .content blockquote { border-left:3px solid var(--line); margin-left:0; padding-left:1rem; color:var(--muted); }
 mark[data-hl], mark[data-hl-id] { background:var(--mark); color:inherit; padding:0 .1em; border-radius:2px; }
@@ -124,6 +197,12 @@ mark.flash { animation: hlflash 1.6s ease; }
 .hl-count { font-size:.8rem; font-family:system-ui,sans-serif; color:var(--accent); white-space:nowrap; }
 code.token { background:var(--card); border:1px solid var(--line); border-radius:6px; padding:.25rem .5rem; font-size:.85rem; user-select:all; overflow-wrap:anywhere; }
 .reader-actions { margin-top:.6rem; }
+/* Archive/Back repeated at the end of the article, where you actually finish. */
+.end-actions { display:flex; gap:.6rem; align-items:center; flex-wrap:wrap; margin-top:3rem; padding-top:1.2rem; border-top:1px solid var(--line); font-family:system-ui,sans-serif; }
+.end-actions .act { font-size:.95rem; padding:.6rem 1.1rem; border-radius:8px; text-decoration:none; border:1px solid var(--line); color:var(--muted); background:none; cursor:pointer; }
+.end-actions .act:hover { color:var(--fg); border-color:var(--muted); }
+.end-actions button.act { color:var(--accent-fg); background:var(--accent); border-color:var(--accent); }
+.end-actions button.act:hover { color:var(--accent-fg); opacity:.9; }
 /* Public (shared) reader: a quiet strip saying where this came from. */
 .pub-note { font-family:system-ui,sans-serif; font-size:.8rem; color:var(--muted); border-top:1px solid var(--line); margin-top:2.5rem; padding-top:.8rem; }
 button.act.on { color:var(--accent); border-color:var(--accent); }
@@ -162,7 +241,20 @@ body { transition:padding-right .2s ease; }
  * of the nav links — the reader uses it for Back and Highlights. It replaces
  * rather than joins the nav so the header stays a single line on a phone.
  */
-function page({ title, body, user, active = '', nonce = '', script = '', articleCsp = false, headerExtra = '', brandLink = true, noindex = false }) {
+/** "/" focuses the header search from anywhere. Present on every signed-in page. */
+const NAV_SCRIPT = `
+document.addEventListener('keydown', (e) => {
+  if (e.key !== '/' || e.metaKey || e.ctrlKey || e.altKey) return;
+  const t = e.target;
+  if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.tagName === 'SELECT' || t.isContentEditable)) return;
+  const box = document.querySelector('.hdr-search input');
+  if (!box) return;
+  e.preventDefault(); // otherwise the "/" lands in the box
+  box.focus();
+  box.select();
+});`;
+
+function page({ title, body, user, active = '', nonce = '', script = '', articleCsp = false, headerExtra = '', brandLink = true, noindex = false, bodyClass = '', headScript = '', searchQ = '' }) {
   const nav = user ? `
     <nav>
       <a href="/" class="${active === 'inbox' ? 'active' : ''}">Inbox</a>
@@ -175,6 +267,13 @@ function page({ title, body, user, active = '', nonce = '', script = '', article
       <form method="post" action="/logout"><button class="act" type="submit">Log out</button></form>
     </div>` : '';
   const middle = user && headerExtra ? headerExtra : nav;
+  // Reachable from the reader and the highlights page too, not just the list —
+  // the point is not having to navigate somewhere before you can search.
+  const quickSearch = user ? `
+    <form class="hdr-search" method="get" action="/" role="search">
+      <input type="search" name="q" value="${escapeHtml(searchQ)}" placeholder="Search articles…" aria-label="Search articles" autocomplete="off">
+    </form>` : '';
+  const pageScript = [user ? NAV_SCRIPT : '', script].filter(Boolean).join('\n');
   return `<!doctype html>
 <html lang="en">
 <head>
@@ -184,11 +283,11 @@ function page({ title, body, user, active = '', nonce = '', script = '', article
 ${noindex ? '<meta name="robots" content="noindex, nofollow">\n' : ''}<title>${escapeHtml(title)} — Earmark</title>
 <link rel="icon" href="${FAVICON}">
 <style>${CSS}</style>
-</head>
-<body>
-<header class="site">${brandLink ? '<a class="brand" href="/">📖 Earmark</a>' : '<span class="brand">📖 Earmark</span>'}${middle}${who}</header>
+${headScript ? `<script nonce="${nonce}">${headScript}</script>\n` : ''}</head>
+<body${bodyClass ? ` class="${bodyClass}"` : ''}>
+<header class="site">${brandLink ? '<a class="brand" href="/">📖 Earmark</a>' : '<span class="brand">📖 Earmark</span>'}${middle}${quickSearch}${who}</header>
 <main>${body}</main>
-${script ? `<script nonce="${nonce}">${script}</script>` : ''}
+${pageScript ? `<script nonce="${nonce}">${pageScript}</script>` : ''}
 </body>
 </html>`;
 }
@@ -196,6 +295,12 @@ ${script ? `<script nonce="${nonce}">${script}</script>` : ''}
 function send(res, status, html, { nonce = '', headers = {} } = {}) {
   res.writeHead(status, {
     'Content-Type': 'text/html; charset=utf-8',
+    // Every page here is per-account and changes the instant you archive or
+    // favorite something. Sending no cache directive at all leaves browsers to
+    // guess at freshness, and a reload issued right after an action can then be
+    // answered from cache — the archived article stays on screen and the button
+    // looks broken. Also stops a shared cache holding one account's inbox.
+    'Cache-Control': 'no-store',
     'Content-Security-Policy':
       `default-src 'none'; img-src * data:; media-src *; style-src 'unsafe-inline'; ` +
       `script-src 'nonce-${nonce}'; connect-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'`,
@@ -252,7 +357,30 @@ function domainFilter(typed, known) {
   return hits.length ? { domains: hits } : { domain: d };
 }
 
-/** Build searchArticles filters from web form params (q/domain/hl/len). */
+/**
+ * Which articles a search is allowed to reach, by their state.
+ *
+ * 'any' is the default because a search you typed is a search of everything —
+ * an article you archived last year is exactly what you're usually digging for.
+ * The other three narrow it, which is what the inbox needed: until now a search
+ * silently spanned the archive with no way to say "only the ones I haven't
+ * dealt with yet".
+ */
+const STATES = {
+  any: { includeArchived: true },
+  inbox: { includeArchived: false },
+  archived: { archivedOnly: true },
+  favorites: { favoriteOnly: true, includeArchived: true },
+};
+const STATE_LABELS = {
+  any: 'Anywhere',
+  inbox: 'Inbox only',
+  archived: 'Archived only',
+  favorites: 'Favorites only',
+};
+const cleanState = (v) => (STATES[v] ? v : 'any');
+
+/** Build searchArticles filters from web form params (q/domain/hl/len/state). */
 function filtersFromParams(get, knownDomains = []) {
   const hl = get('hl') || (get('highlighted') === '1' ? '1' : '');
   return {
@@ -261,6 +389,9 @@ function filtersFromParams(get, knownDomains = []) {
     highlighted: hl === '1',
     minHighlights: hl && hl !== '1' ? (parseInt(hl, 10) || 0) : 0,
     ...(LEN_BUCKETS[get('len') || ''] || {}),
+    // Owns includeArchived/archivedOnly/favoriteOnly, so callers must not
+    // clamp them afterwards or the state dropdown silently does nothing.
+    ...STATES[cleanState(get('state'))],
   };
 }
 
@@ -302,11 +433,14 @@ function listPage(ctx, user, view, url) {
   const domain = get('domain').trim();
   const hl = get('hl') || (get('highlighted') === '1' ? '1' : '');
   const len = get('len');
+  const state = cleanState(get('state'));
   const sort = SORTS[get('sort')] ? get('sort') : 'newest';
   // A fresh seed whenever Random is picked without one (i.e. straight from the
   // sort dropdown); the pager then carries it so pages don't reshuffle.
   const seed = sort === 'random' ? (cleanSeed(get('seed')) || newSeed()) : '';
-  const searching = Boolean(q || domain || hl || len);
+  // Narrowing the state counts as searching on its own: "show me everything
+  // still in my inbox" is a useful query with no words in it.
+  const searching = Boolean(q || domain || hl || len || state !== 'any');
   const pageNum = Math.max(1, parseInt(get('page'), 10) || 1);
   const offset = (pageNum - 1) * PAGE_SIZE;
   const paging = { sort, seed, limit: PAGE_SIZE, offset };
@@ -328,7 +462,9 @@ function listPage(ctx, user, view, url) {
     };
     empty = 'No articles match this view.';
   } else if (searching) {
-    baseFilters = { ...filtersFromParams(get, knownDomains), includeArchived: true }; // search spans all
+    // filtersFromParams already resolved the state (defaulting to 'any', which
+    // spans the archive) — don't override it here.
+    baseFilters = filtersFromParams(get, knownDomains);
     empty = 'No articles match this search.';
   } else if (view === 'favorites') { baseFilters = { favoriteOnly: true, includeArchived: true }; empty = 'No favorites yet — star an article to keep it here.'; }
   else if (view === 'archive') { baseFilters = { archivedOnly: true }; empty = 'Nothing archived yet.'; }
@@ -368,6 +504,7 @@ function listPage(ctx, user, view, url) {
   <input type="hidden" name="domain" value="${escapeHtml(domain)}">
   <input type="hidden" name="hl" value="${escapeHtml(hl)}">
   <input type="hidden" name="len" value="${escapeHtml(len)}">
+  <input type="hidden" name="state" value="${escapeHtml(state)}">
   <input name="name" placeholder="Name this view…" required maxlength="64">
   <button class="act" type="submit">Save as view</button>
 </form>` : '';
@@ -375,7 +512,7 @@ function listPage(ctx, user, view, url) {
   const viewParam = get('view');
   // Build a URL preserving the current view/filters/sort with overrides.
   const buildQs = (overrides) => {
-    const cur = { view: viewParam, q, domain, len, hl, sort, seed, ...overrides };
+    const cur = { view: viewParam, q, domain, len, hl, state: state === 'any' ? '' : state, sort, seed, ...overrides };
     const p = new URLSearchParams();
     for (const [k, v] of Object.entries(cur)) if (v && !(k === 'sort' && v === 'newest')) p.set(k, String(v));
     const s = p.toString();
@@ -401,13 +538,16 @@ ${viewChips}
     <option value="1" ${hl === '1' ? 'selected' : ''}>has highlights</option>
     <option value="3" ${hl === '3' ? 'selected' : ''}>3+ highlights</option>
   </select>
+  <select name="state" title="Which articles to search">${Object.entries(STATE_LABELS)
+    .map(([k, label]) => `<option value="${k}" ${k === state ? 'selected' : ''}>${label}</option>`).join('')}
+  </select>
   <select name="sort">${sortOptions}</select>
   <button class="act" type="submit">Search</button>
   ${sort === 'random' ? `<a class="act" href="${buildQs({ seed: newSeed(), page: '' })}" title="Reshuffle">↻ Shuffle</a>` : ''}
   ${searching || savedView ? `<a class="back" href="${viewParam ? `/?view=${escapeHtml(viewParam)}` : '/'}">Clear</a>` : ''}
 </form>
 ${savedView ? `<div class="meta">${total.toLocaleString('en-US')} article${total === 1 ? '' : 's'} in “${escapeHtml(savedView.name)}”</div>` : ''}
-${searching && !savedView ? `<div class="meta">${total.toLocaleString('en-US')} result${total === 1 ? '' : 's'}${q ? ` for “${escapeHtml(q)}”` : ''}${domain ? ` from ${escapeHtml(domain)}` : ''}</div>${saveViewForm}` : ''}
+${searching && !savedView ? `<div class="meta">${total.toLocaleString('en-US')} result${total === 1 ? '' : 's'}${q ? ` for “${escapeHtml(q)}”` : ''}${domain ? ` from ${escapeHtml(domain)}` : ''}${state !== 'any' ? ` · ${escapeHtml(STATE_LABELS[state].toLowerCase())}` : ''}</div>${saveViewForm}` : ''}
 ${!searching && !savedView ? `<div class="meta">${total.toLocaleString('en-US')} article${total === 1 ? '' : 's'}</div>` : ''}`;
 
   const pager = pageCount > 1 ? `<div class="pager">
@@ -461,6 +601,12 @@ ${!searching && !savedView ? `<div class="meta">${total.toLocaleString('en-US')}
     : `<div class="empty">${empty}</div>`);
 
   const script = `
+// Which list this is, so a toggle knows whether the row still belongs here.
+// Saved views and searches report 'other': their membership rules are the
+// server's business, so those fall back to a reload.
+const VIEW = ${jsonForScript(savedView || searching ? 'other'
+  : (['favorites', 'archive'].includes(view) ? view : 'inbox'))};
+
 // Drop thumbnails whose og:image 404s or is hotlink-blocked, rather than
 // leaving a broken-image icon. 'error' doesn't bubble, so listen on capture.
 document.addEventListener('error', (e) => {
@@ -476,19 +622,45 @@ document.addEventListener('click', async (e) => {
     return;
   }
   const btn = e.target.closest('button[data-act]'); if (!btn) return;
-  const li = btn.closest('li[data-id]'); const id = li.dataset.id;
+  const li = btn.closest('li[data-id]'); if (!li) return;
+  const id = li.dataset.id;
   const act = btn.dataset.act;
+  const on = btn.dataset.val === 'true';
+
+  btn.disabled = true;
+  let res;
   if (act === 'delete') {
-    if (!confirm('Delete this article and its highlights?')) return;
-    await fetch('/api/articles/' + id, { method: 'DELETE' });
+    if (!confirm('Delete this article and its highlights?')) { btn.disabled = false; return; }
+    res = await fetch('/api/articles/' + id, { method: 'DELETE' });
   } else {
-    await fetch('/api/articles/' + id, {
+    res = await fetch('/api/articles/' + id, {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ [act]: btn.dataset.val === 'true' }),
+      body: JSON.stringify({ [act]: on }),
     });
   }
-  location.reload();
+  // A failed request used to fall through to reload() and look exactly like
+  // "the button does nothing" — an expired session being the likeliest cause.
+  if (!res.ok) {
+    btn.disabled = false;
+    alert(res.status === 401
+      ? 'Your session has expired — log in again, then retry.'
+      : 'That did not save (the server said ' + res.status + ').');
+    return;
+  }
+
+  // Take the row out here rather than leaning on the reload. The row is gone
+  // the moment the server agrees, so the result is visible even if the reload
+  // is slow, and there is no flash of the article still sitting in the list.
+  const gone = act === 'delete'
+    || (act === 'archive' && (VIEW === 'inbox' || VIEW === 'archive'))
+    || (act === 'favorite' && VIEW === 'favorites' && !on);
+  if (gone) {
+    li.remove();
+    if (!document.querySelector('ul.articles li')) location.reload(); // show the empty state
+    return;
+  }
+  location.reload(); // saved views and searches: let the server decide membership
 });
 
 // Bulk-archive everything older than a year.
@@ -588,11 +760,19 @@ function readerPage(ctx, user, article, url) {
       <button class="act fav" data-act="favorite" data-val="${article.favorite ? 'false' : 'true'}" title="Favorite">${article.favorite ? '★' : '☆'}</button>
       <button class="act" data-act="archive" data-val="${article.archived ? 'false' : 'true'}">${article.archived ? 'Unarchive' : 'Archive'}</button>
       <button class="act${article.shareId ? ' on' : ''}" id="share-btn" title="Public link to the parsed article — your highlights are not shown">${article.shareId ? 'Shared ✓' : 'Share'}</button>
+      <button class="act" id="type-btn" title="Text size, spacing, width and typeface">Aa</button>
       <button class="act" id="reparse-btn" title="Re-extract this article if it was parsed wrong">Fix parsing</button>
     </div>
-    <div class="meta">Select any text to highlight it.</div>
+    <div class="meta">Select text — or double-tap a word — to highlight it.</div>
   </header>
   <div class="content" id="content">${article.html}</div>
+  <!-- Finishing an article is the moment you want to file it, and that moment
+       happens at the BOTTOM. Scrolling back up to the header to archive was the
+       one thing the reader made you do twice. -->
+  <div class="end-actions">
+    <button class="act big" data-act="archive" data-val="${article.archived ? 'false' : 'true'}">${article.archived ? 'Unarchive' : 'Archive'}${article.archived ? '' : ' and go back'}</button>
+    <a class="act big" href="${escapeHtml(backTo)}">Back to the list</a>
+  </div>
 </article>
 <aside id="hl-panel" class="hl-panel" hidden>
   <div class="hl-panel-head"><strong>Highlights (${hls.length})</strong><button class="act" id="hl-close">×</button></div>
@@ -600,6 +780,33 @@ function readerPage(ctx, user, article, url) {
 </aside>
 <div id="hl-tip" hidden><button id="hl-save">Highlight</button><button id="skip-save" title="Drop this text from articles saved in future">Never import</button></div>
 <div id="hl-menu" hidden><button id="hl-menu-del">Delete highlight</button><button id="hl-menu-skip">Never import</button></div>
+<div id="type-dialog" hidden>
+  <div class="skip-box">
+    <strong>Reading type</strong>
+    <div class="meta">Applies to every article, on this device.</div>
+    <label class="type-row">Typeface
+      <select id="type-family">
+        <option value="serif">Serif (Georgia)</option>
+        <option value="sans">Sans (system)</option>
+        <option value="humanist">Humanist (Iowan, Palatino)</option>
+        <option value="mono">Monospace</option>
+      </select>
+    </label>
+    <label class="type-row">Text size <output id="type-size-out"></output>
+      <input type="range" id="type-size" min="14" max="30" step="1">
+    </label>
+    <label class="type-row">Line spacing <output id="type-lead-out"></output>
+      <input type="range" id="type-lead" min="130" max="220" step="5">
+    </label>
+    <label class="type-row">Column width <output id="type-width-out"></output>
+      <input type="range" id="type-width" min="30" max="70" step="2">
+    </label>
+    <div class="skip-actions">
+      <button class="act" id="type-reset" type="button">Reset</button>
+      <button class="act" id="type-close" type="button">Done</button>
+    </div>
+  </div>
+</div>
 <div id="share-dialog" hidden>
   <div class="skip-box">
     <strong>Public link</strong>
@@ -823,19 +1030,35 @@ document.addEventListener('click', (e) => {
 });
 document.getElementById('hl-menu-del').addEventListener('click', () => { menu.hidden = true; if (menuHlId) deleteHighlight(menuHlId); });
 
-// archive/favorite/delete-highlight buttons
+// archive/favorite/delete-highlight buttons (top of the article and the end bar)
 document.addEventListener('click', async (e) => {
   const btn = e.target.closest('button[data-act]'); if (!btn) return;
   const act = btn.dataset.act;
   if (act === 'del-hl') {
-    await fetch('/api/highlights/' + btn.dataset.id, { method: 'DELETE' });
-  } else {
-    await fetch('/api/articles/' + ARTICLE, {
-      method: 'PATCH',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ [act]: btn.dataset.val === 'true' }),
-    });
+    const r = await fetch('/api/highlights/' + btn.dataset.id, { method: 'DELETE' });
+    if (!r.ok) { alert('Could not delete that highlight.'); return; }
+    location.reload();
+    return;
   }
+  const val = btn.dataset.val === 'true';
+  btn.disabled = true;
+  const res = await fetch('/api/articles/' + ARTICLE, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ [act]: val }),
+  });
+  // Silently reloading on failure looked exactly like "the button does nothing".
+  if (!res.ok) {
+    btn.disabled = false;
+    alert(res.status === 401
+      ? 'Your session has expired — log in again, then retry.'
+      : 'That did not save (the server said ' + res.status + ').');
+    return;
+  }
+  // Archiving means "done with this", so hand back the list you came from
+  // rather than re-rendering an article you just filed away. Unarchiving stays
+  // put — you only just rescued it, and you probably want to read it.
+  if (act === 'archive' && val) { location.href = BACK_TO; return; }
   location.reload();
 });
 
@@ -849,18 +1072,99 @@ document.addEventListener('selectionchange', () => {
   tip.style.left = (window.scrollX + rect.left) + 'px';
   tip.hidden = false;
 });
-document.getElementById('hl-save').addEventListener('mousedown', async (e) => {
-  e.preventDefault(); // don't collapse the selection before we read it
-  const text = String(document.getSelection()).trim();
+/** POST one highlight and re-render. Shared by the tip button and double-tap. */
+async function saveHighlight(text) {
+  text = String(text || '').trim();
   if (!text) return;
-  await fetch('/api/articles/' + ARTICLE + '/highlights', {
+  const res = await fetch('/api/articles/' + ARTICLE + '/highlights', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ text: text.slice(0, 20000), clientId: 'web-' + Date.now() + '-' + Math.random().toString(36).slice(2) }),
   });
+  if (!res.ok) { alert('Could not save that highlight (' + res.status + ').'); return; }
   tip.hidden = true;
   location.reload();
+}
+
+// The tip has to answer touch as well as mouse. 'mousedown' alone left the
+// button dead on a tablet in the common case, because the tap collapses the
+// selection before any synthesised mouse event arrives.
+for (const evt of ['mousedown', 'touchstart']) {
+  document.getElementById('hl-save').addEventListener(evt, async (e) => {
+    e.preventDefault(); // don't collapse the selection before we read it
+    await saveHighlight(String(document.getSelection()));
+  }, { passive: false });
+}
+
+// ---- double-tap / double-click a word to highlight it outright --------------
+// Select-then-aim-at-a-small-button is fiddly on a tablet, so make one gesture
+// do the whole thing. Uses whatever the browser already selected (a double-tap
+// selects a word natively in most engines) and falls back to working the word
+// out from the tap coordinates when the selection is empty.
+const WORD_EDGE = /[\\s.,;:!?()\\[\\]{}"'“”‘’—]/;
+
+function wordRangeAt(x, y) {
+  let range = null;
+  if (document.caretRangeFromPoint) {
+    range = document.caretRangeFromPoint(x, y);              // WebKit / Blink
+  } else if (document.caretPositionFromPoint) {
+    const p = document.caretPositionFromPoint(x, y);          // Gecko
+    if (p) { range = document.createRange(); range.setStart(p.offsetNode, p.offset); range.collapse(true); }
+  }
+  if (!range) return null;
+  const node = range.startContainer;
+  if (node.nodeType !== 3 || !root.contains(node)) return null;
+  const text = node.textContent;
+  let a = range.startOffset, b = range.startOffset;
+  while (a > 0 && !WORD_EDGE.test(text[a - 1])) a--;
+  while (b < text.length && !WORD_EDGE.test(text[b])) b++;
+  if (a >= b) return null;
+  const r = document.createRange();
+  r.setStart(node, a); r.setEnd(node, b);
+  return r;
+}
+
+async function highlightAt(x, y) {
+  const sel = document.getSelection();
+  if (sel && !sel.isCollapsed && root.contains(sel.anchorNode)) {
+    await saveHighlight(String(sel));
+    return;
+  }
+  const r = wordRangeAt(x, y);
+  if (!r) return;
+  if (sel) { sel.removeAllRanges(); sel.addRange(r); }
+  await saveHighlight(String(r));
+}
+
+// Don't fire on an existing highlight — a double-tap there means "open the
+// delete menu", which the click handler above already owns.
+const onExistingMark = (x, y) => {
+  const el = document.elementFromPoint(x, y);
+  return !!(el && el.closest && el.closest('mark[data-hl-id]'));
+};
+
+root.addEventListener('dblclick', (e) => {
+  if (onExistingMark(e.clientX, e.clientY)) return;
+  highlightAt(e.clientX, e.clientY);
 });
+
+// Touch double-tap, detected by hand: iOS only fires dblclick sometimes, and
+// never when it decides the gesture was a zoom.
+let lastTapAt = 0, lastTapX = 0, lastTapY = 0;
+root.addEventListener('touchend', (e) => {
+  if (e.touches.length || !e.changedTouches.length) return;
+  const t = e.changedTouches[0];
+  const now = Date.now();
+  const near = Math.abs(t.clientX - lastTapX) < 30 && Math.abs(t.clientY - lastTapY) < 30;
+  if (now - lastTapAt < 400 && near) {
+    lastTapAt = 0;
+    if (onExistingMark(t.clientX, t.clientY)) return;
+    e.preventDefault(); // suppress the follow-up synthetic click / zoom
+    highlightAt(t.clientX, t.clientY);
+    return;
+  }
+  lastTapAt = now; lastTapX = t.clientX; lastTapY = t.clientY;
+}, { passive: false });
 
 // "Never import": open the phrase in an editable box, prefilled with whatever
 // text you pointed at, so you can trim it down to the bit that actually
@@ -896,6 +1200,54 @@ dlgText.addEventListener('input', refreshSkipDialog);
 document.getElementById('skip-cancel').addEventListener('click', closeSkipDialog);
 dlg.addEventListener('click', (e) => { if (e.target === dlg) closeSkipDialog(); });
 document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && !dlg.hidden) closeSkipDialog(); });
+
+// ---- "Aa": text size, spacing, column width, typeface ----------------------
+// Every control writes through on 'input', so the article reflows under your
+// finger and you can judge the result against the actual text rather than a
+// preview. window.__type is defined by the head script.
+const typeDlg = document.getElementById('type-dialog');
+const typeCtl = {
+  family: document.getElementById('type-family'),
+  size: document.getElementById('type-size'),
+  lead: document.getElementById('type-lead'),
+  width: document.getElementById('type-width'),
+};
+const typeOut = {
+  size: document.getElementById('type-size-out'),
+  lead: document.getElementById('type-lead-out'),
+  width: document.getElementById('type-width-out'),
+};
+function typeFill(s) {
+  typeCtl.family.value = s.family;
+  typeCtl.size.value = s.size;
+  typeCtl.lead.value = s.lead;
+  typeCtl.width.value = s.width;
+  typeOut.size.textContent = s.size + 'px';
+  typeOut.lead.textContent = (s.lead / 100).toFixed(2);
+  typeOut.width.textContent = s.width + 'rem';
+}
+const typeCurrent = () => ({
+  family: typeCtl.family.value,
+  size: Number(typeCtl.size.value),
+  lead: Number(typeCtl.lead.value),
+  width: Number(typeCtl.width.value),
+});
+const closeType = () => { typeDlg.hidden = true; };
+document.getElementById('type-btn').addEventListener('click', () => {
+  typeFill(window.__type.read());
+  typeDlg.hidden = false;
+});
+for (const el of [typeCtl.family, typeCtl.size, typeCtl.lead, typeCtl.width]) {
+  el.addEventListener('input', () => { const s = typeCurrent(); typeFill(s); window.__type.save(s); });
+}
+document.getElementById('type-reset').addEventListener('click', () => {
+  const d = window.__type.DEFAULTS;
+  typeFill(d);
+  window.__type.save(d);
+});
+document.getElementById('type-close').addEventListener('click', closeType);
+typeDlg.addEventListener('click', (e) => { if (e.target === typeDlg) closeType(); });
+document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && !typeDlg.hidden) closeType(); });
 
 // ---- "Share": mint (or reuse) a public link to the parsed article -----------
 // POST is idempotent server-side, so reopening the dialog shows the same link
@@ -1028,7 +1380,9 @@ dlgOk.addEventListener('click', async () => {
     : 'Added.';
   setTimeout(closeSkipDialog, data.existingMatches ? 2200 : 800);
 });`;
-  return { body, script, headerExtra };
+  // bodyClass drives the reader-only column width; headScript replays the saved
+  // type settings before first paint so the article doesn't reflow on load.
+  return { body, script, headerExtra, bodyClass: 'reading', headScript: TYPE_SCRIPT };
 }
 
 function highlightsPage(ctx, user, url) {
@@ -1386,6 +1740,10 @@ async function handle(ctx, req, res, url) {
   }
   return send(res, 200, page({
     title, body: made.body, user, active, nonce, script: made.script, headerExtra: made.headerExtra || '',
+    bodyClass: made.bodyClass || '', headScript: made.headScript || '',
+    // Only the article list: /highlights has its own q meaning something else,
+    // and echoing that into an article-search box would be a lie.
+    searchQ: route === 'GET /' ? (url.searchParams.get('q') || '') : '',
   }), { nonce });
 }
 

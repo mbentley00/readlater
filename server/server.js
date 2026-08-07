@@ -1374,6 +1374,10 @@ const server = http.createServer(async (req, res) => {
           maxWords: Number.isInteger(f.maxWords) && f.maxWords > 0 ? f.maxWords : 0,
           minHighlights: Number.isInteger(f.minHighlights) && f.minHighlights > 0 ? f.minHighlights : 0,
           includeArchived: f.includeArchived === true,
+          // Article state, so a view can pin itself to the inbox / the archive /
+          // favorites the same way the web search's state filter does.
+          archivedOnly: f.archivedOnly === true,
+          favoriteOnly: f.favoriteOnly === true,
         };
         const v = { id: newId(), userId: user.id, name: name.trim(), filters, createdAt: Date.now() };
         store.insertView(v);

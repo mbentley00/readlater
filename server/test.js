@@ -406,6 +406,107 @@ async function main() {
     await api('DELETE', `/api/articles/${articleId}/share`); // leave it unshared for later assertions
     assert.ok(shareId2, 'second slug was issued');
 
+    // ---- archiving from the web UI ----------------------------------------
+    // The list's Archive button PATCHes then re-renders. With no cache
+    // directive the browser was free to answer that reload from cache, leaving
+    // the archived article on screen — indistinguishable from a dead button.
+    res = await fetch(BASE + '/', { headers: { Cookie: aliceCookie } });
+    assert.strictEqual(res.headers.get('cache-control'), 'no-store',
+      'per-account pages must not be cached');
+    html = await res.text();
+    assert.ok(html.includes('const VIEW = "inbox"'), 'list tells its script which view it is');
+    assert.ok(html.includes('if (!res.ok)'), 'list surfaces a failed archive instead of reloading over it');
+
+    res = await fetch(BASE + `/read/${articleId}?from=%2F`, { headers: { Cookie: aliceCookie } });
+    html = await res.text();
+    assert.strictEqual((html.match(/data-act="archive"/g) || []).length, 2,
+      'reader offers Archive at the top and at the end of the article');
+    assert.ok(html.includes('end-actions'), 'reader has an end-of-article action bar');
+    assert.ok(html.includes('location.href = BACK_TO'), 'archiving returns to the list you came from');
+
+    // reading-type controls, applied before first paint
+    assert.ok(html.includes('id="type-btn"'), 'reader has the Aa button');
+    assert.ok(html.includes('id="type-dialog"'), 'reader has the type panel');
+    assert.ok(/<body class="reading">/.test(html), 'reader body carries the reading class');
+    for (const ctl of ['type-family', 'type-size', 'type-lead', 'type-width']) {
+      assert.ok(html.includes(`id="${ctl}"`), `type panel has ${ctl}`);
+    }
+    assert.ok(html.indexOf('window.__type') < html.indexOf('<body'),
+      'type settings are applied in <head>, before the article paints');
+    assert.ok(html.includes('wordRangeAt') && html.includes("addEventListener('touchend'"),
+      'double-tap-to-highlight is wired up');
+
+    // the public page gets none of it: no scripts, no controls, still no-store
+    r = await api('POST', `/api/articles/${articleId}/share`);
+    const uiShare = r.body.shareId;
+    res = await fetch(BASE + `/p/${uiShare}`);
+    assert.strictEqual(res.headers.get('cache-control'), 'no-store',
+      'revoking a share must not be defeated by a cached copy');
+    html = await res.text();
+    assert.ok(!html.includes('<script'), 'public page runs no script at all');
+    assert.ok(!html.includes('data-act='), 'public page has no article actions');
+    assert.ok(!html.includes('<div class="end-actions">'), 'public page has no archive bar');
+    await api('DELETE', `/api/articles/${articleId}/share`);
+
+    // ---- search: article-state filter + header quick search ----------------
+    // Three articles matching one word, in three different states.
+    const mkState = async (slug, title) => (await api('POST', '/api/articles', {
+      url: `https://example.com/${slug}`, title, html: '<p>A kestrel hovers over the verge.</p>',
+    })).body.id;
+    const kInbox = await mkState('kestrel-1', 'Kestrel Inbox');
+    const kArch = await mkState('kestrel-2', 'Kestrel Archived');
+    const kFav = await mkState('kestrel-3', 'Kestrel Favorite');
+    await api('PATCH', `/api/articles/${kArch}`, { archived: true });
+    await api('PATCH', `/api/articles/${kFav}`, { favorite: true });
+
+    const kHits = async (qs) => {
+      const page = await fetch(BASE + qs, { headers: { Cookie: aliceCookie } });
+      const h = await page.text();
+      return ['Kestrel Inbox', 'Kestrel Archived', 'Kestrel Favorite'].filter((t) => h.includes('>' + t + '<'));
+    };
+    // Default stays "anywhere": a search you typed should reach the archive.
+    assert.deepStrictEqual((await kHits('/?q=kestrel')).sort(),
+      ['Kestrel Archived', 'Kestrel Favorite', 'Kestrel Inbox'], 'search spans every state by default');
+    assert.deepStrictEqual((await kHits('/?q=kestrel&state=inbox')).sort(),
+      ['Kestrel Favorite', 'Kestrel Inbox'], 'inbox-only drops the archived one');
+    assert.deepStrictEqual(await kHits('/?q=kestrel&state=archived'),
+      ['Kestrel Archived'], 'archived-only keeps just the archived one');
+    assert.deepStrictEqual(await kHits('/?q=kestrel&state=favorites'),
+      ['Kestrel Favorite'], 'favorites-only keeps just the starred one');
+    // A state on its own is a query — no words needed.
+    assert.deepStrictEqual(await kHits('/?state=archived'),
+      ['Kestrel Archived'], 'state alone filters the list');
+    assert.deepStrictEqual(await kHits('/?q=kestrel&state=nonsense').then((r) => r.sort()),
+      ['Kestrel Archived', 'Kestrel Favorite', 'Kestrel Inbox'], 'an unknown state falls back to anywhere');
+
+    res = await fetch(BASE + '/?q=kestrel&state=inbox', { headers: { Cookie: aliceCookie } });
+    html = await res.text();
+    assert.ok(html.includes('<select name="state"'), 'state dropdown is on the search form');
+    assert.ok(html.includes('value="inbox" selected'), 'the chosen state stays chosen');
+    assert.ok(html.includes('· inbox only'), 'the result count says the search was narrowed');
+    assert.ok(html.includes('name="state" value="inbox"'), 'save-as-view carries the state');
+    // Links built by buildQs (pager, shuffle) must keep the state, and drop it when 'any'.
+    res = await fetch(BASE + '/?q=kestrel&state=inbox&sort=random', { headers: { Cookie: aliceCookie } });
+    assert.ok((await res.text()).includes('state=inbox&sort=random'), 'pager/shuffle links keep the state');
+    res = await fetch(BASE + '/?q=kestrel&sort=random', { headers: { Cookie: aliceCookie } });
+    assert.ok(!(await res.text()).includes('state='), "the default state isn't dragged through URLs");
+
+    // The quick-search box rides in the header on every signed-in page.
+    for (const p of ['/', '/highlights', '/settings', `/read/${kInbox}`]) {
+      res = await fetch(BASE + p, { headers: { Cookie: aliceCookie } });
+      assert.ok((await res.text()).includes('<form class="hdr-search"'), `header search present on ${p}`);
+    }
+    res = await fetch(BASE + '/login');
+    assert.ok(!(await res.text()).includes('<form class="hdr-search"'), 'no header search when logged out');
+    res = await fetch(BASE + '/?q=kestrel', { headers: { Cookie: aliceCookie } });
+    assert.ok(/class="hdr-search"[\s\S]{0,240}value="kestrel"/.test(await res.text()),
+      'header box shows the current article search');
+    res = await fetch(BASE + '/highlights?q=kestrel', { headers: { Cookie: aliceCookie } });
+    assert.ok(!/class="hdr-search"[\s\S]{0,240}value="kestrel"/.test(await res.text()),
+      "the highlights page's own q is not echoed into the article-search box");
+
+    for (const id of [kInbox, kArch, kFav]) await api('DELETE', `/api/articles/${id}`);
+
     // ---- reader script can't be closed early by article data ---------------
     // JSON.stringify leaves '<' alone, so a value containing "</script>" used to
     // end the inline script tag and take the whole reader's JS with it. Hostile
@@ -419,7 +520,11 @@ async function main() {
     await api('POST', `/api/articles/${breakoutId}/highlights`, { text: 'quote with </script> inside' });
     res = await fetch(BASE + `/read/${breakoutId}`, { headers: { Cookie: aliceCookie } });
     html = await res.text();
-    assert.strictEqual(html.split('</script>').length - 1, 1,
+    // Every closing tag must be matched by one the server opened; an extra one
+    // means article data escaped into the markup.
+    assert.strictEqual(
+      (html.match(/<\/script>/g) || []).length,
+      (html.match(/<script\b/g) || []).length,
       'article data cannot close the reader\'s script tag early');
     assert.ok(html.includes('\\u003c/script>'), 'the dangerous sequence is escaped, not dropped');
     await api('DELETE', `/api/articles/${breakoutId}`);
