@@ -229,6 +229,18 @@ fun ReaderScreen(articleId: String, onBack: () -> Unit, onOpenArticle: (String) 
     // the article for real starts a fresh saveable scope, so it still gets asked.
     var didInitialScroll by rememberSaveable { mutableStateOf(false) }
 
+    // The listening position as this Activity last saw it, saved beside the
+    // scroll offset. Both are restored together after the system reclaims the
+    // app, which is what lets the restore below tell "we were away for a moment
+    // and nothing moved" apart from "listening ran on for half the article while
+    // the app was gone" — the case where the restored offset is badly stale.
+    var lastSeenTts by rememberSaveable { mutableStateOf(-1) }
+    // Captured during composition, before the effect below can overwrite it with
+    // the now-current position (effects run only after composition).
+    val ttsWhenLastHere = remember { lastSeenTts }
+    val liveTts = if (isTtsThisArticle) ttsState.paragraphIndex else article?.ttsParagraph ?: -1
+    LaunchedEffect(liveTts) { if (liveTts >= 0) lastSeenTts = liveTts }
+
     // Bodies of archived articles aren't synced eagerly — fetch on open.
     LaunchedEffect(article?.id, article?.html == null) {
         val a = article
@@ -262,17 +274,32 @@ fun ReaderScreen(articleId: String, onBack: () -> Unit, onOpenArticle: (String) 
     // scroll position and the listening (TTS) position have meaningfully
     // diverged, ask which one to resume instead of guessing.
     var resumeChoice by remember { mutableStateOf<Pair<Int, Int>?>(null) } // (read, tts)
+    // Plain remember, so it resets for each Activity instance: a recreated
+    // Activity has to make this decision again, even though didInitialScroll
+    // survived with it.
+    var positionSettled by remember { mutableStateOf(false) }
     LaunchedEffect(blocks) {
-        if (!didInitialScroll && blocks.isNotEmpty()) {
-            val read = (article?.readParagraph ?: 0).coerceIn(0, blocks.size - 1)
-            val tts = (article?.ttsParagraph ?: 0).coerceIn(0, blocks.size - 1)
+        if (positionSettled || blocks.isEmpty()) return@LaunchedEffect
+        val read = (article?.readParagraph ?: 0).coerceIn(0, blocks.size - 1)
+        val tts = (article?.ttsParagraph ?: 0).coerceIn(0, blocks.size - 1)
+
+        // Listening carried on after this Activity was torn down — the system
+        // reclaimed the app mid-listen and handed back a scroll offset frozen at
+        // whatever was on screen when we left. Reopening there silently loses
+        // however far playback got, so make the open-time decision over again.
+        // Not when playback is still running and the view is following it: that
+        // path scrolls itself to the spoken paragraph a moment later.
+        val listeningRanOn = didInitialScroll && ttsWhenLastHere >= 0 && tts != ttsWhenLastHere &&
+            !(isTtsThisArticle && ttsState.isPlaying && followTts)
+
+        if (!didInitialScroll || listeningRanOn) {
             // Ask whenever the two positions have really diverged. This used to
             // also skip the question whenever TTS happened to be playing this
             // article, which was too blunt: opening an article that is playing,
             // to read ahead of where it has spoken, is exactly when the positions
             // differ and the choice matters most — and it silently jumped you to
-            // the spoken paragraph instead. Coming back to the app is handled by
-            // didInitialScroll surviving above, so erring toward asking is safe.
+            // the spoken paragraph instead. A plain trip to another app and back
+            // moves neither position, so it still goes unasked.
             if (read > 0 && tts > 0 && kotlin.math.abs(read - tts) > 2) {
                 listState.scrollToBlock(minOf(read, tts))
                 resumeChoice = read to tts
@@ -281,6 +308,7 @@ fun ReaderScreen(articleId: String, onBack: () -> Unit, onOpenArticle: (String) 
             }
             didInitialScroll = true
         }
+        positionSettled = true
     }
 
     // Follow the paragraph currently being spoken (unless the user scrolled away).
