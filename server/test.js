@@ -1188,6 +1188,84 @@ function testEconomistEndMark() {
 }
 
 /**
+ * New Yorker cartoons interrupt a piece with a drawing, a caption and a
+ * "Cartoon by" credit. All three go — but the paragraph of real article prose
+ * before the cartoon must survive, which is the whole difficulty of the rule.
+ */
+function testNewYorkerCartoons() {
+  const { applyNewYorkerCartoons, isNewYorker } = require('./skip');
+  const NY = 'https://www.newyorker.com/magazine/2026/07/20/x';
+  const run = (html) => applyNewYorkerCartoons(NY, { html, textContent: 'x' });
+
+  assert.ok(isNewYorker('https://www.newyorker.com/magazine/2026/07/20/x'), 'matches newyorker.com');
+  assert.ok(isNewYorker('https://newyorker.com/x'), 'matches bare newyorker.com');
+  assert.ok(!isNewYorker('https://newyorker.com.evil.example/x'), 'does not match a lookalike domain');
+  assert.ok(!isNewYorker('https://www.wired.com/x'), 'does not match a sibling Condé Nast title');
+
+  // The common shape: the whole insert is one figure, caption and credit inside.
+  const fig = run('<p>Before the cartoon.</p>'
+    + '<figure><a href="x"></a>“It’s almost like they’re posing.”Cartoon by Michael Maslin</figure>'
+    + '<p>After the cartoon.</p>');
+  assert.strictEqual(fig.cartoons, 1, 'figure-wrapped insert is one cartoon');
+  assert.ok(/Before the cartoon/.test(fig.html) && /After the cartoon/.test(fig.html), 'prose either side kept');
+  assert.ok(!/posing|Michael Maslin/.test(fig.html), 'caption and credit both gone');
+
+  // Caption and credit as separate paragraphs inside the figure (the shape the
+  // reader renders as two stacked lines under the drawing).
+  const split = run('<figure><p><span><img src="a.jpg"/></span></p>'
+    + '<p>“The things I do so you people feel less alone.”</p>'
+    + '<p><span>Cartoon by Farley Katz</span></p></figure><p>Real prose.</p>');
+  assert.ok(!/feel less alone|Farley Katz/.test(split.html), 'both lines gone from a split figure');
+  assert.ok(/Real prose/.test(split.html), 'article prose kept');
+
+  // Flattened extraction: image, caption and credit as bare siblings.
+  const flat = run('<p>The President’s public schedule went out at nine.</p><img src="a.jpg"/>'
+    + '<p>“The things I do so you people feel less alone.”</p>'
+    + '<p>Cartoon by Farley Katz</p><p>Rubenstein scoffed at the surprise.</p>');
+  assert.strictEqual(flat.cartoons, 1, 'flattened insert still recognized');
+  assert.ok(!/feel less alone|Farley Katz/.test(flat.html), 'bare caption and credit gone');
+  assert.ok(/public schedule/.test(flat.html) && /Rubenstein scoffed/.test(flat.html), 'prose either side kept');
+
+  // The trap, taken from a real article: short QUOTED prose immediately before a
+  // cartoon. The drawing sits between it and the credit, which is what proves
+  // the paragraph belongs to the article rather than to the cartoon.
+  const trap = run('<p>“ ‘Perfect’ was my wedding song,” a young woman said.</p>'
+    + '<figure><picture><img src="a.jpg"/></picture></figure><p>Cartoon by Justin Sheen</p>');
+  assert.ok(!/Justin Sheen/.test(trap.html), 'bare credit removed');
+  assert.ok(/wedding song/.test(trap.html), 'quoted prose before the drawing is NOT taken as a caption');
+
+  // Caption and credit run together in a single paragraph.
+  const inline = run('<figure><picture><img src="a.jpg"/></picture></figure>'
+    + '<p>“Sir, did you order the special meal?” Cartoon by Peter Kuper</p><p>Then the jury spoke.</p>');
+  assert.ok(!/special meal|Peter Kuper/.test(inline.html), 'inline caption+credit block removed whole');
+  assert.ok(/Then the jury spoke/.test(inline.html), 'following prose kept');
+
+  // Guardrails: prose that merely mentions a cartoon, and prose inside a figure.
+  const mention = '<p>In 1998 a cartoon by Roz Chast ran in these pages, and readers wrote for months.</p>';
+  assert.strictEqual(run(mention).cartoons, 0, 'lowercase mention in prose is not a credit');
+  assert.ok(/Roz Chast/.test(run(mention).html), 'that paragraph is untouched');
+  const prosy = run('<figure><figcaption>A long stretch of genuine editorial prose discussing the '
+    + 'history of the form at length, far past any caption a cartoon would carry, noting a Cartoon by Someone.'
+    + '</figcaption></figure>');
+  assert.strictEqual(prosy.cartoons, 0, 'a figure carrying real prose is left alone');
+
+  // A cartoon gallery leaves no empty list shell behind.
+  const gallery = run('<p>Prose.</p><ul>'
+    + '<li><figure><img src="a.jpg"/><figcaption>Cartoon by Edward Koren</figcaption></figure></li>'
+    + '<li><figure><img src="b.jpg"/><figcaption>Cartoon by Edward Koren</figcaption></figure></li></ul>');
+  assert.strictEqual(gallery.cartoons, 2, 'each gallery entry counts');
+  assert.ok(!/<ul>|<li>/.test(gallery.html), 'the emptied list shell is cleaned up');
+
+  // Other publishers and articles without cartoons are never rewritten.
+  const wired = applyNewYorkerCartoons('https://www.wired.com/x',
+    { html: '<figure>“C.”Cartoon by X Y</figure>', textContent: 'x' });
+  assert.strictEqual(wired.cartoons, 0, 'other publishers untouched');
+  assert.strictEqual(run('<p>An article with no cartoons at all in it.</p>').cartoons, 0, 'no credit, no change');
+
+  console.log('  New Yorker cartoon inserts ✔');
+}
+
+/**
  * Condé Nast (New Yorker, Wired, …) split a body into sibling
  * `div.body__inner-container` chunks; Readability keeps only the top-scoring
  * one, dropping later chunks and the ♦ end mark. mergeChunkedBody hoists them
@@ -1241,6 +1319,7 @@ function testChunkedBodyMerge() {
 
 testEmailNormalization();
 testEconomistEndMark();
+testNewYorkerCartoons();
 testChunkedBodyMerge();
 testReparseEngine().catch((e) => { console.error(e); process.exit(1); });
 checkDockerfileCopiesEveryModule();

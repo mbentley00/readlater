@@ -244,11 +244,10 @@ function withSkipRules(userId, fields, url) {
   // phrase rules run over what's left.
   let input = fields;
   if (url) {
-    const { truncated, ...cut } = skip.applyDomainRules(url, input);
-    if (truncated) {
-      console.log(`domain rule: truncated ${url} at its end-of-article mark`);
-      input = cut;
-    }
+    const { truncated, cartoons, ...cut } = skip.applyDomainRules(url, input);
+    if (truncated) console.log(`domain rule: truncated ${url} at its end-of-article mark`);
+    if (cartoons) console.log(`domain rule: removed ${cartoons} cartoon insert(s) from ${url}`);
+    if (truncated || cartoons) input = cut;
   }
   const rules = store.listSkipRules(userId);
   if (!rules.length) return input;

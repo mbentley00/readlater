@@ -120,6 +120,145 @@ const isEconomist = (url) => {
   return h === 'economist.com' || h.endsWith('.economist.com');
 };
 
+const isNewYorker = (url) => {
+  const h = hostOf(url);
+  return h === 'newyorker.com' || h.endsWith('.newyorker.com');
+};
+
+/**
+ * A cartoon's artist credit. Capital C is deliberate: the credit is always
+ * typeset "Cartoon by <artist>", so matching case-sensitively means the phrase
+ * as it appears in prose ("a cartoon by Roz Chast ran in 1998") is not a match
+ * at all, rather than something the guards below have to talk back down.
+ */
+const CARTOON_CREDIT = /Cartoons? by \S/;
+
+/** Longest "Cartoon by <artist>" tail. Long enough for any byline, short enough to exclude prose. */
+const CARTOON_CREDIT_MAX = 120;
+
+/** Longest cartoon caption. The longest in a 194-cartoon sample ran 133 characters. */
+const CARTOON_CAPTION_MAX = 300;
+
+/**
+ * A caption is a complete quotation — the whole line sits inside quote marks.
+ * This is what separates a cartoon's caption from body copy that merely opens
+ * with a quote: real prose closes the quote and keeps going ("'Perfect' was my
+ * wedding song," a young woman said), so it fails the closing-quote test.
+ */
+const isCartoonCaption = (text) =>
+  text.length > 0 && text.length <= CARTOON_CAPTION_MAX &&
+  /^[“"]/.test(text) && /[”"]$/.test(text);
+
+/** Split a block's text at its cartoon credit. Returns null when there is none. */
+function splitAtCredit(text) {
+  const m = CARTOON_CREDIT.exec(text);
+  if (!m) return null;
+  return { before: norm(text.slice(0, m.index)), credit: norm(text.slice(m.index)) };
+}
+
+/**
+ * Strip The New Yorker's mid-article cartoon inserts.
+ *
+ * A cartoon lands in the middle of a piece as a drawing, usually a caption line,
+ * then a "Cartoon by <artist>" credit. Read as prose — or worse, spoken by TTS —
+ * the caption and credit arrive mid-argument as though they were the article.
+ *
+ * Nearly always the whole insert is a single <figure> (the caption and credit
+ * being its figcaptions or nested paragraphs), so removing that figure takes the
+ * drawing, caption and credit together and structurally cannot touch body copy:
+ * article prose is never inside a cartoon figure. A flattened extraction
+ * occasionally leaves the credit as a bare sibling paragraph instead, which is
+ * handled second and far more warily — there the block before the credit is as
+ * likely to be the last paragraph of real article content as it is a caption.
+ *
+ * Returns fields unchanged, and cartoons: 0, for any other publisher or an
+ * article with no credit in it.
+ */
+function applyNewYorkerCartoons(url, fields) {
+  const html = fields.html || '';
+  if (!html || !isNewYorker(url) || !CARTOON_CREDIT.test(html)) {
+    return { ...fields, cartoons: 0 };
+  }
+
+  let root;
+  try {
+    const { document } = parseHTML('<!doctype html><html><body></body></html>');
+    root = document.createElement('div');
+    document.body.appendChild(root);
+    root.innerHTML = html;
+  } catch {
+    return { ...fields, cartoons: 0 }; // never lose the article over a rule
+  }
+
+  let cartoons = 0;
+
+  // 1. The whole insert as one figure — the overwhelmingly common shape.
+  for (const fig of [...root.querySelectorAll('figure')]) {
+    if (!fig.isConnected) continue; // nested figure already removed with its parent
+    const split = splitAtCredit(norm(fig.textContent));
+    if (!split) continue;
+    // Everything in the figure must be accounted for as caption + credit. A
+    // figure carrying real prose is not a cartoon insert, whatever it credits.
+    if (split.credit.length > CARTOON_CREDIT_MAX) continue;
+    if (split.before && !isCartoonCaption(split.before)) continue;
+    fig.remove();
+    cartoons++;
+  }
+
+  // A gallery lists one cartoon per <li>; emptying the figures leaves the shell.
+  if (cartoons) {
+    for (const li of [...root.querySelectorAll('li')]) {
+      if (!norm(li.textContent) && !li.querySelector('img, picture, iframe')) li.remove();
+    }
+    for (const list of [...root.querySelectorAll('ul, ol')]) {
+      if (!list.children.length) list.remove();
+    }
+  }
+
+  // 2. The credit flattened into a bare paragraph, outside any figure.
+  const blocks = [...root.querySelectorAll(BLOCK_SELECTOR)];
+  const order = [...root.querySelectorAll('*')];
+  const posOf = new Map(order.map((el, i) => [el, i]));
+  /** Does a drawing sit between these two blocks? Then `a` is not `b`'s caption. */
+  const imageBetween = (a, b) => order
+    .slice(posOf.get(a) + 1, posOf.get(b))
+    .some((el) => !a.contains(el) && /^(img|picture|figure|svg)$/i.test(el.tagName));
+
+  for (let i = 0; i < blocks.length; i++) {
+    const el = blocks[i];
+    if (!el.isConnected || el.closest('figure')) continue;
+    const split = splitAtCredit(norm(el.textContent));
+    if (!split) continue;
+    if (split.credit.length > CARTOON_CREDIT_MAX) continue;
+    // Text ahead of the credit in the same block is the caption run together
+    // with it. Anything else is prose that merely mentions a cartoon — leave it.
+    if (split.before && !isCartoonCaption(split.before)) continue;
+
+    // The caption, when it is its own block, is the block just before — but only
+    // when nothing was drawn in between. The cartoon's caption sits below its
+    // drawing, so an intervening image proves the earlier block belongs to the
+    // article, not the cartoon. That single check is what keeps the last
+    // paragraph before a cartoon from being swallowed with it.
+    const prev = i > 0 ? blocks[i - 1] : null;
+    if (prev && prev.isConnected && !prev.contains(el) && !prev.closest('figure') &&
+        isCartoonCaption(norm(prev.textContent)) && !imageBetween(prev, el)) {
+      prev.remove();
+    }
+    el.remove();
+    cartoons++;
+  }
+
+  if (!cartoons) return { ...fields, cartoons: 0 };
+
+  const textContent = norm(root.textContent) || fields.textContent;
+  return {
+    ...fields,
+    html: root.innerHTML,
+    textContent: typeof fields.textContent === 'string' ? textContent : fields.textContent,
+    cartoons,
+  };
+}
+
 /**
  * Truncate an Economist article at its end-of-article mark.
  *
@@ -136,7 +275,7 @@ const isEconomist = (url) => {
  * Returns fields unchanged when the article isn't the Economist's or has no
  * marker — a missing square must never truncate an article to nothing.
  */
-function applyDomainRules(url, fields) {
+function applyEconomistEndMark(url, fields) {
   const html = fields.html || '';
   if (!html || !isEconomist(url) || !html.includes(ECONOMIST_END_MARK)) {
     return { ...fields, truncated: false };
@@ -180,7 +319,19 @@ function applyDomainRules(url, fields) {
   };
 }
 
+/**
+ * Run every built-in publisher rule over an article. Each rule recognizes its
+ * own domain and returns the fields untouched otherwise, so they simply chain.
+ *
+ * @returns fields plus {truncated: bool, cartoons: int} describing what fired.
+ */
+function applyDomainRules(url, fields) {
+  return applyNewYorkerCartoons(url, applyEconomistEndMark(url, fields));
+}
+
 module.exports = {
-  applySkipRules, phraseError, applyDomainRules, isEconomist,
+  applySkipRules, phraseError, applyDomainRules,
+  applyEconomistEndMark, applyNewYorkerCartoons, isEconomist, isNewYorker,
   MAX_BLOCK_CHARS, MIN_PHRASE_CHARS, BLOCK_SELECTOR, ECONOMIST_END_MARK,
+  CARTOON_CREDIT, CARTOON_CAPTION_MAX, CARTOON_CREDIT_MAX,
 };
