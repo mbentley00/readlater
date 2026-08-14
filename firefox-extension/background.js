@@ -30,7 +30,15 @@ const MAX_WAIT_MS = 12000; // ...but never sit on a summary longer than this
 // Toolbar badge timings. The outcome badge ('✓' / '!') has to outlast a glance
 // away from the screen, so it holds well past the save itself.
 const BADGE_HOLD_MS = 5000;   // how long '✓' / '!' stay on the icon
-const BADGE_STUCK_MS = 60000; // safety net: never pin '…' to the icon forever
+const BADGE_STUCK_MS = 75000; // safety net: never pin '…' to the icon forever
+
+// A hung server is worse than a dead one: fetch() with no signal never settles,
+// so the catch blocks below never run and the save fails *silently*. (A server
+// that is genuinely down rejects at once and does report an error.) Generous,
+// because /api/save-url has the server fetch and parse the page itself — its
+// own outbound fetch already allows 25s. BADGE_STUCK_MS outlasts this so the
+// timeout, not the badge net, is what normally ends a stuck save.
+const SAVE_TIMEOUT_MS = 60000;
 
 // notificationId -> URL to open when the user clicks the notification.
 const notifUrls = new Map();
@@ -141,18 +149,67 @@ browser.notifications.onClicked.addListener((id) => {
  * of the '✓' that replaced it — so a save taking ~2s flashed the checkmark for
  * a few hundred ms, and one taking 2.5s never showed it at all. Only terminal
  * states auto-clear; '…' holds until the outcome replaces it.
+ *
+ * [expireTo] is what the hold timer leaves behind. '…' expires to '!' rather
+ * than to a blank icon: a save that silently stops showing progress reads as
+ * "nothing happened", which is exactly how a hung server used to look.
  */
+const BADGE_ERR = '#b3261e';
+
 function badgeFor(tabId) {
   let badgeTimer = null;
-  return (text, color, holdMs) => {
+  const paint = (text, color) => {
     const a = browser.browserAction || browser.action;
     if (!a) return;
-    if (badgeTimer !== null) { clearTimeout(badgeTimer); badgeTimer = null; }
     try { a.setBadgeBackgroundColor({ color: color || '#3d6b52', tabId }); } catch (e) {}
     try { a.setBadgeText({ text, tabId }); } catch (e) {}
-    if (!text || !holdMs) return;
-    badgeTimer = setTimeout(() => { try { a.setBadgeText({ text: '', tabId }); } catch (e) {} }, holdMs);
   };
+  return (text, color, holdMs, expireTo) => {
+    if (badgeTimer !== null) { clearTimeout(badgeTimer); badgeTimer = null; }
+    paint(text, color);
+    if (!text || !holdMs) return;
+    badgeTimer = setTimeout(() => {
+      badgeTimer = null;
+      if (!expireTo) return paint('', null);
+      // Expired into an outcome — let that outcome have its own hold, then go.
+      paint(expireTo, BADGE_ERR);
+      badgeTimer = setTimeout(() => { badgeTimer = null; paint('', null); }, BADGE_HOLD_MS);
+    }, holdMs);
+  };
+}
+
+/**
+ * POST JSON and return the parsed reply, or throw with a message fit to show.
+ *
+ * Every save goes through here so none of them can hang forever. The timeout
+ * case is called out by name: "no reply" and "refused the save" send you to
+ * very different places, and only the first one means the article is still
+ * sitting unsaved in a tab you can retry from.
+ */
+async function postJson(path, payload) {
+  const { serverUrl, token } = await getSettings();
+  let res;
+  try {
+    res = await fetch(`${serverUrl}${path}`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify(payload),
+      signal: AbortSignal.timeout(SAVE_TIMEOUT_MS),
+    });
+  } catch (e) {
+    if (e && e.name === 'TimeoutError') {
+      throw new Error(`no reply from the server in ${Math.round(SAVE_TIMEOUT_MS / 1000)}s — it may be overloaded. Nothing was saved; try again.`);
+    }
+    throw new Error(`could not reach the server (${(e && e.message) || e})`);
+  }
+  if (!res.ok) {
+    const body = await res.text().catch(() => '');
+    throw new Error(`server replied ${res.status}: ${body.slice(0, 200)}`);
+  }
+  return res.json().catch(() => ({}));
 }
 
 /** Extract the article from the tab's live DOM and POST it to the server. */
@@ -168,7 +225,7 @@ async function savePage(tabId) {
   // Immediate feedback so a slow/cold server doesn't feel like nothing happened.
   // Every path below replaces this; the long timer is only a safety net so an
   // unforeseen throw can't leave '…' pinned to the icon forever.
-  setBadge('…', null, BADGE_STUCK_MS);
+  setBadge('…', null, BADGE_STUCK_MS, '!');
 
   let article;
   try {
@@ -183,38 +240,26 @@ async function savePage(tabId) {
     });
     article = results && results[0];
   } catch (e) {
-    setBadge('!', '#b3261e', BADGE_HOLD_MS);
+    setBadge('!', BADGE_ERR, BADGE_HOLD_MS);
     notifyError('Earmark: cannot read this page', e.message || e);
     return { ok: false, error: `This page cannot be captured (${e.message || e})` };
   }
   if (!article || !article.html) {
-    setBadge('!', '#b3261e', BADGE_HOLD_MS);
+    setBadge('!', BADGE_ERR, BADGE_HOLD_MS);
     notifyError('Earmark: nothing to save', 'Could not find article content on this page.');
     return { ok: false, error: 'no article content found' };
   }
 
   try {
-    const res = await fetch(`${serverUrl}/api/articles`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${token}`,
-      },
-      // Tag how this was saved (live-DOM capture of the open tab) so parse
-      // failures can be diagnosed by save method on the server.
-      body: JSON.stringify({ ...article, source: 'browser-page' }),
-    });
-    if (!res.ok) {
-      const body = await res.text();
-      throw new Error(`server replied ${res.status}: ${body.slice(0, 200)}`);
-    }
+    // Tag how this was saved (live-DOM capture of the open tab) so parse
+    // failures can be diagnosed by save method on the server.
+    const data = await postJson('/api/articles', { ...article, source: 'browser-page' });
     setBadge('✓', null, BADGE_HOLD_MS);
-    const data = await res.json().catch(() => ({}));
     const readUrl = data && data.id ? `${serverUrl}/read/${data.id}` : null;
     notifySaved(article.title, readUrl);
     return { ok: true, title: article.title };
   } catch (e) {
-    setBadge('!', '#b3261e', BADGE_HOLD_MS);
+    setBadge('!', BADGE_ERR, BADGE_HOLD_MS);
     notifyError('Earmark: save failed', e.message || e);
     return { ok: false, error: String(e.message || e) };
   }
@@ -237,7 +282,7 @@ async function saveHighlight(tabId, { withNote = false } = {}) {
   }
 
   const setBadge = badgeFor(tabId);
-  setBadge('…', null, BADGE_STUCK_MS);
+  setBadge('…', null, BADGE_STUCK_MS, '!');
 
   let sel;
   try {
@@ -247,12 +292,12 @@ async function saveHighlight(tabId, { withNote = false } = {}) {
     });
     sel = results && results[0];
   } catch (e) {
-    setBadge('!', '#b3261e', BADGE_HOLD_MS);
+    setBadge('!', BADGE_ERR, BADGE_HOLD_MS);
     notifyError('Earmark: cannot read this page', e.message || e);
     return { ok: false, error: `This page cannot be read (${e.message || e})` };
   }
   if (!sel || !sel.text) {
-    setBadge('!', '#b3261e', BADGE_HOLD_MS);
+    setBadge('!', BADGE_ERR, BADGE_HOLD_MS);
     notifyError('Earmark: nothing selected', 'Select some text on the page first, then save it as a highlight.');
     return { ok: false, error: 'no text selected' };
   }
@@ -272,32 +317,20 @@ async function saveHighlight(tabId, { withNote = false } = {}) {
   }
 
   try {
-    const res = await fetch(`${serverUrl}/api/highlights`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${token}`,
-      },
-      body: JSON.stringify({
-        url: sel.url,
-        title: sel.title,
-        siteName: sel.siteName,
-        text: sel.text,
-        note,
-        source: 'browser-highlight',
-      }),
+    const data = await postJson('/api/highlights', {
+      url: sel.url,
+      title: sel.title,
+      siteName: sel.siteName,
+      text: sel.text,
+      note,
+      source: 'browser-highlight',
     });
-    if (!res.ok) {
-      const body = await res.text();
-      throw new Error(`server replied ${res.status}: ${body.slice(0, 200)}`);
-    }
     setBadge('✓', null, BADGE_HOLD_MS);
-    const data = await res.json().catch(() => ({}));
     const readUrl = data && data.articleId ? `${serverUrl}/read/${data.articleId}` : `${serverUrl}/highlights`;
     notifyHighlight(sel.title, sel.text, readUrl);
     return { ok: true, title: sel.title };
   } catch (e) {
-    setBadge('!', '#b3261e', BADGE_HOLD_MS);
+    setBadge('!', BADGE_ERR, BADGE_HOLD_MS);
     notifyError('Earmark: highlight failed', e.message || e);
     return { ok: false, error: String(e.message || e) };
   }
@@ -312,13 +345,7 @@ async function saveLink(linkUrl) {
     return;
   }
   try {
-    const res = await fetch(`${serverUrl}/api/save-url`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
-      body: JSON.stringify({ url: linkUrl, source: 'browser-link' }),
-    });
-    if (!res.ok) throw new Error(`server replied ${res.status}`);
-    const data = await res.json().catch(() => ({}));
+    const data = await postJson('/api/save-url', { url: linkUrl, source: 'browser-link' });
     const readUrl = data && data.id ? `${serverUrl}/read/${data.id}` : null;
     notifySaved(data.title || linkUrl, readUrl);
   } catch (e) {

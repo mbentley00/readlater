@@ -22,6 +22,22 @@ primary_region = 'sjc'
   auto_start_machines = true
   min_machines_running = 1
 
+  # On 2026-08-14 the process stayed alive but stopped serving for several
+  # minutes — the proxy logged "could not finish reading HTTP body from
+  # instance" and saves hung with no error. Nothing noticed, because nothing
+  # was watching: extraction and SQLite are synchronous, so one heavy article
+  # blocks every other request, and a blocked event loop still looks 'started'
+  # to flyd. This check makes the stall visible and fails requests fast rather
+  # than letting them hang. /login is the one route that answers 200 without a
+  # session (everything else 303s to it), and it touches the DB, so a check
+  # that passes means the whole request path is really moving.
+  [[http_service.checks]]
+    interval = '15s'
+    timeout = '4s'
+    grace_period = '20s'
+    method = 'GET'
+    path = '/login'
+
 [[mounts]]
   source = 'readlater_data'
   destination = '/data'
