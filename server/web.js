@@ -98,8 +98,10 @@ a { color: var(--accent); }
    highlights drawer (z-index 50) and the modals (80). */
 header.site { position:sticky; top:0; z-index:40; display:flex; align-items:center; gap:1.25rem; padding:.8rem 1.2rem; border-bottom:1px solid var(--line); font-family: system-ui, sans-serif; background:var(--bg); }
 header.site .brand { font-weight:700; text-decoration:none; color:var(--fg); font-size:1.05rem; white-space:nowrap; }
-header.site nav { display:flex; gap:.9rem; flex:1; }
-header.site nav a { text-decoration:none; color:var(--muted); font-size:.95rem; }
+/* Wraps rather than overflowing: "Random Highlights" is long enough to push the
+   search box and account block off a phone screen otherwise. */
+header.site nav { display:flex; flex-wrap:wrap; gap:.35rem .9rem; flex:1; }
+header.site nav a { text-decoration:none; color:var(--muted); font-size:.95rem; white-space:nowrap; }
 header.site nav a.active { color:var(--fg); font-weight:600; }
 header.site .who { color:var(--muted); font-size:.85rem; display:flex; align-items:center; gap:.6rem; }
 header.site .who form { margin:0; }
@@ -260,6 +262,7 @@ function page({ title, body, user, active = '', nonce = '', script = '', article
       <a href="/" class="${active === 'inbox' ? 'active' : ''}">Inbox</a>
       <a href="/?view=archive" class="${active === 'archive' ? 'active' : ''}">Archive</a>
       <a href="/highlights" class="${active === 'highlights' ? 'active' : ''}">Highlights</a>
+      <a href="/highlights?sort=random" class="${active === 'highlights-random' ? 'active' : ''}">Random Highlights</a>
     </nav>` : '<nav></nav>';
   const who = user ? `
     <div class="who">
@@ -1728,7 +1731,11 @@ async function handle(ctx, req, res, url) {
     const article = ctx.store.getArticle(parts[1], user.id);
     if (article) { made = readerPage(ctx, user, article, url); title = article.title; active = ''; }
   } else if (route === 'GET /highlights') {
-    made = highlightsPage(ctx, user, url); title = 'Highlights'; active = 'highlights';
+    made = highlightsPage(ctx, user, url);
+    // The nav has a link for each: /highlights and the shuffled view of it.
+    const random = url.searchParams.get('sort') === 'random';
+    title = random ? 'Random highlights' : 'Highlights';
+    active = random ? 'highlights-random' : 'highlights';
   } else if (route === 'GET /settings') {
     made = settingsPage(ctx, user, url, req); title = 'Settings'; active = 'settings';
   } else if (route === 'GET /favicon.ico') {
