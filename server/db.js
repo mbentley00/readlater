@@ -198,6 +198,11 @@ CREATE INDEX IF NOT EXISTS articles_user_updated ON articles(userId, updatedAt);
 -- multi-KB rows off disk just to count them. As a covering index this answers
 -- the count from the index alone: 219ms -> 2ms at 24k articles.
 CREATE INDEX IF NOT EXISTS articles_user_arch_saved ON articles(userId, archived, savedAt DESC);
+-- The highlights page's domain dropdown joins highlights → articles by id just
+-- to read each article's domain. Covering (id, domain) answers that from the
+-- index; without it every highlighted article's table row is touched, which on
+-- the production volume means thousands of cold page reads per page load.
+CREATE INDEX IF NOT EXISTS articles_id_domain ON articles(id, domain);
 
 CREATE TABLE IF NOT EXISTS highlights (
   id TEXT PRIMARY KEY,
@@ -715,12 +720,25 @@ function open(dataDir) {
       const sortKey = HL_SORTS[sort] ? sort : 'recent';
       if (sortKey === 'random') args.seed = String(seed || '');
       const order = HL_SORTS[sortKey];
-      let sql = `SELECT a.id, a.title, a.siteName, a.domain, a.savedAt, a.wordCount,
-          COUNT(h.id) AS n, MAX(h.createdAt) AS lastHighlightAt
-        FROM highlights h JOIN articles a ON a.id = h.articleId
-        WHERE ${where} GROUP BY a.id ORDER BY ${order}`;
-      if (limit > 0) { sql += ' LIMIT @limit OFFSET @offset'; args.limit = limit; args.offset = Math.max(0, offset); }
-      return sqlite.prepare(sql).all(args);
+      // Aggregate, sort and page on the highlights side first; join the full
+      // article metadata only for the page actually shown. A single-pass
+      // version selected a.wordCount for every group, and wordCount is stored
+      // AFTER the inline html/textContent/sourceHtml blobs, so every non-index
+      // sort walked each highlighted article's overflow-page chain — reading
+      // most of a multi-GB table to render one page (~15s on the production
+      // volume). The inner join still references only a.id (a covering index
+      // probe) unless a domain filter or title sort needs a's cheap early
+      // columns; every sort key except title comes from highlights alone.
+      let inner = `SELECT h.articleId AS id, COUNT(h.id) AS n, MAX(h.createdAt) AS lastHighlightAt
+          FROM highlights h JOIN articles a ON a.id = h.articleId
+          WHERE ${where} GROUP BY h.articleId ORDER BY ${order}`;
+      if (limit > 0) { inner += ' LIMIT @limit OFFSET @offset'; args.limit = limit; args.offset = Math.max(0, offset); }
+      // The outer ORDER BY re-sorts the page: SQLite does not promise the join
+      // preserves the subquery's order. The same sort expressions resolve here
+      // (n / lastHighlightAt as output columns, a.title / a.id via the join).
+      return sqlite.prepare(`SELECT a.id, a.title, a.siteName, a.domain, a.savedAt, a.wordCount,
+          g.n AS n, g.lastHighlightAt AS lastHighlightAt
+        FROM (${inner}) g JOIN articles a ON a.id = g.id ORDER BY ${order}`).all(args);
     },
     highlightedArticlesCount: (userId, { q = '', domain = '', domains = null } = {}) => {
       const { where, args } = hlWhere(userId, q, domain, domains);
@@ -728,8 +746,13 @@ function open(dataDir) {
         JOIN articles a ON a.id = h.articleId WHERE ${where} GROUP BY a.id)`).get(args).c;
     },
     /** Domains among a user's highlighted articles, with counts (for the filter). */
+    // INDEXED BY: without stats the planner probes the id autoindex and reads
+    // each article's table row just for domain; the covering index answers it
+    // without touching the huge rows. The index is part of SCHEMA, so it is
+    // always there for INDEXED BY to name.
     highlightedDomains: (userId) =>
-      prep('hld', `SELECT a.domain, COUNT(DISTINCT a.id) n FROM highlights h JOIN articles a ON a.id = h.articleId
+      prep('hld', `SELECT a.domain, COUNT(DISTINCT a.id) n
+        FROM highlights h JOIN articles a INDEXED BY articles_id_domain ON a.id = h.articleId
         WHERE h.userId = ? AND a.domain != '' GROUP BY a.domain ORDER BY n DESC`).all(userId),
 
     highlightCountsByArticle: (userId) => {
