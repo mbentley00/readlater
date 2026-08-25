@@ -1,5 +1,15 @@
+# The build context is uploaded to the remote builder on every deploy, and the
+# Dockerfile only ever COPYs package.json, package-lock.json and the named .js
+# files. Everything below is local-only and was making the context ~175MB —
+# backups/ alone was 175MB of it — for no benefit.
 data/
 node_modules/
+backups/
 test.js
 README.md
 fly.toml
+*.db
+*.db-shm
+*.db-wal
+*.epub
+*.pdf
