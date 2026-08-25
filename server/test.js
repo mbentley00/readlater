@@ -9,6 +9,7 @@ const fs = require('fs');
 const http = require('http');
 const path = require('path');
 const os = require('os');
+const zlib = require('zlib');
 const assert = require('assert');
 
 const PORT = 18090 + Math.floor(Math.random() * 1000);
@@ -63,6 +64,91 @@ function makeTestPdf(text) {
     offsets.map((o) => String(o).padStart(10, '0') + ' 00000 n \n').join('');
   out += `trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n${xrefPos}\n%%EOF`;
   return Buffer.from(out, 'latin1');
+}
+
+/**
+ * A real ZIP (deflate + one stored entry) laid out as a minimal EPUB 3. Built
+ * by hand for the same reason makeTestPdf is: the test must exercise the actual
+ * archive reader, and no ZIP writer ships with the server.
+ *
+ * The central directory deliberately carries an extra field the local headers
+ * don't, which is legal and common — and which breaks any reader that computes
+ * an entry's data offset from the wrong header.
+ */
+function makeTestEpub({ title = 'The Test Book', author = 'A. Writer' } = {}) {
+  const CRC = new Int32Array(256);
+  for (let i = 0; i < 256; i++) {
+    let c = i;
+    for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+    CRC[i] = c;
+  }
+  const crc32 = (b) => {
+    let c = -1;
+    for (let i = 0; i < b.length; i++) c = CRC[(c ^ b[i]) & 0xff] ^ (c >>> 8);
+    return (c ^ -1) >>> 0;
+  };
+
+  const chapter = (h, ps) => Buffer.from(`<?xml version="1.0" encoding="utf-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml"><head><title>${h}</title>
+<style>p{color:red}</style><script>tracker()</script></head>
+<body><h1>${h}</h1>
+${ps.map((p) => `<p>${p}</p>`).join('\n')}
+<blockquote><p>A quotation set inside a blockquote.</p></blockquote>
+</body></html>`, 'utf8');
+
+  const files = [
+    { name: 'mimetype', data: Buffer.from('application/epub+zip', 'utf8'), store: true },
+    { name: 'META-INF/container.xml', data: Buffer.from(`<?xml version="1.0"?>
+<container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">
+  <rootfiles><rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/></rootfiles>
+</container>`, 'utf8') },
+    { name: 'OEBPS/content.opf', data: Buffer.from(`<?xml version="1.0"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="3.0">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+    <dc:title>${title}</dc:title><dc:creator>${author}</dc:creator><dc:language>en</dc:language>
+  </metadata>
+  <manifest>
+    <item id="cover" href="cover.jpg" media-type="image/jpeg"/>
+    <item id="c0" href="ch1.xhtml" media-type="application/xhtml+xml"/>
+    <item id="c1" href="ch2.xhtml" media-type="application/xhtml+xml"/>
+  </manifest>
+  <spine><itemref idref="cover"/><itemref idref="c0"/><itemref idref="c1"/></spine>
+</package>`, 'utf8') },
+    { name: 'OEBPS/cover.jpg', data: Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10]) },
+    { name: 'OEBPS/ch1.xhtml', data: chapter('Chapter One', ['The EPUB import pipeline extracted this sentence.']) },
+    { name: 'OEBPS/ch2.xhtml', data: chapter('Chapter Two', ['And this one came from the second chapter.']) },
+  ];
+
+  const locals = [], central = [];
+  let offset = 0;
+  for (const f of files) {
+    const body = f.store ? f.data : zlib.deflateRawSync(f.data);
+    const name = Buffer.from(f.name, 'utf8');
+    const lh = Buffer.alloc(30);
+    lh.writeUInt32LE(0x04034b50, 0); lh.writeUInt16LE(20, 4);
+    lh.writeUInt16LE(f.store ? 0 : 8, 8);
+    lh.writeUInt32LE(crc32(f.data), 14);
+    lh.writeUInt32LE(body.length, 18); lh.writeUInt32LE(f.data.length, 22);
+    lh.writeUInt16LE(name.length, 26); lh.writeUInt16LE(0, 28);
+    locals.push(lh, name, body);
+
+    const extra = Buffer.alloc(4); // present centrally, absent locally
+    const ch = Buffer.alloc(46);
+    ch.writeUInt32LE(0x02014b50, 0); ch.writeUInt16LE(20, 4); ch.writeUInt16LE(20, 6);
+    ch.writeUInt16LE(f.store ? 0 : 8, 10);
+    ch.writeUInt32LE(crc32(f.data), 16);
+    ch.writeUInt32LE(body.length, 20); ch.writeUInt32LE(f.data.length, 24);
+    ch.writeUInt16LE(name.length, 28); ch.writeUInt16LE(extra.length, 30);
+    ch.writeUInt32LE(offset, 42);
+    central.push(ch, name, extra);
+    offset += lh.length + name.length + body.length;
+  }
+  const cd = Buffer.concat(central);
+  const eocd = Buffer.alloc(22);
+  eocd.writeUInt32LE(0x06054b50, 0);
+  eocd.writeUInt16LE(files.length, 8); eocd.writeUInt16LE(files.length, 10);
+  eocd.writeUInt32LE(cd.length, 12); eocd.writeUInt32LE(offset, 16);
+  return Buffer.concat([Buffer.concat(locals), cd, eocd]);
 }
 
 /** Fake Anthropic Messages API: always "finds" a long article in the page. */
@@ -159,14 +245,20 @@ async function main() {
     stdio: ['ignore', 'pipe', 'inherit'],
   });
 
-  // wait for server to come up
-  for (let i = 0; i < 50; i++) {
+  // Wait for the server to come up. A cold start loads better-sqlite3's native
+  // binding, pdf.js and linkedom, which on a slow/cold filesystem has taken
+  // well over the 5s this used to allow — after which every assertion failed
+  // with an ECONNREFUSED that looked like a broken server rather than one that
+  // simply wasn't up yet. Wait longer, and say so plainly if it never arrives.
+  let up = false;
+  for (let i = 0; i < 300 && !up; i++) {
     try {
       const r = await fetch(BASE + '/login');
-      if (r.ok) break;
+      up = r.ok;
     } catch { /* not up yet */ }
-    await new Promise((r) => setTimeout(r, 100));
+    if (!up) await new Promise((r) => setTimeout(r, 100));
   }
+  if (!up) throw new Error(`test server never became ready on ${BASE} (30s)`);
 
   try {
     // ---- accounts -----------------------------------------------------
@@ -659,6 +751,53 @@ async function main() {
     });
     assert.strictEqual(res.status, 400, 'non-pdf rejected');
     await api('DELETE', `/api/articles/${pdfArticle.id}`);
+
+    // ---- EPUB import ------------------------------------------------------
+    const epubBuf = makeTestEpub();
+    const upload = (path, body, type = 'application/octet-stream') => fetch(BASE + path, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${TOKEN}`, 'Content-Type': type },
+      body,
+    });
+
+    res = await upload('/api/import/epub?filename=the-test-book.epub', epubBuf);
+    assert.strictEqual(res.status, 201, 'epub import accepted');
+    const epubArticle = await res.json();
+    assert.ok(epubArticle.textContent.includes('extracted this sentence'), 'epub chapter 1 text');
+    assert.ok(epubArticle.textContent.includes('second chapter'), 'epub chapter 2 text (whole spine read)');
+    assert.strictEqual(epubArticle.siteName, 'EPUB');
+    assert.strictEqual(epubArticle.title, 'The Test Book', 'title from OPF metadata');
+    assert.strictEqual(epubArticle.byline, 'A. Writer', 'author from OPF metadata');
+    assert.ok(!/tracker\(|color:red/.test(epubArticle.html), 'scripts and styles stripped');
+    assert.ok(epubArticle.html.includes('<h2>Chapter One</h2>'), 'headings kept, h1 demoted');
+    assert.ok(epubArticle.wordCount > 10, 'epub word count computed');
+
+    // re-importing the same book dedupes by content hash
+    res = await upload('/api/import/epub?filename=the-test-book.epub', epubBuf);
+    assert.strictEqual((await res.json()).id, epubArticle.id, 'epub re-import dedupes');
+
+    // the sniffing endpoint the web uploader posts to takes either format,
+    // regardless of the Content-Type the browser attaches
+    res = await upload('/api/import/file?filename=sniffed.epub', epubBuf);
+    assert.strictEqual((await res.json()).id, epubArticle.id, 'import/file detects EPUB');
+    res = await upload('/api/import/file?filename=sniffed.pdf', makeTestPdf('Sniffed PDF text here.'));
+    assert.strictEqual(res.status, 201, 'import/file detects PDF');
+    const sniffedPdf = await res.json();
+    assert.strictEqual(sniffedPdf.siteName, 'PDF');
+
+    // wrong format for the endpoint, and files that are neither
+    res = await upload('/api/import/epub?filename=actually.pdf', pdfBuf);
+    assert.strictEqual(res.status, 400, 'a PDF posted to /import/epub is rejected');
+    res = await upload('/api/import/file?filename=nope.txt', Buffer.from('just some text'));
+    assert.strictEqual(res.status, 400, 'non-document rejected');
+    // a ZIP that is not an EPUB: real archive, no container.xml
+    const plainZip = Buffer.concat([Buffer.from([0x50, 0x4b, 0x03, 0x04]), Buffer.alloc(60)]);
+    res = await upload('/api/import/file?filename=archive.zip', plainZip);
+    assert.strictEqual(res.status, 400, 'plain ZIP rejected');
+
+    await api('DELETE', `/api/articles/${epubArticle.id}`);
+    await api('DELETE', `/api/articles/${sniffedPdf.id}`);
+    console.log('  PDF + EPUB import ✔');
 
     // web highlight creation (what the reader's selection button does)
     r = await api('POST', `/api/articles/${articleId}/highlights`,

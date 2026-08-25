@@ -45,6 +45,23 @@ text to add a new one), archive/favorite from the reader, search everything
 (full text, with domain and has-highlights filters), browse and export
 highlights, and manage your API token.
 
+### Importing PDFs and EPUBs
+
+**Import PDF or EPUB…** above the article list takes files from your machine —
+pick several at once, or drag them anywhere onto the page. Each one becomes an
+ordinary article: searchable, highlightable, archivable, readable on the phone.
+
+An EPUB arrives as a single article holding the whole book in reading order,
+with its title and author taken from the book's own metadata and chapter
+headings kept as headings. Text only — images, fonts and styling in the file are
+dropped, since articles store text rather than assets. Books with DRM cannot be
+read (nothing here breaks it); neither can PDFs that are page scans with no text
+layer, and both say so instead of importing an empty article.
+
+Re-importing a file you already have updates that article in place rather than
+making a second copy — the identity is the file's content hash, so a renamed
+copy of the same book is still the same book.
+
 ### Sharing an article
 
 **Share** in the reader hands you a link like `https://…/p/<slug>` that anyone
@@ -276,7 +293,8 @@ works). Timestamps are epoch milliseconds.
 | `GET /api/articles?q=…&domain=…&highlighted=1&minWords=…&maxWords=…&minHighlights=…` | Search + filters (terms AND-matched vs title/author/site/text; domain matches subdomains; `email` = emailed-in) |
 | `GET/POST /api/views`, `DELETE /api/views/{id}` | Saved filter views (shown as tabs in web + Android) |
 | `GET/POST /api/skip-rules`, `DELETE /api/skip-rules/{id}` | Boilerplate phrases dropped from future saves |
-| `POST /api/import/pdf?filename=…` | Import a PDF (raw body); text extracted into an article |
+| `POST /api/import/file?filename=…` | Import a PDF or EPUB (raw body); format detected from the bytes, text extracted into an article |
+| `POST /api/import/pdf?filename=…`, `POST /api/import/epub?filename=…` | Same, for a caller that knows the format |
 | `GET /api/export.json` | Full export as one JSON document: articles (with HTML), highlights, views |
 | `GET /api/export.ndjson` | Same data, line-delimited — **use this for backups** (see below) |
 | `POST /api/app.apk`, `GET /app.apk` | Upload / download the Android app build |

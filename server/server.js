@@ -30,6 +30,7 @@ const { open, hostOf } = require('./db');
 const llm = require('./llm');
 const { extractReadable } = require('./extract');
 const pdf = require('./pdf');
+const epub = require('./epub');
 const tts = require('./tts');
 const inbound = require('./inbound');
 const skip = require('./skip');
@@ -39,6 +40,28 @@ const { reparse, textOf } = require('./reparse');
 // Cap raw source we keep for reparse/"view original" so a single huge message
 // can't blow the data volume. Big enough for any real newsletter or page.
 const SOURCE_CAP = 3 * 1024 * 1024;
+
+// Uploaded PDFs/EPUBs are held in memory while they parse, on a 512MB VM.
+// A book is a few MB; this leaves room for one that is unusually image-heavy
+// without letting an upload take the process down.
+const IMPORT_MAX_BYTES = 50 * 1024 * 1024;
+
+/**
+ * Which document format an uploaded buffer holds, from its bytes rather than
+ * its filename or Content-Type — the uploader shouldn't have to be right about
+ * either. Returns 'pdf', 'epub', or null.
+ */
+function sniffDocument(buf) {
+  if (buf.length >= 5 && buf.subarray(0, 5).toString('latin1') === '%PDF-') return 'pdf';
+  // EPUB is a ZIP. Distinguish it from any other ZIP by the mimetype entry the
+  // spec puts first (uncompressed, at a fixed offset), falling back to the
+  // container path, which appears in every EPUB's central directory.
+  if (buf.length >= 4 && buf.readUInt32LE(0) === 0x04034b50) {
+    if (buf.subarray(30, 60).toString('latin1').startsWith('mimetypeapplication/epub+zip')) return 'epub';
+    if (buf.includes('META-INF/container.xml')) return 'epub';
+  }
+  return null;
+}
 
 // Browser-like headers. Many publishers sit behind bot filters (Cloudflare,
 // Akamai) that answer 429/403 to an obvious bot UA or a request with no
@@ -1280,30 +1303,43 @@ const server = http.createServer(async (req, res) => {
       }
     }
 
-    // ---- PDF import: raw application/pdf body, parsed into an article
-    if (req.method === 'POST' && parts[1] === 'import' && parts[2] === 'pdf' && parts.length === 3) {
-      const buf = await readBodyBuffer(req, 50 * 1024 * 1024);
-      if (buf.length < 5 || buf.subarray(0, 5).toString() !== '%PDF-') {
-        return json(res, 400, { error: 'not a PDF file' });
+    // ---- document import: a raw PDF or EPUB body, parsed into an article.
+    // /file sniffs the format from the bytes (what the web uploader posts);
+    // /pdf and /epub name it explicitly.
+    if (req.method === 'POST' && parts[1] === 'import' && parts.length === 3
+        && ['pdf', 'epub', 'file'].includes(parts[2])) {
+      const buf = await readBodyBuffer(req, IMPORT_MAX_BYTES);
+      const kind = sniffDocument(buf);
+      if (!kind || (parts[2] !== 'file' && kind !== parts[2])) {
+        return json(res, 400, {
+          error: parts[2] === 'file' ? 'not a PDF or EPUB file' : `not a ${parts[2].toUpperCase()} file`,
+        });
       }
-      const filename = sanitizeString(url.searchParams.get('filename'), 200) || 'document.pdf';
+      const fallbackName = `document.${kind}`;
+      const filename = sanitizeString(url.searchParams.get('filename'), 200) || fallbackName;
       let parsed;
       try {
-        parsed = await pdf.pdfToArticle(buf, filename);
+        parsed = kind === 'pdf'
+          ? await pdf.pdfToArticle(buf, filename)
+          : await epub.epubToArticle(buf, filename);
       } catch (e) {
-        return json(res, 400, { error: `could not parse PDF: ${e.message}` });
+        return json(res, 400, { error: `could not parse ${kind.toUpperCase()}: ${e.message}` });
       }
       if (!parsed.textContent.trim()) {
-        return json(res, 400, { error: 'no extractable text (scanned/image-only PDF?)' });
+        return json(res, 400, {
+          error: kind === 'pdf'
+            ? 'no extractable text (scanned/image-only PDF?)'
+            : 'no extractable text (DRM-protected or image-only EPUB?)',
+        });
       }
       // dedupe on content hash so re-importing the same file updates in place
-      const artUrl = 'pdf:' + crypto.createHash('sha256').update(buf).digest('hex').slice(0, 24);
+      const artUrl = `${kind}:` + crypto.createHash('sha256').update(buf).digest('hex').slice(0, 24);
       const now = Date.now();
       let a = store.articleByUrl(user.id, artUrl);
       const fields = withSkipRules(user.id, {
         title: sanitizeString(parsed.title) || filename,
-        byline: null,
-        siteName: 'PDF',
+        byline: sanitizeString(parsed.byline, 200) || null,
+        siteName: kind === 'pdf' ? 'PDF' : 'EPUB',
         excerpt: sanitizeString(parsed.textContent.replace(/\s+/g, ' ').trim(), 300),
         html: parsed.html,
         textContent: parsed.textContent.slice(0, 500000),
@@ -1315,11 +1351,11 @@ const server = http.createServer(async (req, res) => {
         a = {
           id: newId(), userId: user.id, url: artUrl,
           savedAt: now, archived: false, favorite: false, readParagraph: 0,
-          source: 'pdf',
+          source: kind,
           ...fields,
         };
         store.insertArticle(a);
-        console.log(`article saved [pdf] ${filename}`);
+        console.log(`article saved [${kind}] ${filename}`);
       }
       return json(res, 201, pubArticle(store.getArticle(a.id, user.id)));
     }

@@ -136,6 +136,9 @@ ul.articles .thumb { flex:none; width:84px; height:84px; object-fit:cover; borde
 ul.articles .title { font-size:1.08rem; text-decoration:none; color:var(--fg); font-weight:600; }
 ul.articles .title:hover { color:var(--accent); }
 .meta { color:var(--muted); font-size:.8rem; font-family: system-ui, sans-serif; margin-top:.15rem; }
+/* Dropping a PDF/EPUB anywhere on the list imports it; outline the whole page
+   so the target is obviously the window and not one small strip of it. */
+body.dropping::after { content:'Drop to import'; position:fixed; inset:.5rem; z-index:90; display:flex; align-items:center; justify-content:center; border:2px dashed var(--accent); border-radius:12px; background:rgba(0,0,0,.35); color:var(--fg); font:600 1.1rem/1 system-ui,sans-serif; pointer-events:none; }
 .actions { display:flex; gap:.35rem; font-family: system-ui, sans-serif; }
 .skip-add { display:flex; gap:.4rem; margin:.6rem 0 .3rem; }
 .skip-add input { flex:1; min-width:0; padding:.35rem .5rem; border:1px solid var(--line); border-radius:6px; background:transparent; color:var(--fg); }
@@ -593,10 +596,11 @@ ${!searching && !savedView ? `<div class="meta">${total.toLocaleString('en-US')}
   const isInbox = !searching && !savedView && view !== 'archive' && view !== 'favorites';
   const importBar = `
 <div class="importbar meta">
-  <button id="import-pdf" class="act">Import PDF…</button>
+  <button id="import-doc" class="act">Import PDF or EPUB…</button>
   ${isInbox ? '<button id="bulk-archive" class="act">Archive older than 1 year</button>' : ''}
   <span id="import-status"></span>
-  <input type="file" id="pdf-file" accept=".pdf,application/pdf" style="display:none">
+  <input type="file" id="doc-file" multiple
+    accept=".pdf,.epub,application/pdf,application/epub+zip" style="display:none">
 </div>`;
 
   const body = searchForm + importBar + (list.length
@@ -680,24 +684,71 @@ if (bulkBtn) bulkBtn.addEventListener('click', async () => {
   location.reload();
 });
 
-// PDF import: pick a file, POST it raw, reload to show the new article.
-const pdfBtn = document.getElementById('import-pdf');
-const pdfFile = document.getElementById('pdf-file');
-const pdfStatus = document.getElementById('import-status');
-if (pdfBtn) pdfBtn.addEventListener('click', () => pdfFile.click());
-if (pdfFile) pdfFile.addEventListener('change', async () => {
-  const f = pdfFile.files[0]; if (!f) return;
-  pdfStatus.textContent = 'Importing ' + f.name + '…';
-  const res = await fetch('/api/import/pdf?filename=' + encodeURIComponent(f.name), {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/pdf' },
-    body: f,
-  });
-  if (res.ok) { location.reload(); }
-  else {
-    const err = await res.json().catch(() => ({}));
-    pdfStatus.textContent = 'Import failed: ' + (err.error || res.status);
+// Document import: pick PDFs/EPUBs (or drop them on the page), POST each raw,
+// reload to show the new articles. The server sniffs the format from the bytes,
+// so nothing here has to work out which is which.
+const docBtn = document.getElementById('import-doc');
+const docFile = document.getElementById('doc-file');
+const docStatus = document.getElementById('import-status');
+
+async function importDocs(files) {
+  const list = [...files];
+  if (!list.length) return;
+  if (docBtn) docBtn.disabled = true;
+  const failed = [];
+  let done = 0;
+  // One at a time: parsing is synchronous on a single-threaded server, so
+  // firing a dozen books at once would just queue them while blocking
+  // everything else the server has to answer.
+  for (const f of list) {
+    docStatus.textContent = list.length > 1
+      ? 'Importing ' + (done + 1) + ' of ' + list.length + ': ' + f.name + '…'
+      : 'Importing ' + f.name + '…';
+    try {
+      const res = await fetch('/api/import/file?filename=' + encodeURIComponent(f.name), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/octet-stream' },
+        body: f,
+      });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        failed.push(f.name + ' — ' + (err.error || res.status));
+      }
+    } catch (e) {
+      failed.push(f.name + ' — ' + e.message);
+    }
+    done++;
   }
+  if (docBtn) docBtn.disabled = false;
+  if (docFile) docFile.value = ''; // so re-picking the same file fires 'change'
+  // Reload when anything landed, so the new articles are actually visible; keep
+  // the failures on screen when nothing did.
+  if (failed.length < list.length) {
+    if (failed.length) alert('Some files could not be imported:\\n\\n' + failed.join('\\n'));
+    location.reload();
+  } else {
+    docStatus.textContent = 'Import failed: ' + failed.join('; ');
+  }
+}
+
+if (docBtn) docBtn.addEventListener('click', () => docFile.click());
+if (docFile) docFile.addEventListener('change', () => importDocs(docFile.files));
+
+// Drag a book anywhere onto the list to import it.
+document.addEventListener('dragover', (e) => {
+  if (e.dataTransfer && [...e.dataTransfer.types].includes('Files')) {
+    e.preventDefault();
+    document.body.classList.add('dropping');
+  }
+});
+document.addEventListener('dragleave', (e) => {
+  if (!e.relatedTarget) document.body.classList.remove('dropping');
+});
+document.addEventListener('drop', (e) => {
+  if (!e.dataTransfer || !e.dataTransfer.files.length) return;
+  e.preventDefault();
+  document.body.classList.remove('dropping');
+  importDocs(e.dataTransfer.files);
 });`;
   return { body, script };
 }
@@ -748,6 +799,13 @@ function readerPage(ctx, user, article, url) {
       <button class="act" id="hl-toggle">Highlights (${hls.length})</button>
     </div>`;
   const meta = [article.siteName, article.byline, fmtDate(article.savedAt)].filter(Boolean).map(escapeHtml).join(' · ');
+  // An uploaded PDF/EPUB has no original to go back to: nothing to re-fetch (the
+  // url is a content hash) and no captured source (the file itself isn't kept).
+  // The link would only ever reach "no original source was kept".
+  const hasOriginal = !/^(pdf|epub):/i.test(article.url || '');
+  const originalLink = hasOriginal
+    ? `${meta ? ' · ' : ''}<a href="/read/${escapeHtml(article.id)}/original" target="_blank" rel="noopener noreferrer">view original ↗</a>`
+    : '';
   const hlItems = hls.map((h) => `<div class="hl-item" data-hl-id="${h.id}">
       <div class="hl-item-text">${escapeHtml(h.text)}</div>
       ${h.note ? `<div class="note">${escapeHtml(h.note)}</div>` : ''}
@@ -758,7 +816,7 @@ function readerPage(ctx, user, article, url) {
 <article class="reader">
   <header>
     <h1>${escapeHtml(article.title)}</h1>
-    <div class="meta">${meta}${meta ? ' · ' : ''}<a href="/read/${escapeHtml(article.id)}/original" target="_blank" rel="noopener noreferrer">view original ↗</a></div>
+    <div class="meta">${meta}${originalLink}</div>
     <div class="actions reader-actions">
       <button class="act fav" data-act="favorite" data-val="${article.favorite ? 'false' : 'true'}" title="Favorite">${article.favorite ? '★' : '☆'}</button>
       <button class="act" data-act="archive" data-val="${article.archived ? 'false' : 'true'}">${article.archived ? 'Unarchive' : 'Archive'}</button>
@@ -857,6 +915,7 @@ function readerPage(ctx, user, article, url) {
   const script = `
 const ARTICLE = ${jsonForScript(article.id)};
 const ORIGINAL_URL = ${jsonForScript(article.url || '')};
+const HAS_ORIGINAL = ${jsonForScript(hasOriginal)};
 const BACK_TO = ${jsonForScript(backTo)};
 
 // Keyboard shortcuts: o = open the original, e = archive and go back.
@@ -865,7 +924,7 @@ document.addEventListener('keydown', (e) => {
   const t = e.target;
   if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.tagName === 'SELECT' || t.isContentEditable)) return;
   if (e.key === 'o') {
-    window.open('/read/' + ARTICLE + '/original', '_blank', 'noopener');
+    if (HAS_ORIGINAL) window.open('/read/' + ARTICLE + '/original', '_blank', 'noopener');
   } else if (e.key === 'e') {
     e.preventDefault();
     fetch('/api/articles/' + ARTICLE, {
