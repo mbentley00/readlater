@@ -183,6 +183,12 @@ CREATE TABLE IF NOT EXISTS articles (
   -- without a session. NULL = not shared. Revoking clears it, which breaks
   -- every copy of the old link; re-sharing mints a fresh one.
   shareId TEXT,
+  -- When the article was archived (ms), so the Archive list can be ordered by
+  -- "most recently filed away" rather than by when it was saved. NULL while an
+  -- article is in the inbox. Its own column rather than reusing updatedAt: that
+  -- one moves for reparses and sync writes, and it sits after the html blobs,
+  -- so ordering on it walks every row's overflow pages.
+  archivedAt INTEGER,
   updatedAt INTEGER NOT NULL
 );
 CREATE UNIQUE INDEX IF NOT EXISTS articles_user_url ON articles(userId, url);
@@ -212,6 +218,10 @@ CREATE TABLE IF NOT EXISTS highlights (
   text TEXT NOT NULL,
   note TEXT,
   paragraphIndex INTEGER,
+  -- Where the highlight sits in its ORIGINAL source, when that source has its
+  -- own address space: a Kindle location/page number. Free text, because it is
+  -- the source's identifier, not ours.
+  location TEXT,
   createdAt INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS hl_article ON highlights(articleId);
@@ -332,15 +342,29 @@ const ARTICLE_SORTS = {
   // order back for every page of that result set. ORDER BY RANDOM() would
   // reshuffle on each request and make pagination drop/repeat articles.
   random: 'shuffle(@seed, a.id) ASC',
+  // Archive-only: "newest" there means most recently FILED AWAY, not most
+  // recently saved. Sorting by savedAt buried this morning's archiving under
+  // whatever happened to be saved most recently. Served by
+  // articles_user_archived_at, whose expression must stay identical to this one.
+  // updatedAt is the fallback for rows archived before archivedAt existed.
+  newestArchived: 'COALESCE(a.archivedAt, a.updatedAt) DESC',
+  oldestArchived: 'COALESCE(a.archivedAt, a.updatedAt) ASC',
 };
 
 /** Shared WHERE builder for searchArticles + countArticles. */
 function buildArticleWhere(userId, {
   q = '', domain = '', domains = null, highlighted = false, includeArchived = false, since = 0,
   favoriteOnly = false, archivedOnly = false, minWords = 0, maxWords = 0, minHighlights = 0,
+  sources = null,
 } = {}) {
   const where = ['a.userId = @userId'];
   const args = { userId };
+  // How the article was saved (android-share, browser-page, email, …): the web
+  // UI's "From phone" list is this with ['android-share'].
+  if (sources && sources.length) {
+    where.push(`a.source IN (${sources.map((_, i) => `@src${i}`).join(', ')})`);
+    sources.forEach((s, i) => { args[`src${i}`] = String(s); });
+  }
   if (archivedOnly) where.push('a.archived = 1');
   else if (!includeArchived) where.push('a.archived = 0');
   if (favoriteOnly) where.push('a.favorite = 1');
@@ -380,9 +404,15 @@ const HL_SORTS = {
 };
 
 /** Shared WHERE for highlighted-articles queries (userId + optional q/domain). */
-function hlWhere(userId, q, domain, domains = null) {
+function hlWhere(userId, q, domain, domains = null, sources = null) {
   const parts = ['h.userId = @userId'];
   const args = { userId };
+  // Where the highlighted article came from ('kindle', 'android-share', …), so
+  // the highlights page can be narrowed to one import.
+  if (sources && sources.length) {
+    parts.push(`a.source IN (${sources.map((_, i) => `@hsrc${i}`).join(', ')})`);
+    sources.forEach((s, i) => { args[`hsrc${i}`] = String(s); });
+  }
   const m = ftsMatch(q);
   if (m) { parts.push(m.clause); Object.assign(args, m.args); }
   if (domains && domains.length) {
@@ -484,11 +514,45 @@ function open(dataDir) {
   if (!articleCols.includes('shareId')) {
     sqlite.exec("ALTER TABLE articles ADD COLUMN shareId TEXT");
   }
+  // When an article was archived, for the Archive list's ordering. Backfilled
+  // from updatedAt for rows archived before the column existed — the best
+  // approximation available, and what the Android app already falls back to.
+  if (!articleCols.includes('archivedAt')) {
+    sqlite.exec("ALTER TABLE articles ADD COLUMN archivedAt INTEGER");
+    // Deliberately NOT backfilled with an UPDATE: every article row carries its
+    // html/textContent/sourceHtml inline, so rewriting 20k+ rows would move
+    // gigabytes to set one integer. Rows archived before this column existed
+    // fall back to updatedAt in the ordering below instead — the same
+    // approximation the Android app makes.
+  }
+  // Created here (not in SCHEMA) for the same reason as the shareId index: on a
+  // database predating the column the CREATE would run before the ALTER above.
+  // The expression must match ARTICLE_SORTS.newestArchived exactly for SQLite to
+  // order from the index rather than sorting the whole archive on every page.
+  sqlite.exec(`CREATE INDEX IF NOT EXISTS articles_user_archived_at
+    ON articles(userId, archived, COALESCE(archivedAt, updatedAt) DESC)`);
+  // Same problem for the length sorts: wordCount was added by ALTER TABLE, so
+  // it sits past each row's html/textContent/sourceHtml. Ordering by it read
+  // most of the database, and because the server is single-threaded and
+  // synchronous that one query stalled EVERY other request behind it — which is
+  // how an unrelated click (minting a share link) ended up hanging. Ordering
+  // from this index touches no article rows but the page being shown.
+  sqlite.exec('CREATE INDEX IF NOT EXISTS articles_user_wordcount ON articles(userId, archived, wordCount)');
+
+  // Kindle location (or page) a highlight came from, so an imported highlight
+  // points back at its exact spot in the book.
+  const highlightCols = sqlite.prepare('PRAGMA table_info(highlights)').all().map((c) => c.name);
+  if (!highlightCols.includes('location')) {
+    sqlite.exec("ALTER TABLE highlights ADD COLUMN location TEXT");
+  }
   // Created here rather than in SCHEMA: on a database predating the column, the
   // CREATE INDEX in SCHEMA would run before the ALTER above and fail outright.
   // Unique so a slug can never resolve to two articles; SQLite treats NULLs as
   // distinct, so any number of unshared articles coexist.
   sqlite.exec('CREATE UNIQUE INDEX IF NOT EXISTS articles_share ON articles(shareId)');
+  // The "From phone" list filters on source; without this, its count reads
+  // every (blob-laden) row of the account. Same reasoning as articles_user_arch_saved.
+  sqlite.exec('CREATE INDEX IF NOT EXISTS articles_user_source ON articles(userId, source)');
   // one-time recompute after the script/style-stripping fix (imported
   // articles were over-counted by embedded JSON-LD / scripts).
   if (sqlite.pragma('user_version', { simple: true }) < 2) {
@@ -628,12 +692,21 @@ function open(dataDir) {
     articleByShareId: (shareId) =>
       rowArticle(prep('abs', `SELECT ${ARTICLE_COLS} FROM articles WHERE shareId = ?`).get(shareId)),
     /** Publish (shareId) or revoke (null). Scoped to the owner. */
+    /** Just the share slug (and proof the article is this user's). The article
+     *  rows carry html/textContent inline, so loading a whole article to read
+     *  one short column pulled the entire body off the volume — which is what
+     *  made the Share button sit there with an empty box. Returns undefined
+     *  when there is no such article for this user. */
+    articleShareId: (id, userId) =>
+      prep('agsi', 'SELECT shareId FROM articles WHERE id = ? AND userId = ?').get(id, userId),
     setArticleShareId: (id, userId, shareId) =>
       prep('assh', 'UPDATE articles SET shareId = ? WHERE id = ? AND userId = ?').run(shareId, id, userId),
     insertArticle: (a) => prep('ai', `INSERT INTO articles
-      (id, userId, url, domain, savedAt, archived, favorite, readParagraph, title, byline, siteName, excerpt, html, textContent, sourceHtml, imageUrl, publishedAt, source, wordCount, updatedAt)
-      VALUES (@id, @userId, @url, @domain, @savedAt, @archived, @favorite, @readParagraph, @title, @byline, @siteName, @excerpt, @html, @textContent, @sourceHtml, @imageUrl, @publishedAt, @source, @wordCount, @updatedAt)`)
-      .run({ imageUrl: null, publishedAt: null, sourceHtml: null, source: null, ...a, ...articleIdentity(a), archived: a.archived ? 1 : 0, favorite: a.favorite ? 1 : 0, textContent: searchText(a), wordCount: articleWordCount(a) }),
+      (id, userId, url, domain, savedAt, archived, favorite, readParagraph, title, byline, siteName, excerpt, html, textContent, sourceHtml, imageUrl, publishedAt, source, wordCount, archivedAt, updatedAt)
+      VALUES (@id, @userId, @url, @domain, @savedAt, @archived, @favorite, @readParagraph, @title, @byline, @siteName, @excerpt, @html, @textContent, @sourceHtml, @imageUrl, @publishedAt, @source, @wordCount, @archivedAt, @updatedAt)`)
+      // An article created straight into the archive (a Kindle book, an
+      // importer) is archived as of now unless the caller says otherwise.
+      .run({ imageUrl: null, publishedAt: null, sourceHtml: null, source: null, ...a, ...articleIdentity(a), archived: a.archived ? 1 : 0, favorite: a.favorite ? 1 : 0, archivedAt: a.archived ? (a.archivedAt || a.updatedAt || a.savedAt) : null, textContent: searchText(a), wordCount: articleWordCount(a) }),
     // Update content; only overwrites imageUrl/publishedAt/sourceHtml when new ones are provided.
     updateArticleContent: (id, f) => prep('auc', `UPDATE articles SET
       title = @title, byline = @byline, siteName = @siteName, excerpt = @excerpt,
@@ -656,6 +729,13 @@ function open(dataDir) {
         favorite = COALESCE(@favorite, favorite),
         readParagraph = COALESCE(@readParagraph, readParagraph),
         ttsParagraph = COALESCE(@ttsParagraph, ttsParagraph),
+        -- Stamped when this patch archives the article, cleared when it
+        -- unarchives, and left alone by patches that touch neither (a reading
+        -- position write must not reorder the archive).
+        archivedAt = CASE
+          WHEN @archived IS NULL THEN archivedAt
+          WHEN @archived = 1 THEN @updatedAt
+          ELSE NULL END,
         updatedAt = @updatedAt WHERE id = @id`)
         .run({
           id, updatedAt,
@@ -667,7 +747,7 @@ function open(dataDir) {
     /** Archive all of a user's non-archived articles saved before [beforeMs].
      *  Returns how many were archived. */
     bulkArchiveBefore: (userId, beforeMs, now) =>
-      prep('bab', 'UPDATE articles SET archived = 1, updatedAt = @now WHERE userId = @userId AND archived = 0 AND savedAt < @before')
+      prep('bab', 'UPDATE articles SET archived = 1, archivedAt = @now, updatedAt = @now WHERE userId = @userId AND archived = 0 AND savedAt < @before')
         .run({ userId, before: beforeMs, now }).changes,
 
     deleteArticle: (id) => {
@@ -684,17 +764,34 @@ function open(dataDir) {
       const sortKey = ARTICLE_SORTS[filters.sort] ? filters.sort : 'newest';
       if (sortKey === 'random') args.seed = String(filters.seed || '');
       const order = ARTICLE_SORTS[sortKey];
-      let sql = `SELECT a.id, a.userId, a.url, a.domain, a.savedAt, a.archived, a.favorite, a.readParagraph,
+      const cols = `a.id, a.userId, a.url, a.domain, a.savedAt, a.archived, a.favorite, a.readParagraph,
           a.ttsParagraph, a.title, a.byline, a.siteName, a.excerpt, a.imageUrl, a.publishedAt, a.wordCount,
-          a.shareId, a.updatedAt
-        FROM articles a WHERE ${where.join(' AND ')} ORDER BY ${order}`;
+          a.shareId, a.source, a.updatedAt`;
       const lim = Number(filters.limit) || 0;
-      if (lim > 0) {
-        sql += ' LIMIT @limit OFFSET @offset';
-        args.limit = lim;
-        args.offset = Math.max(0, Number(filters.offset) || 0);
+      if (lim <= 0) {
+        // Unpaged (exports, sync): nothing to gain from the two-step below.
+        return sqlite.prepare(`SELECT ${cols} FROM articles a
+          WHERE ${where.join(' AND ')} ORDER BY ${order}`).all(args).map(rowArticle);
       }
-      return sqlite.prepare(sql).all(args).map(rowArticle);
+      args.limit = lim;
+      args.offset = Math.max(0, Number(filters.offset) || 0);
+      // Pick the page by id FIRST, then read the columns for just those rows.
+      //
+      // Every article stores html/textContent/sourceHtml inline, and most of the
+      // metadata this selects (updatedAt, wordCount, imageUrl, source, …) was
+      // added by ALTER TABLE, so it lives PAST those blobs in the record. Naming
+      // those columns in a query that matches thousands of rows made SQLite walk
+      // every match's overflow-page chain just to build a 50-row page — which is
+      // what made a search of a 24k-article library take tens of seconds. The
+      // inner query touches only id plus the sort key (savedAt and the FTS
+      // rowids are early/indexed), so the overflow reads drop from "every match"
+      // to "the fifty rows actually shown".
+      return sqlite.prepare(`WITH page AS (
+          SELECT a.id AS id FROM articles a
+          WHERE ${where.join(' AND ')} ORDER BY ${order} LIMIT @limit OFFSET @offset
+        )
+        SELECT ${cols} FROM articles a JOIN page ON page.id = a.id ORDER BY ${order}`)
+        .all(args).map(rowArticle);
     },
 
     /** Total count for the same filters (for pagination). */
@@ -711,12 +808,13 @@ function open(dataDir) {
     highlightCount: (userId) => prep('hc', 'SELECT COUNT(*) c FROM highlights WHERE userId = ?').get(userId).c,
     highlightsForArticle: (articleId) =>
       prep('hfa', 'SELECT * FROM highlights WHERE articleId = ? ORDER BY createdAt').all(articleId),
-    highlightsForUser: (userId) => prep('hfu', `SELECT h.*, a.title articleTitle, a.url articleUrl
+    highlightsForUser: (userId) => prep('hfu', `SELECT h.*, a.title articleTitle, a.url articleUrl,
+        a.source articleSource, a.byline articleByline
       FROM highlights h LEFT JOIN articles a ON a.id = h.articleId
       WHERE h.userId = ? ORDER BY h.createdAt DESC`).all(userId),
     /** Articles that have highlights, with counts — for the highlights page. */
-    highlightedArticles: (userId, { q = '', domain = '', domains = null, sort = 'recent', seed = '', limit = 0, offset = 0 } = {}) => {
-      const { where, args } = hlWhere(userId, q, domain, domains);
+    highlightedArticles: (userId, { q = '', domain = '', domains = null, sources = null, sort = 'recent', seed = '', limit = 0, offset = 0 } = {}) => {
+      const { where, args } = hlWhere(userId, q, domain, domains, sources);
       const sortKey = HL_SORTS[sort] ? sort : 'recent';
       if (sortKey === 'random') args.seed = String(seed || '');
       const order = HL_SORTS[sortKey];
@@ -740,8 +838,8 @@ function open(dataDir) {
           g.n AS n, g.lastHighlightAt AS lastHighlightAt
         FROM (${inner}) g JOIN articles a ON a.id = g.id ORDER BY ${order}`).all(args);
     },
-    highlightedArticlesCount: (userId, { q = '', domain = '', domains = null } = {}) => {
-      const { where, args } = hlWhere(userId, q, domain, domains);
+    highlightedArticlesCount: (userId, { q = '', domain = '', domains = null, sources = null } = {}) => {
+      const { where, args } = hlWhere(userId, q, domain, domains, sources);
       return sqlite.prepare(`SELECT COUNT(*) c FROM (SELECT a.id FROM highlights h
         JOIN articles a ON a.id = h.articleId WHERE ${where} GROUP BY a.id)`).get(args).c;
     },
@@ -832,8 +930,16 @@ function open(dataDir) {
       },
     },
     insertHighlight: (h) => prep('hi', `INSERT INTO highlights
-      (id, userId, clientId, articleId, text, note, paragraphIndex, createdAt)
-      VALUES (@id, @userId, @clientId, @articleId, @text, @note, @paragraphIndex, @createdAt)`).run(h),
+      (id, userId, clientId, articleId, text, note, paragraphIndex, location, createdAt)
+      VALUES (@id, @userId, @clientId, @articleId, @text, @note, @paragraphIndex, @location, @createdAt)`)
+      // Defaulted here rather than at every call site: only imports that have a
+      // source-side address (Kindle) set it.
+      .run({ location: null, ...h }),
+    // Re-importing a book refreshes each highlight's source address without
+    // touching the highlight itself (its id, note and anchoring all survive).
+    setHighlightLocation: (id, userId, location) =>
+      prep('hsl', 'UPDATE highlights SET location = @location WHERE id = @id AND userId = @userId')
+        .run({ id, userId, location: location || null }),
     deleteHighlight: (id, userId) =>
       prep('hd', 'DELETE FROM highlights WHERE id = ? AND userId = ?').run(id, userId),
   };

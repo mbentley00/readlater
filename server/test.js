@@ -194,11 +194,35 @@ function startMockTts(port) {
   return new Promise((resolve) => server.listen(port, '127.0.0.1', () => resolve(server)));
 }
 
+/** OpenAI-compatible /audio/transcriptions mock: any upload comes back as a
+ *  fixed verbose_json transcript with a silence gap between segments 2 and 3,
+ *  so paragraph splitting is observable. */
+function startMockStt(port) {
+  const server = http.createServer((req, res) => {
+    req.resume(); // drain the multipart body; its contents don't matter
+    req.on('end', () => {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        text: 'Welcome back to the show. Today we talk about timber towers. They sway, but they are safe.',
+        duration: 16.0,
+        segments: [
+          { start: 0, end: 3, text: ' Welcome back to the show.' },
+          { start: 3.2, end: 8, text: ' Today we talk about timber towers.' },
+          { start: 12, end: 16, text: ' They sway, but they are safe.' },
+        ],
+      }));
+    });
+  });
+  return new Promise((resolve) => server.listen(port, '127.0.0.1', () => resolve(server)));
+}
+
 async function main() {
   const MOCK_LLM_PORT = PORT + 1;
   const mockLlm = await startMockAnthropic(MOCK_LLM_PORT);
   const MOCK_TTS_PORT = PORT + 2;
   const mockTts = await startMockTts(MOCK_TTS_PORT);
+  const MOCK_STT_PORT = PORT + 4;
+  const mockStt = await startMockStt(MOCK_STT_PORT);
   const MOCK_PAGE_PORT = PORT + 3;
   const mockPage = await new Promise((resolve) => {
     const s = http.createServer((req, res) => {
@@ -241,6 +265,7 @@ async function main() {
       ANTHROPIC_BASE_URL: `http://127.0.0.1:${MOCK_LLM_PORT}`,
       TTS_API_KEY: 'tts-test-not-real',
       TTS_API_URL: `http://127.0.0.1:${MOCK_TTS_PORT}`,
+      TRANSCRIBE_API_URL: `http://127.0.0.1:${MOCK_STT_PORT}`,
     },
     stdio: ['ignore', 'pipe', 'inherit'],
   });
@@ -327,6 +352,72 @@ async function main() {
     // validation
     r = await api('POST', '/api/articles', { title: 'no url or html' });
     assert.strictEqual(r.status, 400);
+
+    // ---- "From phone": articles saved via the Android share sheet are listed
+    // on the web until the same URL is saved again from Firefox.
+    const webGet = async (p, cookie) => {
+      const wr = await fetch(BASE + p, { headers: { Cookie: cookie }, redirect: 'manual' });
+      return { status: wr.status, html: await wr.text(), setCookie: wr.headers.get('set-cookie') || '' };
+    };
+    r = await api('POST', '/api/articles', {
+      url: 'https://example.com/from-phone', title: 'Shared From The Phone',
+      html: '<p>Server-fetched version.</p>', source: 'android-share',
+    });
+    assert.strictEqual(r.status, 201);
+    assert.strictEqual(r.body.source, 'android-share');
+    const phoneId = r.body.id;
+    let w = await webGet('/?src=phone', aliceCookie);
+    assert.strictEqual(w.status, 200);
+    assert.ok(w.html.includes('Shared From The Phone'), 'phone-saved article listed under From phone');
+    assert.ok(!w.html.includes('A Great Story'), 'browser-saved article not in the phone list');
+    assert.ok(w.html.includes('href="https://example.com/from-phone" target="_blank"'), 'row links straight to the original');
+    assert.ok(w.html.includes('saved from phone'), 'row is tagged with its source');
+    r = await api('GET', '/api/views');
+    // the saved-view API accepts the same restriction
+    r = await api('POST', '/api/views', { name: 'Phone', filters: { sources: ['android-share'], includeArchived: true } });
+    assert.strictEqual(r.status, 201);
+    assert.deepStrictEqual(r.body.filters.sources, ['android-share']);
+    w = await webGet(`/?view=v:${r.body.id}`, aliceCookie);
+    assert.ok(w.html.includes('Shared From The Phone') && !w.html.includes('A Great Story'), 'saved view filters by source');
+    await api('DELETE', `/api/views/${r.body.id}`);
+    // re-saving from the Firefox extension flips the source, so it drops off the list
+    r = await api('POST', '/api/articles', {
+      url: 'https://example.com/from-phone', title: 'Shared From The Phone',
+      html: '<p>Rendered-in-Firefox version.</p>', source: 'browser-page',
+    });
+    assert.strictEqual(r.body.id, phoneId, 'same article');
+    assert.strictEqual(r.body.source, 'browser-page', 'source follows the latest full-page capture');
+    w = await webGet('/?src=phone', aliceCookie);
+    assert.ok(!w.html.includes('Shared From The Phone'), 'gone from the phone list after a Firefox re-save');
+    assert.ok(w.html.includes('Nothing saved from the phone'), 'empty-state copy for the phone list');
+
+    // ---- sticky sort: picking Random keeps its order (the seed) across visits
+    // until another sort is picked or the list is explicitly reshuffled.
+    w = await webGet('/?sort=random', aliceCookie);
+    let m = w.setCookie.match(/rl_sort=random:([a-z0-9]+)/);
+    assert.ok(m, 'choosing Random stores its seed');
+    const seed1 = m[1];
+    w = await webGet('/', aliceCookie + '; rl_sort=random:' + seed1);
+    assert.ok(w.html.includes('<option value="random" selected>'), 'plain / keeps the random sort');
+    // the seed rides in each row's ?from= back-link (URL-encoded), which is the only place it shows without a pager
+    assert.ok(w.html.includes('seed%3D' + seed1), 'and the same seed (same order)');
+    assert.strictEqual(w.setCookie.includes('rl_sort='), false, 'nothing to re-store');
+    w = await webGet('/?sort=random', aliceCookie + '; rl_sort=random:' + seed1);
+    assert.ok(w.html.includes('seed%3D' + seed1), 're-submitting the dropdown on Random does not reshuffle');
+    w = await webGet('/?sort=random&seed=abcd1234', aliceCookie + '; rl_sort=random:' + seed1);
+    assert.ok(w.setCookie.includes('rl_sort=random:abcd1234'), 'Shuffle (a new seed) replaces the stored order');
+    w = await webGet('/?sort=newest', aliceCookie + '; rl_sort=random:' + seed1);
+    assert.ok(w.setCookie.includes('rl_sort=newest'), 'picking another sort ends the random order');
+    w = await webGet('/highlights?sort=random', aliceCookie);
+    m = w.setCookie.match(/rl_hlsort=random:([a-z0-9]+)/);
+    assert.ok(m, 'random highlights store a seed too');
+    w = await webGet('/highlights?sort=random', aliceCookie + '; rl_hlsort=random:' + m[1]);
+    // (no highlighted rows yet, so no back-links to read the seed out of; the
+    // stored one being accepted shows as nothing to re-store)
+    assert.strictEqual(w.setCookie.includes('rl_hlsort='), false, 'random highlights keep their seed');
+    // leave the account as the tests below expect it
+    r = await api('DELETE', `/api/articles/${phoneId}`);
+    assert.strictEqual(r.status, 200);
 
     // list (metadata only, no html)
     r = await api('GET', '/api/articles');
@@ -511,9 +602,14 @@ async function main() {
 
     res = await fetch(BASE + `/read/${articleId}?from=%2F`, { headers: { Cookie: aliceCookie } });
     html = await res.text();
-    assert.strictEqual((html.match(/data-act="archive"/g) || []).length, 2,
-      'reader offers Archive at the top and at the end of the article');
+    assert.strictEqual((html.match(/data-act="archive"/g) || []).length, 3,
+      'reader offers Archive at the top, in the floating bar, and at the end of the article');
+    assert.ok(html.includes('id="float-bar"') && html.includes('id="fs-btn"'),
+      'reader has the scroll-up floating bar and a full-screen toggle');
     assert.ok(html.includes('end-actions'), 'reader has an end-of-article action bar');
+    // the button's data-act is a verb; the PATCH body must use the API's field
+    assert.ok(!/JSON\.stringify\(\{ \[act\]: (on|val) \}\)/.test(html),
+      'archive buttons send `archived`, not the raw data-act verb');
     assert.ok(html.includes('location.href = BACK_TO'), 'archiving returns to the list you came from');
 
     // reading-type controls, applied before first paint
@@ -525,7 +621,7 @@ async function main() {
     }
     assert.ok(html.indexOf('window.__type') < html.indexOf('<body'),
       'type settings are applied in <head>, before the article paints');
-    assert.ok(html.includes('wordRangeAt') && html.includes("addEventListener('touchend'"),
+    assert.ok(html.includes('blockAt(') && html.includes("addEventListener('touchend'"),
       'double-tap-to-highlight is wired up');
 
     // the public page gets none of it: no scripts, no controls, still no-store
@@ -799,6 +895,128 @@ async function main() {
     await api('DELETE', `/api/articles/${sniffedPdf.id}`);
     console.log('  PDF + EPUB import ✔');
 
+    // ---- audio (podcast) import: stub now, transcript fills in the background
+    const mp3Buf = Buffer.concat([Buffer.from('ID3'), Buffer.alloc(64)]);
+    res = await upload('/api/import/file?filename=My_Podcast_Episode.mp3', mp3Buf);
+    assert.strictEqual(res.status, 202, 'audio import accepted as a background job');
+    const audioArticle = await res.json();
+    assert.strictEqual(audioArticle.siteName, 'Podcast');
+    assert.ok(audioArticle.title.includes('My Podcast Episode'), 'title from filename, extension dropped');
+    let transcribed = null;
+    for (let i = 0; i < 50; i++) {
+      r = await api('GET', `/api/articles/${audioArticle.id}`);
+      if ((r.body.textContent || '').includes('timber towers')) { transcribed = r.body; break; }
+      await new Promise((res2) => setTimeout(res2, 100));
+    }
+    assert.ok(transcribed, 'transcript filled in in the background');
+    assert.ok(/<p>They sway/.test(transcribed.html), 'silence gap starts a new paragraph');
+    // re-uploading the same file returns the finished article, not a redo
+    res = await upload('/api/import/file?filename=My_Podcast_Episode.mp3', mp3Buf);
+    assert.strictEqual(res.status, 200, 'audio re-import is idempotent');
+    assert.strictEqual((await res.json()).id, audioArticle.id, 'audio re-import dedupes');
+    await api('DELETE', `/api/articles/${audioArticle.id}`);
+    console.log('  Audio (podcast) import + transcription ✔');
+
+    // ---- Kindle highlights import: book article + real highlight rows ------
+    const kindlePayload = {
+      title: 'The Timber Tower', byline: 'A. Builder', asin: 'b00testasin',
+      highlights: [
+        { text: 'The wood can handle these forces easily.',
+          before: ['Down on the deck you feel a gentle rocking.', 'Up on the mast it is amplified.'],
+          after: ['But the people on the higher floors might not.'],
+          location: '412' },
+        { text: 'They had to weigh the building down with concrete.' },
+      ],
+    };
+    r = await api('POST', '/api/import/kindle', kindlePayload);
+    assert.strictEqual(r.status, 201, 'kindle import accepted');
+    assert.strictEqual(r.body.article.siteName, 'Kindle');
+    assert.strictEqual(r.body.article.url, 'kindle:B00TESTASIN', 'article keyed by ASIN');
+    assert.strictEqual(r.body.article.archived, true, 'imported books arrive archived, not in the inbox');
+    assert.strictEqual(r.body.highlightsAdded, 2, 'both highlights inserted');
+    assert.ok(r.body.article.html.includes('gentle rocking'), 'context before kept');
+    assert.ok(r.body.article.html.includes('higher floors'), 'context after kept');
+    assert.ok(/<h2><a href="https:\/\/read\.amazon\.com[^>]*>Location 412 *<\/a><\/h2>/.test(r.body.article.html)
+      || r.body.article.html.includes('>Location 412</a></h2>'), 'location heading kept, linked to the book');
+    assert.ok(r.body.article.html.includes('<hr>'), 'sections separated');
+    const kindleId = r.body.article.id;
+    r = await api('GET', `/api/articles/${kindleId}/highlights`);
+    assert.strictEqual(r.body.highlights.length, 2, 'highlight rows created');
+    const kHl = r.body.highlights.find((h) => h.text.includes('wood can handle'));
+    assert.strictEqual(kHl.paragraphIndex, 2, 'paragraph index points at the highlight paragraph');
+    // traceability: the Kindle location rides on the highlight row itself
+    assert.strictEqual(kHl.location, '412', 'kindle location stored on the highlight');
+    assert.ok(r.body.highlights.some((h) => h.location === null),
+      'a highlight with no location stores null rather than failing');
+    // ...and the article body links that location back into the Kindle reader
+    const kArt = await api('GET', `/api/articles/${kindleId}`);
+    assert.ok(kArt.body.html.includes('read.amazon.com/?asin=B00TESTASIN&location=412'),
+      'location heading deep-links to the book at that location');
+
+    // the reader page shows the location and offers a way back to the book
+    let kHtml = await (await fetch(BASE + `/read/${kindleId}`, { headers: { Cookie: aliceCookie2 } })).text();
+    assert.ok(kHtml.includes('Location 412'), 'reader panel shows the Kindle location');
+    assert.ok(kHtml.includes('open in Kindle'), 'reader offers a link back to the book');
+
+    // markdown export carries book, author, location and the deep link
+    const kMd = await (await fetch(BASE + '/api/highlights/export.md', { headers: { Cookie: aliceCookie2 } })).text();
+    assert.ok(kMd.includes('## The Timber Tower'), 'export names the book');
+    assert.ok(kMd.includes('A. Builder'), 'export names the author');
+    assert.ok(kMd.includes('[Location 412](https://read.amazon.com/?asin=B00TESTASIN&location=412)'),
+      'export deep-links each highlight to its location in the book');
+
+    // filtering: the highlights page can be narrowed to Kindle imports
+    let hlPage = await (await fetch(BASE + '/highlights?src=kindle', { headers: { Cookie: aliceCookie2 } })).text();
+    assert.ok(hlPage.includes('The Timber Tower'), 'src=kindle keeps Kindle books');
+    hlPage = await (await fetch(BASE + '/highlights?src=email', { headers: { Cookie: aliceCookie2 } })).text();
+    assert.ok(!hlPage.includes('The Timber Tower'), 'another source filters the Kindle book out');
+    // and so can the article list
+    const listPage = await (await fetch(BASE + '/?src=kindle', { headers: { Cookie: aliceCookie2 } })).text();
+    assert.ok(listPage.includes('The Timber Tower'), 'article list filters to Kindle books');
+    // the API offers the same source filter (archived books are only reachable
+    // with includeArchived, which is how an imported book arrives)
+    r = await api('GET', '/api/articles?source=kindle&includeArchived=1');
+    assert.ok(r.body.articles.length >= 1, 'API filters articles by source');
+    assert.ok(r.body.articles.every((a) => a.source === 'kindle'), 'only kindle articles come back');
+    r = await api('GET', '/api/articles?source=email&includeArchived=1');
+    assert.ok(!r.body.articles.some((a) => a.url === 'kindle:B00TESTASIN'),
+      'a different source excludes the Kindle book');
+    // re-scrape: same payload again → no duplicate highlights, same article
+    // a book unarchived by hand must not be re-archived by the next scrape
+    await api('PATCH', `/api/articles/${kindleId}`, { archived: false });
+    r = await api('POST', '/api/import/kindle', kindlePayload);
+    assert.strictEqual(r.body.article.archived, false,
+      're-import leaves a hand-unarchived book alone');
+    await api('PATCH', `/api/articles/${kindleId}`, { archived: true });
+    r = await api('POST', '/api/import/kindle', kindlePayload);
+    assert.strictEqual(r.body.article.id, kindleId, 'kindle re-import dedupes by ASIN');
+    assert.strictEqual(r.body.highlightsAdded, 0, 're-import adds no duplicate highlights');
+    assert.strictEqual(r.body.highlightsRelocated, 0, 'nothing to relocate when locations already match');
+    // a book imported before locations existed picks them up on re-import,
+    // without duplicating or re-creating the highlight
+    const moved = { ...kindlePayload, highlights: kindlePayload.highlights.map(
+      (h, i) => (i === 0 ? { ...h, location: '999' } : h)) };
+    r = await api('POST', '/api/import/kindle', moved);
+    assert.strictEqual(r.body.highlightsAdded, 0, 'relocating adds no highlights');
+    assert.strictEqual(r.body.highlightsRelocated, 1, 're-import backfills a changed location');
+    r = await api('GET', `/api/articles/${kindleId}/highlights`);
+    assert.strictEqual(r.body.highlights.length, 2, 'still two highlights after relocating');
+    assert.ok(r.body.highlights.some((h) => h.location === '999'), 'new location stored on the same row');
+    r = await api('POST', '/api/import/kindle', { title: '', highlights: [] });
+    assert.strictEqual(r.status, 400, 'kindle import requires a title');
+    // a runaway highlight (mis-tap spanning >3 pages, ~5000+ chars) is dropped
+    r = await api('POST', '/api/import/kindle', {
+      title: 'Runaway Book', asin: 'B00RUNAWAY',
+      highlights: [{ text: 'A normal-sized highlight.' }, { text: 'z'.repeat(6000) }],
+    });
+    assert.strictEqual(r.status, 201, 'kindle import with a runaway highlight still lands');
+    assert.strictEqual(r.body.highlights, 1, 'runaway highlight dropped from the import');
+    assert.strictEqual(r.body.highlightsAdded, 1);
+    assert.ok(!r.body.article.html.includes('zzzz'), 'runaway text kept out of the article body');
+    await api('DELETE', `/api/articles/${r.body.article.id}`);
+    await api('DELETE', `/api/articles/${kindleId}`);
+    console.log('  Kindle highlights import ✔');
+
     // web highlight creation (what the reader's selection button does)
     r = await api('POST', `/api/articles/${articleId}/highlights`,
       { text: 'Then it got worse.', clientId: 'web-test-1' },
@@ -838,6 +1056,46 @@ async function main() {
       url: 'https://example.com/recent', title: 'Recent Article', html: '<p>New.</p>',
     });
     const recentId = r.body.id;
+    // ---- Archive ordering: by when it was ARCHIVED, not when it was saved ----
+    // An article saved long ago but archived just now must come first; the
+    // Archive list is a record of what you filed away, not of what you saved.
+    r = await api('POST', '/api/articles', {
+      url: 'https://example.com/old-save-new-archive', title: 'Old save, archived just now',
+      html: '<p>Body.</p>', savedAt: Date.now() - 200 * 24 * 60 * 60 * 1000,
+    });
+    const oldSaveId = r.body.id;
+    r = await api('POST', '/api/articles', {
+      url: 'https://example.com/new-save-old-archive', title: 'Recent save, archived long ago',
+      html: '<p>Body.</p>',
+    });
+    const newSaveId = r.body.id;
+    // archive the recently-saved one first, then the old one
+    await api('PATCH', `/api/articles/${newSaveId}`, { archived: true });
+    await new Promise((res2) => setTimeout(res2, 20));
+    await api('PATCH', `/api/articles/${oldSaveId}`, { archived: true });
+    r = await api('GET', `/api/articles/${oldSaveId}`);
+    assert.ok(r.body.archived, 'the old-saved article is archived');
+    let archiveHtml = await (await fetch(BASE + '/?view=archive&sort=newest', { headers: { Cookie: aliceCookie2 } })).text();
+    const posOld = archiveHtml.indexOf('Old save, archived just now');
+    const posNew = archiveHtml.indexOf('Recent save, archived long ago');
+    assert.ok(posOld >= 0 && posNew >= 0, 'both archived articles are on the archive page');
+    assert.ok(posOld < posNew, 'archive is ordered by when things were archived, not saved');
+    // the Inbox chip must not look selected while on the Archive tab
+    assert.ok(!/view-chip active[^>]*>\s*<a href="\/">Inbox/.test(archiveHtml),
+      'Inbox chip is not marked active on the Archive tab');
+    const inboxHtml = await (await fetch(BASE + '/', { headers: { Cookie: aliceCookie2 } })).text();
+    assert.ok(/view-chip active[^>]*>\s*<a href="\/">Inbox/.test(inboxHtml),
+      'Inbox chip IS marked active on the inbox');
+    // unarchiving clears the stamp so it cannot resurface in the archive order
+    await api('PATCH', `/api/articles/${oldSaveId}`, { archived: false });
+    r = await api('GET', `/api/articles/${oldSaveId}`);
+    assert.strictEqual(r.body.archived, false, 'unarchived again');
+    archiveHtml = await (await fetch(BASE + '/?view=archive&sort=newest', { headers: { Cookie: aliceCookie2 } })).text();
+    assert.ok(!archiveHtml.includes('Old save, archived just now'), 'unarchived article leaves the archive');
+    await api('DELETE', `/api/articles/${oldSaveId}`);
+    await api('DELETE', `/api/articles/${newSaveId}`);
+    console.log('  Archive ordering + view chips ✔');
+
     r = await api('POST', '/api/articles/bulk-archive', { olderThanDays: 365 });
     assert.ok(r.body.archived >= 1, 'bulk-archive archived at least the ancient article');
     r = await api('GET', `/api/articles/${ancientId}`);
@@ -1147,6 +1405,7 @@ async function main() {
   } finally {
     mockLlm.close();
     mockTts.close();
+    mockStt.close();
     mockPage.close();
     const exited = new Promise((resolve) => proc.on('exit', resolve));
     proc.kill('SIGTERM');

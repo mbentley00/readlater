@@ -191,6 +191,8 @@ mark.flash { animation: hlflash 1.6s ease; }
 .hl-panel { position:fixed; top:0; right:0; height:100%; width:min(360px,88vw); background:var(--card); border-left:1px solid var(--line); box-shadow:-4px 0 24px rgba(0,0,0,.15); overflow-y:auto; z-index:50; font-family:system-ui,sans-serif; }
 .hl-panel-head { display:flex; align-items:center; justify-content:space-between; padding:.9rem 1rem; border-bottom:1px solid var(--line); position:sticky; top:0; background:var(--card); }
 .hl-panel-body { padding:.5rem; }
+.hl-item-loc { font-size:.75rem; color:var(--muted); margin-top:.25rem; }
+.hl-item-loc a { color:var(--muted); }
 .hl-item { padding:.7rem .8rem; border-radius:8px; cursor:pointer; border:1px solid transparent; }
 .hl-item:hover { background:var(--bg); border-color:var(--line); }
 .hl-item-text { font-size:.9rem; line-height:1.45; }
@@ -229,6 +231,25 @@ form.search label { color:var(--muted); display:flex; gap:.3rem; align-items:cen
 form.saveview { display:flex; gap:.5rem; margin:.6rem 0 0; font-family:system-ui,sans-serif; }
 form.saveview input[name=name] { padding:.3rem .5rem; border:1px solid var(--line); border-radius:6px; background:var(--card); color:var(--fg); font-size:.85rem; }
 #hl-tip, #hl-menu { position:absolute; z-index:60; }
+/* touch-action: a double-tap on the text is "highlight this paragraph", never
+   "zoom". Declaring that in CSS lets the touch listeners stay passive, which
+   is what keeps scrolling smooth on iPad — a non-passive touch handler makes
+   WebKit wait for JS before it may scroll. */
+article.reader .content { touch-action:manipulation; }
+/* Floating bar: appears when you scroll UP mid-article (that's the "I want to
+   do something other than keep reading" gesture) or when text is selected,
+   so Back/Archive/Highlight are one tap away without returning to the top.
+   Below the highlights drawer (50) and the modals (80). */
+#float-bar { position:fixed; left:50%; bottom:calc(.9rem + env(safe-area-inset-bottom, 0px)); transform:translate(-50%, 140%); z-index:45; display:flex; align-items:center; gap:.3rem; padding:.35rem; border-radius:999px; background:var(--card); border:1px solid var(--line); box-shadow:0 6px 24px rgba(0,0,0,.18); font-family:system-ui,sans-serif; transition:transform .18s ease, opacity .18s ease; opacity:0; pointer-events:none; max-width:calc(100vw - 1.5rem); }
+#float-bar.show { transform:translate(-50%, 0); opacity:1; pointer-events:auto; }
+#float-bar .act, #float-bar a.act { font-size:.9rem; padding:.45rem .85rem; border-radius:999px; text-decoration:none; border:none; background:none; color:var(--fg); cursor:pointer; white-space:nowrap; }
+#float-bar .act.primary { background:var(--accent); color:var(--accent-fg); }
+#float-bar .sel-only { display:none; }
+#float-bar.has-sel .sel-only { display:inline-block; }
+/* Full-screen reading: just the text. The site header goes; the floating bar
+   is how you get Back/Archive/exit while it's on. */
+body.fullscreen header.site { display:none; }
+body.fullscreen article.reader header .actions, body.fullscreen article.reader header .meta { display:none; }
 #hl-tip button, #hl-menu button { background:var(--accent); color:var(--accent-fg); border:none; border-radius:6px; padding:.35rem .8rem; cursor:pointer; font:.85rem system-ui,sans-serif; box-shadow:0 2px 8px rgba(0,0,0,.25); }
 #hl-tip button + button, #hl-menu button + button { margin-left:.3rem; }
 mark[data-hl-id] { cursor:pointer; }
@@ -264,6 +285,7 @@ function page({ title, body, user, active = '', nonce = '', script = '', article
     <nav>
       <a href="/" class="${active === 'inbox' ? 'active' : ''}">Inbox</a>
       <a href="/?view=archive" class="${active === 'archive' ? 'active' : ''}">Archive</a>
+      <a href="/?src=phone" class="${active === 'phone' ? 'active' : ''}" title="Saved from the phone's share sheet and short enough (under ~5 minutes of text) that the fetch may have missed content — open the original and re-save from Firefox to be sure the right version was kept">From phone</a>
       <a href="/highlights" class="${active === 'highlights' ? 'active' : ''}">Highlights</a>
       <a href="/highlights?sort=random" class="${active === 'highlights-random' ? 'active' : ''}">Random Highlights</a>
     </nav>` : '<nav></nav>';
@@ -386,10 +408,37 @@ const STATE_LABELS = {
 };
 const cleanState = (v) => (STATES[v] ? v : 'any');
 
-/** Build searchArticles filters from web form params (q/domain/hl/len/state). */
+/**
+ * Where an article came from, grouped for the "Saved from" filter. The phone
+ * group is the one that earns its keep: the share sheet makes the server
+ * fetch the page, which can miss paywalled or JS-rendered content the Firefox
+ * extension (capturing the live DOM) would have got — so those are the saves
+ * worth opening in Firefox and saving again. A Firefox re-save moves the
+ * article out of the group (server: POST /api/articles updates `source`).
+ */
+const SOURCES = {
+  phone: { label: 'Saved from phone', sources: ['android-share'] },
+  firefox: { label: 'Saved from Firefox', sources: ['browser-page', 'browser-link', 'browser-highlight'] },
+  email: { label: 'Saved by email', sources: ['email'] },
+  import: { label: 'Imported PDF/EPUB', sources: ['pdf', 'epub'] },
+  kindle: { label: 'Kindle books', sources: ['kindle'] },
+  podcast: { label: 'Podcast transcripts', sources: ['audio'] },
+};
+const cleanSrc = (v) => (SOURCES[v] ? v : '');
+
+/** Build searchArticles filters from web form params (q/domain/hl/len/state/src). */
 function filtersFromParams(get, knownDomains = []) {
   const hl = get('hl') || (get('highlighted') === '1' ? '1' : '');
+  const src = cleanSrc(get('src'));
+  // The "From phone" list is a to-do list: shares whose server-side fetch may
+  // have missed content, worth re-saving from Firefox. A share that landed
+  // with more than ~5 minutes of reading (the app's "short" cutoff at 225 wpm)
+  // clearly imported fine, so it has no business on the list. Only when the
+  // user hasn't asked for a length bucket themselves, which must win.
+  const phoneCap = src === 'phone' && !LEN_BUCKETS[get('len') || ''] ? { maxWords: 1124 } : {};
   return {
+    sources: src ? SOURCES[src].sources : [],
+    ...phoneCap,
     q: (get('q') || '').trim(),
     ...domainFilter(get('domain'), knownDomains),
     highlighted: hl === '1',
@@ -418,6 +467,37 @@ const newSeed = () => crypto.randomBytes(4).toString('hex');
 const cleanSeed = (s) => (/^[a-z0-9]{1,16}$/i.test(s) ? s : '');
 
 /**
+ * The sort you picked sticks, in a cookie, until you pick another one. That
+ * is mostly about Random: the order is a hash of (seed, article id), so
+ * keeping the seed keeps the order — coming back to the list tomorrow shows
+ * the same pile in the same order, with anything saved since dropped in at a
+ * random spot rather than everything reshuffling. Only an explicit ?sort=
+ * (the dropdown) or ↻ Shuffle (a fresh seed) changes it. Cookie value is
+ * `<sort>` or `random:<seed>`; a bad or missing one means "newest".
+ */
+const PREF_COOKIE_AGE = 60 * 60 * 24 * 365;
+const prefCookie = (name, value) => `${name}=${value}; Path=/; SameSite=Lax; HttpOnly; Max-Age=${PREF_COOKIE_AGE}`;
+function parseCookies(req) {
+  const out = {};
+  for (const part of String((req && req.headers && req.headers.cookie) || '').split(';')) {
+    const i = part.indexOf('=');
+    if (i > 0) out[part.slice(0, i).trim()] = part.slice(i + 1).trim();
+  }
+  return out;
+}
+/** Resolve sort + seed from ?sort/?seed and the stored pref; returns the cookie to set, if any. */
+function stickySort(get, stored, sorts, dflt) {
+  const [storedSort, storedSeed] = String(stored || '').split(':');
+  const asked = get('sort');
+  const sort = sorts[asked] ? asked : (sorts[storedSort] ? storedSort : dflt);
+  const seed = sort === 'random'
+    ? (cleanSeed(get('seed')) || (storedSort === 'random' ? cleanSeed(storedSeed || '') : '') || newSeed())
+    : '';
+  const value = sort === 'random' ? `random:${seed}` : sort;
+  return { sort, seed, setCookie: value !== stored ? value : '' };
+}
+
+/**
  * Where "Back" should go, taken from ?from=. The list a reader was opened from
  * has to travel in the URL because the site sends `no-referrer`, so there is no
  * Referer to read it out of. This ends up in an href, so it must never be able
@@ -430,7 +510,7 @@ const safeBackTo = (v) => (/^\/(?![/\\])[^\s"'<>]*$/.test(v || '') ? v : '/');
 const readHref = (id, backTo) =>
   `/read/${id}${backTo && backTo !== '/' ? `?from=${encodeURIComponent(backTo)}` : ''}`;
 
-function listPage(ctx, user, view, url) {
+function listPage(ctx, user, view, url, prefs = {}) {
   const get = (k) => url.searchParams.get(k) || '';
   const savedViews = ctx.store.listViews(user.id);
   const savedView = view.startsWith('v:') ? ctx.store.getView(view.slice(2), user.id) : null;
@@ -440,16 +520,22 @@ function listPage(ctx, user, view, url) {
   const hl = get('hl') || (get('highlighted') === '1' ? '1' : '');
   const len = get('len');
   const state = cleanState(get('state'));
-  const sort = SORTS[get('sort')] ? get('sort') : 'newest';
-  // A fresh seed whenever Random is picked without one (i.e. straight from the
-  // sort dropdown); the pager then carries it so pages don't reshuffle.
-  const seed = sort === 'random' ? (cleanSeed(get('seed')) || newSeed()) : '';
+  const src = cleanSrc(get('src'));
+  // Sort (and the random order's seed) persist across visits — see stickySort.
+  const { sort, seed, setCookie } = stickySort(get, prefs.sort, SORTS, 'newest');
   // Narrowing the state counts as searching on its own: "show me everything
   // still in my inbox" is a useful query with no words in it.
-  const searching = Boolean(q || domain || hl || len || state !== 'any');
+  const searching = Boolean(q || domain || hl || len || src || state !== 'any');
   const pageNum = Math.max(1, parseInt(get('page'), 10) || 1);
   const offset = (pageNum - 1) * PAGE_SIZE;
-  const paging = { sort, seed, limit: PAGE_SIZE, offset };
+  // On the Archive tab "Newest" means most recently archived — the list is a
+  // record of what you have filed away, so ordering it by save date hid this
+  // morning's archiving behind whatever was saved most recently. Only for the
+  // plain tab: a search or a saved view keeps the ordinary savedAt meaning.
+  const archiveOrder = view === 'archive' && !savedView && !searching;
+  const effSort = archiveOrder && (sort === 'newest' || sort === 'oldest')
+    ? `${sort}Archived` : sort;
+  const paging = { sort: effSort, seed, limit: PAGE_SIZE, offset };
 
   // Every domain this user has saved from, with counts — both the picker's
   // options and the list a typed fragment is resolved against.
@@ -471,7 +557,9 @@ function listPage(ctx, user, view, url) {
     // filtersFromParams already resolved the state (defaulting to 'any', which
     // spans the archive) — don't override it here.
     baseFilters = filtersFromParams(get, knownDomains);
-    empty = 'No articles match this search.';
+    empty = src === 'phone' && !q && !domain && !hl && !len && state === 'any'
+      ? 'Nothing saved from the phone is waiting — everything shared from it has since been re-saved from Firefox (or deleted).'
+      : 'No articles match this search.';
   } else if (view === 'favorites') { baseFilters = { favoriteOnly: true, includeArchived: true }; empty = 'No favorites yet — star an article to keep it here.'; }
   else if (view === 'archive') { baseFilters = { archivedOnly: true }; empty = 'Nothing archived yet.'; }
   else { baseFilters = {}; empty = 'Inbox empty — save something with the Firefox extension, or check <a href="/settings">Settings</a> to connect it.'; }
@@ -495,7 +583,7 @@ function listPage(ctx, user, view, url) {
   // saved views as chips; × deletes (via the page script)
   const viewChips = savedViews.length ? `
 <div class="views">
-  <span class="view-chip ${!savedView && !searching ? 'active' : ''}">
+  <span class="view-chip ${!savedView && !searching && !['favorites', 'archive'].includes(view) ? 'active' : ''}">
     <a href="/">Inbox${chipCount(inboxCount)}</a>
   </span>${savedViews.map((v) => `
   <span class="view-chip ${savedView && savedView.id === v.id ? 'active' : ''}">
@@ -511,6 +599,7 @@ function listPage(ctx, user, view, url) {
   <input type="hidden" name="hl" value="${escapeHtml(hl)}">
   <input type="hidden" name="len" value="${escapeHtml(len)}">
   <input type="hidden" name="state" value="${escapeHtml(state)}">
+  <input type="hidden" name="src" value="${escapeHtml(src)}">
   <input name="name" placeholder="Name this view…" required maxlength="64">
   <button class="act" type="submit">Save as view</button>
 </form>` : '';
@@ -518,7 +607,7 @@ function listPage(ctx, user, view, url) {
   const viewParam = get('view');
   // Build a URL preserving the current view/filters/sort with overrides.
   const buildQs = (overrides) => {
-    const cur = { view: viewParam, q, domain, len, hl, state: state === 'any' ? '' : state, sort, seed, ...overrides };
+    const cur = { view: viewParam, q, domain, len, hl, src, state: state === 'any' ? '' : state, sort, seed, ...overrides };
     const p = new URLSearchParams();
     for (const [k, v] of Object.entries(cur)) if (v && !(k === 'sort' && v === 'newest')) p.set(k, String(v));
     const s = p.toString();
@@ -547,13 +636,17 @@ ${viewChips}
   <select name="state" title="Which articles to search">${Object.entries(STATE_LABELS)
     .map(([k, label]) => `<option value="${k}" ${k === state ? 'selected' : ''}>${label}</option>`).join('')}
   </select>
+  <select name="src" title="How the article was saved">
+    <option value="">Saved from: anywhere</option>${Object.entries(SOURCES)
+    .map(([k, { label }]) => `<option value="${k}" ${k === src ? 'selected' : ''}>${label}</option>`).join('')}
+  </select>
   <select name="sort">${sortOptions}</select>
   <button class="act" type="submit">Search</button>
   ${sort === 'random' ? `<a class="act" href="${buildQs({ seed: newSeed(), page: '' })}" title="Reshuffle">↻ Shuffle</a>` : ''}
   ${searching || savedView ? `<a class="back" href="${viewParam ? `/?view=${escapeHtml(viewParam)}` : '/'}">Clear</a>` : ''}
 </form>
 ${savedView ? `<div class="meta">${total.toLocaleString('en-US')} article${total === 1 ? '' : 's'} in “${escapeHtml(savedView.name)}”</div>` : ''}
-${searching && !savedView ? `<div class="meta">${total.toLocaleString('en-US')} result${total === 1 ? '' : 's'}${q ? ` for “${escapeHtml(q)}”` : ''}${domain ? ` from ${escapeHtml(domain)}` : ''}${state !== 'any' ? ` · ${escapeHtml(STATE_LABELS[state].toLowerCase())}` : ''}</div>${saveViewForm}` : ''}
+${searching && !savedView ? `<div class="meta">${total.toLocaleString('en-US')} result${total === 1 ? '' : 's'}${q ? ` for “${escapeHtml(q)}”` : ''}${domain ? ` from ${escapeHtml(domain)}` : ''}${state !== 'any' ? ` · ${escapeHtml(STATE_LABELS[state].toLowerCase())}` : ''}${src ? ` · ${escapeHtml(SOURCES[src].label.toLowerCase())}` : ''}${src === 'phone' && total ? ' — open the original and save it again from Firefox to be sure the right version was kept' : ''}</div>${saveViewForm}` : ''}
 ${!searching && !savedView ? `<div class="meta">${total.toLocaleString('en-US')} article${total === 1 ? '' : 's'}</div>` : ''}`;
 
   const pager = pageCount > 1 ? `<div class="pager">
@@ -577,13 +670,20 @@ ${!searching && !savedView ? `<div class="meta">${total.toLocaleString('en-US')}
       // So it's visible from the list which articles are readable by anyone
       // holding a link, without opening each one.
       a.shareId ? 'shared' : null,
+      a.source === 'android-share' ? 'saved from phone' : null,
     ].filter(Boolean).map(escapeHtml).join(' · ');
+    // The real page, in a new tab: from here you can re-save it with the
+    // extension. (The reader's "view original" shows the *captured* copy,
+    // which is the wrong thing when the point is to check the capture.)
+    const openOriginal = /^https?:\/\//i.test(a.url || '')
+      ? `${meta ? ' · ' : ''}<a href="${escapeHtml(a.url)}" target="_blank" rel="noopener noreferrer">open original ↗</a>`
+      : '';
     const thumb = a.imageUrl && /^https?:\/\//i.test(a.imageUrl)
       ? `<img class="thumb" src="${escapeHtml(a.imageUrl)}" alt="" loading="lazy" decoding="async" referrerpolicy="no-referrer">`
       : '';
     return `<li data-id="${a.id}">
       <div class="main"><a class="title" href="${escapeHtml(readHref(a.id, backTo))}">${escapeHtml(a.title)}</a>
-      <div class="meta">${meta}</div></div>
+      <div class="meta">${meta}${openOriginal}</div></div>
       ${thumb}
       <div class="actions">
         <button class="act fav" data-act="favorite" data-val="${a.favorite ? 'false' : 'true'}" title="Favorite">${a.favorite ? '★' : '☆'}</button>
@@ -596,11 +696,11 @@ ${!searching && !savedView ? `<div class="meta">${total.toLocaleString('en-US')}
   const isInbox = !searching && !savedView && view !== 'archive' && view !== 'favorites';
   const importBar = `
 <div class="importbar meta">
-  <button id="import-doc" class="act">Import PDF or EPUB…</button>
+  <button id="import-doc" class="act" title="PDF and EPUB import as-is; an audio file (a downloaded podcast episode) is transcribed into a readable article">Import PDF, EPUB or audio…</button>
   ${isInbox ? '<button id="bulk-archive" class="act">Archive older than 1 year</button>' : ''}
   <span id="import-status"></span>
   <input type="file" id="doc-file" multiple
-    accept=".pdf,.epub,application/pdf,application/epub+zip" style="display:none">
+    accept=".pdf,.epub,.mp3,.m4a,.aac,.ogg,.opus,.wav,.flac,application/pdf,application/epub+zip,audio/*" style="display:none">
 </div>`;
 
   const body = searchForm + importBar + (list.length
@@ -643,7 +743,9 @@ document.addEventListener('click', async (e) => {
     res = await fetch('/api/articles/' + id, {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ [act]: on }),
+      // data-act is the verb ('archive'); the API field is the state
+      // ('archived'). Sending the verb silently did nothing.
+      body: JSON.stringify({ [act === 'archive' ? 'archived' : act]: on }),
     });
   }
   // A failed request used to fall through to reload() and look exactly like
@@ -750,7 +852,7 @@ document.addEventListener('drop', (e) => {
   document.body.classList.remove('dropping');
   importDocs(e.dataTransfer.files);
 });`;
-  return { body, script };
+  return { body, script, setCookie };
 }
 
 /**
@@ -802,13 +904,23 @@ function readerPage(ctx, user, article, url) {
   // An uploaded PDF/EPUB has no original to go back to: nothing to re-fetch (the
   // url is a content hash) and no captured source (the file itself isn't kept).
   // The link would only ever reach "no original source was kept".
-  const hasOriginal = !/^(pdf|epub):/i.test(article.url || '');
+  // A Kindle-imported article is keyed kindle:<ASIN>; that ASIN is what makes
+  // each highlight traceable back to its spot in the actual book.
+  const kindleAsin = (/^kindle:(.+)$/i.exec(article.url || '') || [])[1] || '';
+  const kindleHref = (loc) => `https://read.amazon.com/?asin=${encodeURIComponent(kindleAsin.toUpperCase())}`
+    + (loc ? `&location=${encodeURIComponent(loc)}` : '');
+  const hasOriginal = !/^(pdf|epub|audio|kindle):/i.test(article.url || '');
   const originalLink = hasOriginal
     ? `${meta ? ' · ' : ''}<a href="/read/${escapeHtml(article.id)}/original" target="_blank" rel="noopener noreferrer">view original ↗</a>`
-    : '';
+    // An imported book has no captured source, but it does have a real place to
+    // go back to: the book itself, in the Kindle reader.
+    : (kindleAsin ? `${meta ? ' · ' : ''}<a href="${escapeHtml(kindleHref(''))}" target="_blank" rel="noopener noreferrer">open in Kindle ↗</a>` : '');
   const hlItems = hls.map((h) => `<div class="hl-item" data-hl-id="${h.id}">
       <div class="hl-item-text">${escapeHtml(h.text)}</div>
       ${h.note ? `<div class="note">${escapeHtml(h.note)}</div>` : ''}
+      ${h.location ? `<div class="hl-item-loc">${kindleAsin
+        ? `<a href="${escapeHtml(kindleHref(h.location))}" target="_blank" rel="noopener noreferrer">Location ${escapeHtml(h.location)} ↗</a>`
+        : `Location ${escapeHtml(h.location)}`}</div>` : ''}
       <div class="hl-item-actions"><button class="act del-hl" data-id="${h.id}">Delete</button></div>
     </div>`).join('\n');
 
@@ -822,9 +934,10 @@ function readerPage(ctx, user, article, url) {
       <button class="act" data-act="archive" data-val="${article.archived ? 'false' : 'true'}">${article.archived ? 'Unarchive' : 'Archive'}</button>
       <button class="act${article.shareId ? ' on' : ''}" id="share-btn" title="Public link to the parsed article — your highlights are not shown">${article.shareId ? 'Shared ✓' : 'Share'}</button>
       <button class="act" id="type-btn" title="Text size, spacing, width and typeface">Aa</button>
+      <button class="act" id="fs-btn" title="Full screen (f)">&#x26F6;</button>
       <button class="act" id="reparse-btn" title="Re-extract this article if it was parsed wrong">Fix parsing</button>
     </div>
-    <div class="meta">Select text — or double-tap a word — to highlight it.</div>
+    <div class="meta">Select text — or double-tap a paragraph — to highlight it. Scroll up mid-article for Back / Archive.</div>
   </header>
   <div class="content" id="content">${article.html}</div>
   <!-- Finishing an article is the moment you want to file it, and that moment
@@ -840,6 +953,13 @@ function readerPage(ctx, user, article, url) {
   <div class="hl-panel-body">${hls.length ? hlItems : '<div class="meta">No highlights yet. Select text in the article to add one.</div>'}</div>
 </aside>
 <div id="hl-tip" hidden><button id="hl-save">Highlight</button><button id="skip-save" title="Drop this text from articles saved in future">Never import</button></div>
+<div id="float-bar">
+  <a class="act" href="${escapeHtml(backTo)}">&larr; Back</a>
+  <button class="act" data-act="archive" data-val="${article.archived ? 'false' : 'true'}">${article.archived ? 'Unarchive' : 'Archive'}</button>
+  <button class="act" id="fs-float" title="Full screen">&#x26F6;</button>
+  <button class="act primary sel-only" id="hl-save-float">Highlight</button>
+  <button class="act sel-only" id="skip-save-float" title="Drop this text from articles saved in future">Never import</button>
+</div>
 <div id="hl-menu" hidden><button id="hl-menu-del">Delete highlight</button><button id="hl-menu-skip">Never import</button></div>
 <div id="type-dialog" hidden>
   <div class="skip-box">
@@ -1013,10 +1133,10 @@ function anchor(text, id) {
   wrapRange(segs, map[ci], map[ci + text.length - 1] + 1, id);
   return true;
 }
-for (const h of HLS) {
+function anchorHighlight(h) {
   const needle = canonNeedle(h.text);
-  if (!needle) continue;
-  if (anchor(needle, h.id)) continue;
+  if (!needle) return;
+  if (anchor(needle, h.id)) return;
   // The stored text still doesn't line up with the rendered article — some
   // markdown we don't know about, an edit upstream, a reparse. Rather than show
   // nothing at all, mark whichever sentences do line up. Short fragments are
@@ -1026,6 +1146,7 @@ for (const h of HLS) {
     if (c.length >= 24) anchor(c, h.id);
   }
 }
+for (const h of HLS) anchorHighlight(h);
 
 // Highlights side panel: toggle (pushes the page aside), jump-to, and delete.
 const panel = document.getElementById('hl-panel');
@@ -1040,9 +1161,6 @@ function flashMark(id) {
     setTimeout(() => mark.classList.remove('flash'), 1600);
   }
 }
-document.querySelectorAll('.hl-item').forEach((item) => {
-  item.addEventListener('click', (e) => { if (!e.target.closest('button')) flashMark(item.dataset.hlId); });
-});
 async function deleteHighlight(id) {
   // No confirm, no page reload: delete, then update the DOM in place.
   const res = await fetch('/api/highlights/' + id, { method: 'DELETE' });
@@ -1070,9 +1188,36 @@ function removeHighlightFromDom(id) {
   }
 }
 // Panel "Delete" buttons.
-document.querySelectorAll('.hl-item .del-hl').forEach((b) => {
-  b.addEventListener('click', (e) => { e.stopPropagation(); deleteHighlight(b.dataset.id); });
-});
+function wirePanelItem(item) {
+  item.addEventListener('click', (e) => { if (!e.target.closest('button')) flashMark(item.dataset.hlId); });
+  const b = item.querySelector('.del-hl');
+  if (b) b.addEventListener('click', (e) => { e.stopPropagation(); deleteHighlight(b.dataset.id); });
+}
+document.querySelectorAll('.hl-item').forEach(wirePanelItem);
+// A freshly saved highlight goes straight into the page: mark the text and add
+// a panel row. Reloading did the same thing with a flash of blank page, which
+// on a tablet read as "the app just refreshed on me".
+function addHighlightToDom(h) {
+  HLS.push({ id: h.id, text: h.text });
+  anchorHighlight(h);
+  const body = panel.querySelector('.hl-panel-body');
+  if (body) {
+    if (!body.querySelector('.hl-item')) body.innerHTML = '';
+    const item = document.createElement('div');
+    item.className = 'hl-item';
+    item.dataset.hlId = h.id;
+    const t = document.createElement('div'); t.className = 'hl-item-text'; t.textContent = h.text;
+    const acts = document.createElement('div'); acts.className = 'hl-item-actions';
+    const del = document.createElement('button'); del.className = 'act del-hl'; del.dataset.id = h.id; del.textContent = 'Delete';
+    acts.appendChild(del); item.appendChild(t); item.appendChild(acts);
+    body.appendChild(item);
+    wirePanelItem(item);
+  }
+  const n = panel.querySelectorAll('.hl-item').length;
+  document.getElementById('hl-toggle').textContent = 'Highlights (' + n + ')';
+  const head = panel.querySelector('.hl-panel-head strong');
+  if (head) head.textContent = 'Highlights (' + n + ')';
+}
 
 // Click a highlight inside the article -> a small Delete menu at that spot.
 const menu = document.getElementById('hl-menu');
@@ -1082,10 +1227,18 @@ root.addEventListener('click', (e) => {
   if (!mark) return;
   e.stopPropagation();
   menuHlId = mark.dataset.hlId;
-  const r = mark.getBoundingClientRect();
-  menu.style.top = (window.scrollY + r.bottom + 4) + 'px';
-  menu.style.left = (window.scrollX + r.left) + 'px';
+  // At the click itself, not under the mark: a highlight spanning a long
+  // paragraph has its bottom edge well off screen when you click near its top.
+  // Show first so the menu has a size to clamp with; keep it inside the
+  // viewport, flipping above the click when there's no room below.
   menu.hidden = false;
+  const mw = menu.offsetWidth, mh = menu.offsetHeight, pad = 8;
+  let x = e.clientX, y = e.clientY + 12;
+  if (y + mh > window.innerHeight - pad) y = e.clientY - mh - 12;
+  x = Math.max(pad, Math.min(x, window.innerWidth - mw - pad));
+  y = Math.max(pad, y);
+  menu.style.top = (window.scrollY + y) + 'px';
+  menu.style.left = (window.scrollX + x) + 'px';
 });
 document.addEventListener('click', (e) => {
   if (!e.target.closest('#hl-menu') && !e.target.closest('mark[data-hl-id]')) menu.hidden = true;
@@ -1107,7 +1260,8 @@ document.addEventListener('click', async (e) => {
   const res = await fetch('/api/articles/' + ARTICLE, {
     method: 'PATCH',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ [act]: val }),
+    // See the list page: the button's verb is not the API's field name.
+    body: JSON.stringify({ [act === 'archive' ? 'archived' : act]: val }),
   });
   // Silently reloading on failure looked exactly like "the button does nothing".
   if (!res.ok) {
@@ -1126,9 +1280,18 @@ document.addEventListener('click', async (e) => {
 
 // select text in the article -> floating Highlight button
 const tip = document.getElementById('hl-tip');
+const bar = document.getElementById('float-bar');
+// On a touch screen the browser draws its own callout (Copy / Look Up / ...)
+// right above a long-press selection — exactly where the tip would go. Two
+// stacked menus there was a mess on iPad Firefox, so on touch the Highlight
+// button lives in the floating bar at the bottom instead.
+const COARSE = !!(window.matchMedia && matchMedia('(pointer: coarse)').matches);
 document.addEventListener('selectionchange', () => {
   const sel = document.getSelection();
-  if (!sel || sel.isCollapsed || !root.contains(sel.anchorNode)) { tip.hidden = true; return; }
+  const has = !!(sel && !sel.isCollapsed && root.contains(sel.anchorNode));
+  bar.classList.toggle('has-sel', has);
+  updateBar();
+  if (!has || COARSE) { tip.hidden = true; return; }
   const rect = sel.getRangeAt(0).getBoundingClientRect();
   tip.style.top = (window.scrollY + rect.top - 42) + 'px';
   tip.style.left = (window.scrollX + rect.left) + 'px';
@@ -1145,57 +1308,98 @@ async function saveHighlight(text) {
   });
   if (!res.ok) { alert('Could not save that highlight (' + res.status + ').'); return; }
   tip.hidden = true;
-  location.reload();
+  const sel = document.getSelection();
+  if (sel) sel.removeAllRanges(); // also dismisses the browser's own callout
+  bar.classList.remove('has-sel'); updateBar();
+  let h = null;
+  try { h = await res.json(); } catch (e) {}
+  if (h && h.id) addHighlightToDom(h); else location.reload();
 }
 
 // The tip has to answer touch as well as mouse. 'mousedown' alone left the
 // button dead on a tablet in the common case, because the tap collapses the
 // selection before any synthesised mouse event arrives.
-for (const evt of ['mousedown', 'touchstart']) {
-  document.getElementById('hl-save').addEventListener(evt, async (e) => {
-    e.preventDefault(); // don't collapse the selection before we read it
-    await saveHighlight(String(document.getSelection()));
-  }, { passive: false });
+for (const id of ['hl-save', 'hl-save-float']) {
+  for (const evt of ['mousedown', 'touchstart']) {
+    document.getElementById(id).addEventListener(evt, async (e) => {
+      e.preventDefault(); // don't collapse the selection before we read it
+      await saveHighlight(String(document.getSelection()));
+    }, { passive: false });
+  }
 }
 
-// ---- double-tap / double-click a word to highlight it outright --------------
+// ---- floating bar: show on scroll-up (or with a selection), hide on scroll-down
+let lastScrollY = window.scrollY, scrolledUp = false;
+function updateBar() {
+  const fs = document.body.classList.contains('fullscreen');
+  const show = bar.classList.contains('has-sel') || (scrolledUp && (fs || window.scrollY > 300));
+  bar.classList.toggle('show', show);
+}
+window.addEventListener('scroll', () => {
+  const y = window.scrollY, dy = y - lastScrollY;
+  if (Math.abs(dy) > 6) { scrolledUp = dy < 0; lastScrollY = y; }
+  updateBar();
+}, { passive: true });
+
+// ---- full screen: hide everything but the text. Uses the real Fullscreen API
+// where there is one (desktop, iPadOS Safari); elsewhere the CSS-only version
+// still drops the chrome. Escape / the bar's button / 'f' toggle it back.
+function setFullscreen(on) {
+  document.body.classList.toggle('fullscreen', on);
+  const de = document.documentElement;
+  try {
+    if (on && !document.fullscreenElement && de.requestFullscreen) de.requestFullscreen().catch(() => {});
+    else if (on && !document.webkitFullscreenElement && de.webkitRequestFullscreen) de.webkitRequestFullscreen();
+    else if (!on && document.fullscreenElement && document.exitFullscreen) document.exitFullscreen().catch(() => {});
+    else if (!on && document.webkitFullscreenElement && document.webkitExitFullscreen) document.webkitExitFullscreen();
+  } catch (e) {}
+  updateBar();
+}
+const toggleFullscreen = () => setFullscreen(!document.body.classList.contains('fullscreen'));
+document.getElementById('fs-btn').addEventListener('click', toggleFullscreen);
+document.getElementById('fs-float').addEventListener('click', toggleFullscreen);
+for (const evt of ['fullscreenchange', 'webkitfullscreenchange']) {
+  document.addEventListener(evt, () => {
+    // Leaving via Escape or the system gesture: drop the class too.
+    if (!document.fullscreenElement && !document.webkitFullscreenElement) { document.body.classList.remove('fullscreen'); updateBar(); }
+  });
+}
+document.addEventListener('keydown', (e) => {
+  if (e.metaKey || e.ctrlKey || e.altKey) return;
+  const t = e.target;
+  if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.tagName === 'SELECT' || t.isContentEditable)) return;
+  if (e.key === 'f') toggleFullscreen();
+  else if (e.key === 'Escape' && document.body.classList.contains('fullscreen')) setFullscreen(false);
+});
+
+// ---- double-tap / double-click a paragraph to highlight all of it ----------
 // Select-then-aim-at-a-small-button is fiddly on a tablet, so make one gesture
-// do the whole thing. Uses whatever the browser already selected (a double-tap
-// selects a word natively in most engines) and falls back to working the word
-// out from the tap coordinates when the selection is empty.
-const WORD_EDGE = /[\\s.,;:!?()\\[\\]{}"'“”‘’—]/;
+// do the whole thing: the block you tapped (paragraph, list item, quote,
+// heading) becomes one highlight. The browser's own double-tap word selection
+// is ignored — and cleared, so its callout menu goes away too.
+const BLOCK = 'p, li, blockquote, h1, h2, h3, h4, h5, h6, pre, dd, dt, figcaption, td, th';
 
-function wordRangeAt(x, y) {
-  let range = null;
-  if (document.caretRangeFromPoint) {
-    range = document.caretRangeFromPoint(x, y);              // WebKit / Blink
-  } else if (document.caretPositionFromPoint) {
-    const p = document.caretPositionFromPoint(x, y);          // Gecko
-    if (p) { range = document.createRange(); range.setStart(p.offsetNode, p.offset); range.collapse(true); }
-  }
-  if (!range) return null;
-  const node = range.startContainer;
-  if (node.nodeType !== 3 || !root.contains(node)) return null;
-  const text = node.textContent;
-  let a = range.startOffset, b = range.startOffset;
-  while (a > 0 && !WORD_EDGE.test(text[a - 1])) a--;
-  while (b < text.length && !WORD_EDGE.test(text[b])) b++;
-  if (a >= b) return null;
-  const r = document.createRange();
-  r.setStart(node, a); r.setEnd(node, b);
-  return r;
+/** The block element under (x, y) inside the article, or null. */
+function blockAt(x, y) {
+  const el = document.elementFromPoint(x, y);
+  if (!el || !root.contains(el)) return null;
+  const block = el.closest(BLOCK);
+  return block && root.contains(block) ? block : null;
 }
 
+// dblclick and the hand-rolled touch double-tap both fire on some browsers
+// (iPad Firefox among them), which saved the same text twice. One gesture,
+// one highlight: anything within a second of the last one is the same tap.
+let lastHighlightAt = 0;
 async function highlightAt(x, y) {
+  const now = Date.now();
+  if (now - lastHighlightAt < 1000) return;
+  const block = blockAt(x, y);
+  if (!block) return;
+  lastHighlightAt = now;
   const sel = document.getSelection();
-  if (sel && !sel.isCollapsed && root.contains(sel.anchorNode)) {
-    await saveHighlight(String(sel));
-    return;
-  }
-  const r = wordRangeAt(x, y);
-  if (!r) return;
-  if (sel) { sel.removeAllRanges(); sel.addRange(r); }
-  await saveHighlight(String(r));
+  if (sel) sel.removeAllRanges();
+  await saveHighlight(block.textContent);
 }
 
 // Don't fire on an existing highlight — a double-tap there means "open the
@@ -1211,22 +1415,25 @@ root.addEventListener('dblclick', (e) => {
 });
 
 // Touch double-tap, detected by hand: iOS only fires dblclick sometimes, and
-// never when it decides the gesture was a zoom.
+// never when it decides the gesture was a zoom. The listener is passive —
+// zoom is already off via touch-action on the content, and a non-passive
+// touch handler on the whole article made every scroll wait for JS (that was
+// the "sluggish on iPad" feel). The window is generous because Firefox on
+// iPad spaces the two taps out more than Safari does.
 let lastTapAt = 0, lastTapX = 0, lastTapY = 0;
 root.addEventListener('touchend', (e) => {
   if (e.touches.length || !e.changedTouches.length) return;
   const t = e.changedTouches[0];
   const now = Date.now();
   const near = Math.abs(t.clientX - lastTapX) < 30 && Math.abs(t.clientY - lastTapY) < 30;
-  if (now - lastTapAt < 400 && near) {
+  if (now - lastTapAt < 500 && near) {
     lastTapAt = 0;
     if (onExistingMark(t.clientX, t.clientY)) return;
-    e.preventDefault(); // suppress the follow-up synthetic click / zoom
     highlightAt(t.clientX, t.clientY);
     return;
   }
   lastTapAt = now; lastTapX = t.clientX; lastTapY = t.clientY;
-}, { passive: false });
+}, { passive: true });
 
 // "Never import": open the phrase in an editable box, prefilled with whatever
 // text you pointed at, so you can trim it down to the bit that actually
@@ -1330,6 +1537,10 @@ function setShared(on) {
 shareBtn.addEventListener('click', async () => {
   shareMsg.textContent = '';
   shareUrl.value = '';
+  // Say what is happening. The link is minted server-side, and an empty box
+  // with no explanation looked exactly like a bug when that took a moment.
+  shareUrl.placeholder = 'Creating link…';
+  shareBtn.disabled = true;
   shareDlg.hidden = false;
   try {
     const res = await fetch('/api/articles/' + ARTICLE + '/share', { method: 'POST' });
@@ -1341,6 +1552,9 @@ shareBtn.addEventListener('click', async () => {
     shareUrl.select();
   } catch (err) {
     shareMsg.textContent = "Couldn't create a link: " + err.message;
+  } finally {
+    shareBtn.disabled = false;
+    shareUrl.placeholder = '';
   }
 });
 
@@ -1410,10 +1624,14 @@ reparseDlg.querySelectorAll('[data-hint]').forEach((btn) => {
 });
 
 // from a fresh selection
-document.getElementById('skip-save').addEventListener('mousedown', (e) => {
-  e.preventDefault(); // don't collapse the selection before we read it
-  openSkipDialog(String(document.getSelection()));
-});
+for (const id of ['skip-save', 'skip-save-float']) {
+  for (const evt of ['mousedown', 'touchstart']) {
+    document.getElementById(id).addEventListener(evt, (e) => {
+      e.preventDefault(); // don't collapse the selection before we read it
+      openSkipDialog(String(document.getSelection()));
+    }, { passive: false });
+  }
+}
 // from an existing highlight's menu
 document.getElementById('hl-menu-skip').addEventListener('click', (e) => {
   e.stopPropagation();
@@ -1447,26 +1665,29 @@ dlgOk.addEventListener('click', async () => {
   return { body, script, headerExtra, bodyClass: 'reading', headScript: TYPE_SCRIPT };
 }
 
-function highlightsPage(ctx, user, url) {
+function highlightsPage(ctx, user, url, prefs = {}) {
   // Grouped by article: which articles have highlights and how many. The
   // highlights themselves live on each article's reader page.
   const HL_SORTS = { recent: 'Recently highlighted', oldest: 'Oldest highlighted', most: 'Most highlights', title: 'Title A–Z', random: 'Random' };
   const get = (k) => (url && url.searchParams.get(k)) || '';
   const q = get('q').trim();
   const domain = get('domain').trim();
-  const sort = HL_SORTS[get('sort')] ? get('sort') : 'recent';
-  const seed = sort === 'random' ? (cleanSeed(get('seed')) || newSeed()) : '';
+  const src = cleanSrc(get('src'));
+  // Only the random seed sticks here (the nav links name each sort outright):
+  // the same shuffled pile on every visit until ↻ Shuffle or another sort.
+  const { sort, seed, setCookie } = stickySort(get, prefs.hlSort, HL_SORTS, 'recent');
   const pageNum = Math.max(1, parseInt(get('page'), 10) || 1);
   const offset = (pageNum - 1) * PAGE_SIZE;
 
   const domainRows = ctx.store.highlightedDomains(user.id);
   const dom = domainFilter(domain, domainRows.map((r) => r.domain));
-  const total = ctx.store.highlightedArticlesCount(user.id, { q, ...dom });
-  const arts = ctx.store.highlightedArticles(user.id, { q, ...dom, sort, seed, limit: PAGE_SIZE, offset });
+  const sources = src ? SOURCES[src].sources : null;
+  const total = ctx.store.highlightedArticlesCount(user.id, { q, ...dom, sources });
+  const arts = ctx.store.highlightedArticles(user.id, { q, ...dom, sources, sort, seed, limit: PAGE_SIZE, offset });
   const pageCount = Math.max(1, Math.ceil(total / PAGE_SIZE));
   const buildQs = (o) => {
     const p = new URLSearchParams();
-    for (const [k, v] of Object.entries({ q, domain, sort, seed, ...o })) if (v && !(k === 'sort' && v === 'recent')) p.set(k, String(v));
+    for (const [k, v] of Object.entries({ q, domain, src, sort, seed, ...o })) if (v && !(k === 'sort' && v === 'recent')) p.set(k, String(v));
     const s = p.toString();
     return s ? `/highlights?${s}` : '/highlights';
   };
@@ -1493,22 +1714,26 @@ function highlightsPage(ctx, user, url) {
   ${pageNum < pageCount ? `<a class="act" href="${buildQs({ page: pageNum + 1 })}">Next →</a>` : '<span class="act disabled">Next →</span>'}
 </div>` : '';
 
+  const srcOpts = ['<option value="">Any source</option>']
+    .concat(Object.entries(SOURCES).map(([k, v]) =>
+      `<option value="${k}" ${k === src ? 'selected' : ''}>${escapeHtml(v.label)}</option>`)).join('');
   const searchForm = `<form class="search" method="get" action="/highlights">
   <input type="search" name="q" value="${escapeHtml(q)}" placeholder="Search highlight text, titles…">
   ${domainPicker(domainRows, domain)}
+  <select name="src" title="Where the highlighted article came from">${srcOpts}</select>
   <select name="sort">${sortOpts}</select>
   <button class="act" type="submit">Apply</button>
   ${sort === 'random' ? `<a class="act" href="${buildQs({ seed: newSeed(), page: '' })}" title="Reshuffle">↻ Shuffle</a>` : ''}
-  ${q || domain || sort !== 'recent' ? '<a class="back" href="/highlights">Clear</a>' : ''}
+  ${q || domain || src || sort !== 'recent' ? '<a class="back" href="/highlights">Clear</a>' : ''}
 </form>`;
 
   const body = `<h1>Highlights</h1>
 ${searchForm}
 ${total ? `<div class="meta">${total.toLocaleString('en-US')} article${total === 1 ? '' : 's'} with highlights — open one to read them in place.</div>
 <ul class="articles">${items}</ul>${pager}`
-    : `<div class="empty">${q || domain ? 'No highlighted articles match those filters.' : 'No highlights yet — long-press a paragraph in the Android app, or select text in the reader.'}</div>`}
+    : `<div class="empty">${q || domain || src ? 'No highlighted articles match those filters.' : 'No highlights yet — long-press a paragraph in the Android app, or select text in the reader.'}</div>`}
 <p class="meta"><a href="/api/highlights/export.md">Export all as Markdown</a></p>`;
-  return { body, script: '' };
+  return { body, script: '', setCookie };
 }
 
 function settingsPage(ctx, user, url, req) {
@@ -1780,17 +2005,29 @@ async function handle(ctx, req, res, url) {
     return fs.createReadStream(apkTarget.file).pipe(res);
   }
 
+  // Sort preferences (see stickySort) ride in cookies; a page that changes
+  // one hands back the Set-Cookie to send with it.
+  const cookies = parseCookies(req);
+  const prefs = { sort: cookies.rl_sort || '', hlSort: cookies.rl_hlsort || '' };
+  const extraHeaders = {};
+
   let made = null, title = 'ReadLater', active = 'inbox';
   if (route === 'GET /') {
     const view = url.searchParams.get('view') || 'inbox';
-    made = listPage(ctx, user, view, url);
-    active = ['favorites', 'archive'].includes(view) ? view : 'inbox';
-    title = active[0].toUpperCase() + active.slice(1);
+    made = listPage(ctx, user, view, url, prefs);
+    if (made.setCookie) extraHeaders['Set-Cookie'] = prefCookie('rl_sort', made.setCookie);
+    if (url.searchParams.get('src') === 'phone' && !url.searchParams.get('q')) {
+      active = 'phone'; title = 'From phone';
+    } else {
+      active = ['favorites', 'archive'].includes(view) ? view : 'inbox';
+      title = active[0].toUpperCase() + active.slice(1);
+    }
   } else if (route.startsWith('GET /read/') && parts.length === 2) {
     const article = ctx.store.getArticle(parts[1], user.id);
     if (article) { made = readerPage(ctx, user, article, url); title = article.title; active = ''; }
   } else if (route === 'GET /highlights') {
-    made = highlightsPage(ctx, user, url);
+    made = highlightsPage(ctx, user, url, prefs);
+    if (made.setCookie) extraHeaders['Set-Cookie'] = prefCookie('rl_hlsort', made.setCookie);
     // The nav has a link for each: /highlights and the shuffled view of it.
     const random = url.searchParams.get('sort') === 'random';
     title = random ? 'Random highlights' : 'Highlights';
@@ -1810,7 +2047,7 @@ async function handle(ctx, req, res, url) {
     // Only the article list: /highlights has its own q meaning something else,
     // and echoing that into an article-search box would be a lie.
     searchQ: route === 'GET /' ? (url.searchParams.get('q') || '') : '',
-  }), { nonce });
+  }), { nonce, headers: extraHeaders });
 }
 
 module.exports = { handle };

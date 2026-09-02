@@ -31,6 +31,7 @@ const llm = require('./llm');
 const { extractReadable } = require('./extract');
 const pdf = require('./pdf');
 const epub = require('./epub');
+const transcribe = require('./transcribe');
 const tts = require('./tts');
 const inbound = require('./inbound');
 const skip = require('./skip');
@@ -45,11 +46,14 @@ const SOURCE_CAP = 3 * 1024 * 1024;
 // A book is a few MB; this leaves room for one that is unusually image-heavy
 // without letting an upload take the process down.
 const IMPORT_MAX_BYTES = 50 * 1024 * 1024;
+// Audio gets more room: a two-hour podcast at 96 kbps is ~85 MB. Kept in
+// memory only long enough to hash and spool to disk for the transcriber.
+const AUDIO_IMPORT_MAX_BYTES = 100 * 1024 * 1024;
 
 /**
  * Which document format an uploaded buffer holds, from its bytes rather than
  * its filename or Content-Type — the uploader shouldn't have to be right about
- * either. Returns 'pdf', 'epub', or null.
+ * either. Returns 'pdf', 'epub', 'audio', or null.
  */
 function sniffDocument(buf) {
   if (buf.length >= 5 && buf.subarray(0, 5).toString('latin1') === '%PDF-') return 'pdf';
@@ -59,6 +63,16 @@ function sniffDocument(buf) {
   if (buf.length >= 4 && buf.readUInt32LE(0) === 0x04034b50) {
     if (buf.subarray(30, 60).toString('latin1').startsWith('mimetypeapplication/epub+zip')) return 'epub';
     if (buf.includes('META-INF/container.xml')) return 'epub';
+  }
+  // Audio (a downloaded podcast episode shared out of the player): MP3 by ID3
+  // tag or bare frame sync, M4A/AAC by the ftyp box, plus Ogg / WAV / FLAC.
+  if (buf.length >= 12) {
+    const tag3 = buf.toString('latin1', 0, 3);
+    const tag4 = buf.toString('latin1', 0, 4);
+    if (tag3 === 'ID3' || tag4 === 'OggS' || tag4 === 'fLaC') return 'audio';
+    if (tag4 === 'RIFF' && buf.toString('latin1', 8, 12) === 'WAVE') return 'audio';
+    if (buf.toString('latin1', 4, 8) === 'ftyp') return 'audio';
+    if (buf[0] === 0xff && (buf[1] & 0xe0) === 0xe0 && (buf[1] & 0x06) !== 0) return 'audio'; // raw MPEG audio frame
   }
   return null;
 }
@@ -169,6 +183,74 @@ const ttsPending = [];
 const ttsFailedAt = new Map(); // articleId -> ms of last failure (backoff)
 const TTS_FAIL_COOLDOWN = 5 * 60 * 1000;
 let ttsRunning = false;
+
+// ------------------------------------------------------- audio transcription
+// Uploaded podcast audio → transcript article. Same single-flight queue shape
+// as TTS: the upload responds immediately with a "Transcribing…" stub, one
+// transcription runs at a time, and the article is filled in in place. The
+// audio itself is spooled to disk while queued (an episode is tens of MB; the
+// 512 MB machine should not hold several in memory) and deleted after.
+const sttQueued = new Set();
+const sttPending = [];
+let sttRunning = false;
+const sttSpoolFile = (articleId) => path.join(DATA_DIR, `stt-upload-${articleId}`);
+// Leftover spools from a crash mid-transcription: their jobs died with the
+// process, so the files are just disk usage now.
+for (const f of fs.readdirSync(DATA_DIR)) {
+  if (f.startsWith('stt-upload-')) { try { fs.unlinkSync(path.join(DATA_DIR, f)); } catch {} }
+}
+
+function enqueueTranscription(articleId, userId, buf, filename) {
+  if (sttQueued.has(articleId)) return;
+  sttQueued.add(articleId);
+  fs.writeFileSync(sttSpoolFile(articleId), buf);
+  sttPending.push({ articleId, userId, filename });
+  pumpStt();
+}
+
+async function pumpStt() {
+  if (sttRunning) return;
+  sttRunning = true;
+  while (sttPending.length) {
+    const job = sttPending.shift();
+    const spool = sttSpoolFile(job.articleId);
+    try {
+      const a = store.getArticle(job.articleId, job.userId);
+      if (a) {
+        const r = await transcribe.transcribeToArticle(fs.readFileSync(spool), job.filename);
+        store.updateArticleContent(a.id, withSkipRules(job.userId, {
+          title: a.title,
+          byline: a.byline,
+          siteName: a.siteName,
+          excerpt: sanitizeString(r.textContent.replace(/\s+/g, ' ').trim(), 300),
+          html: r.html,
+          textContent: r.textContent.slice(0, 500000),
+          updatedAt: Date.now(),
+        }));
+        console.log(`article transcribed [audio] ${job.filename}: ${r.textContent.length} chars`
+          + (r.durationS ? ` from ${Math.round(r.durationS / 60)} min` : ''));
+      }
+    } catch (e) {
+      console.error(`transcription failed for ${job.articleId}: ${e.message}`);
+      const a = store.getArticle(job.articleId, job.userId);
+      // Put the failure where the user will look for the transcript — but
+      // never overwrite a transcript that already exists.
+      if (a && !(a.textContent || '').trim()) {
+        const msg = String(e.message || 'unknown error').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+        store.updateArticleContent(a.id, {
+          title: a.title, byline: a.byline, siteName: a.siteName,
+          excerpt: 'Transcription failed',
+          html: `<p>Transcription failed: ${msg}</p><p>Upload the file again to retry.</p>`,
+          textContent: '', updatedAt: Date.now(),
+        });
+      }
+    } finally {
+      sttQueued.delete(job.articleId);
+      try { fs.unlinkSync(spool); } catch {}
+    }
+  }
+  sttRunning = false;
+}
 
 // Whether to pre-generate the Kokoro (server) voice automatically when an
 // article is saved/updated. Pre-generating on every save is the biggest
@@ -962,6 +1044,11 @@ const server = http.createServer(async (req, res) => {
           minWords: num('minWords'),
           maxWords: num('maxWords'),
           minHighlights: num('minHighlights'),
+          // Same filter the web UI's "Saved from" offers: how the article was
+          // saved ('kindle', 'android-share', 'email', …). Comma-separated.
+          sources: (url.searchParams.get('source') || '')
+            .split(',').map((x) => x.trim()).filter(Boolean),
+          limit: num('limit'),
         });
         return json(res, 200, { articles: list.map(pubArticleMeta) });
       }
@@ -1007,6 +1094,16 @@ const server = http.createServer(async (req, res) => {
               store.patchArticle(a.id, { archived: false, updatedAt: now });
             }
             a = { ...a, source: src, archived: b.archived === true };
+          } else {
+            // A full-page capture supersedes however this URL was saved
+            // before. The case that matters: something shared from the phone
+            // (a server-side fetch) re-saved from Firefox to get the rendered
+            // version — it now leaves the web UI's "From phone" list.
+            const src = sanitizeString(b.source, 40);
+            if (src && src !== a.source) {
+              store.setArticleSource(a.id, src);
+              a = { ...a, source: src };
+            }
           }
         } else {
           a = {
@@ -1253,7 +1350,9 @@ const server = http.createServer(async (req, res) => {
     // link you already sent). DELETE revokes it: the slug is cleared, so every
     // copy of that link dies at once and re-sharing gives a different one.
     if (parts[1] === 'articles' && parts.length === 4 && parts[3] === 'share') {
-      const a = store.getArticle(parts[2], user.id);
+      // Deliberately NOT getArticle: this endpoint needs one short column, and
+      // getArticle drags the article's html and textContent along with it.
+      const a = store.articleShareId(parts[2], user.id);
       if (!a) return json(res, 404, { error: 'article not found' });
       const link = (shareId) => ({ shareId, url: `${originOf(req)}/p/${shareId}` });
       if (req.method === 'GET') {
@@ -1264,11 +1363,11 @@ const server = http.createServer(async (req, res) => {
         // 18 bytes ≈ 144 bits of base64url: not enumerable, and short enough
         // to paste into a message without wrapping.
         const shareId = crypto.randomBytes(18).toString('base64url');
-        store.setArticleShareId(a.id, user.id, shareId);
+        store.setArticleShareId(parts[2], user.id, shareId);
         return json(res, 201, link(shareId));
       }
       if (req.method === 'DELETE') {
-        store.setArticleShareId(a.id, user.id, null);
+        store.setArticleShareId(parts[2], user.id, null);
         return json(res, 200, { ok: true, shareId: null });
       }
     }
@@ -1303,20 +1402,51 @@ const server = http.createServer(async (req, res) => {
       }
     }
 
-    // ---- document import: a raw PDF or EPUB body, parsed into an article.
+    // ---- document import: a raw PDF, EPUB or audio body → an article.
     // /file sniffs the format from the bytes (what the web uploader posts);
-    // /pdf and /epub name it explicitly.
+    // /pdf, /epub and /audio name it explicitly. Audio (a podcast episode
+    // shared out of the player) is transcribed in the background: the response
+    // is a "Transcribing…" stub that fills in when the transcript lands.
     if (req.method === 'POST' && parts[1] === 'import' && parts.length === 3
-        && ['pdf', 'epub', 'file'].includes(parts[2])) {
-      const buf = await readBodyBuffer(req, IMPORT_MAX_BYTES);
+        && ['pdf', 'epub', 'file', 'audio'].includes(parts[2])) {
+      const buf = await readBodyBuffer(req,
+        parts[2] === 'pdf' || parts[2] === 'epub' ? IMPORT_MAX_BYTES : AUDIO_IMPORT_MAX_BYTES);
       const kind = sniffDocument(buf);
       if (!kind || (parts[2] !== 'file' && kind !== parts[2])) {
         return json(res, 400, {
-          error: parts[2] === 'file' ? 'not a PDF or EPUB file' : `not a ${parts[2].toUpperCase()} file`,
+          error: parts[2] === 'file' ? 'not a PDF, EPUB or audio file' : `not a ${parts[2].toUpperCase()} file`,
         });
       }
-      const fallbackName = `document.${kind}`;
+      const fallbackName = kind === 'audio' ? 'audio.mp3' : `document.${kind}`;
       const filename = sanitizeString(url.searchParams.get('filename'), 200) || fallbackName;
+      if (kind === 'audio') {
+        if (!transcribe.enabled()) {
+          return json(res, 503, { error: 'transcription is not configured (set TRANSCRIBE_API_KEY or TTS_API_KEY)' });
+        }
+        // dedupe on content hash, like the other imports
+        const artUrl = 'audio:' + crypto.createHash('sha256').update(buf).digest('hex').slice(0, 24);
+        const now = Date.now();
+        let a = store.articleByUrl(user.id, artUrl);
+        if (a && (a.textContent || '').trim()) {
+          return json(res, 200, pubArticle(a)); // already transcribed — don't redo it
+        }
+        if (!a) {
+          a = {
+            id: newId(), userId: user.id, url: artUrl,
+            savedAt: now, archived: false, favorite: false, readParagraph: 0,
+            source: 'audio',
+            title: filename.replace(/\.[a-z0-9]{1,5}$/i, '').replace(/[_]+/g, ' ').trim() || 'Podcast episode',
+            byline: null, siteName: 'Podcast',
+            excerpt: 'Transcribing…',
+            html: '<p>Transcribing… A long episode can take a few minutes; the text appears here when it is done.</p>',
+            textContent: '', updatedAt: now,
+          };
+          store.insertArticle(a);
+          console.log(`article saved [audio] ${filename} (${buf.length} bytes, transcribing)`);
+        }
+        enqueueTranscription(a.id, user.id, buf, filename);
+        return json(res, 202, pubArticle(store.getArticle(a.id, user.id)));
+      }
       let parsed;
       try {
         parsed = kind === 'pdf'
@@ -1358,6 +1488,132 @@ const server = http.createServer(async (req, res) => {
         console.log(`article saved [${kind}] ${filename}`);
       }
       return json(res, 201, pubArticle(store.getArticle(a.id, user.id)));
+    }
+
+    // ---- Kindle highlights import: one article per book, assembled from the
+    // highlights themselves plus whatever surrounding context the scraper
+    // could capture (up to two paragraphs either side). The highlight text is
+    // also inserted as real highlight rows, so the reader marks it and the
+    // highlights pages include it. Posted by browser automation driving
+    // read.amazon.com/notebook (see .claude/skills/kindle-import).
+    if (req.method === 'POST' && parts[1] === 'import' && parts.length === 3 && parts[2] === 'kindle') {
+      const b = parseBody(await readBody(req), req.headers['content-type']);
+      const title = sanitizeString(b.title, 300);
+      if (!title) return json(res, 400, { error: 'title is required' });
+      const byline = sanitizeString(b.byline, 200) || null;
+      const asin = sanitizeString(b.asin, 20);
+      const ctx = (v) => (Array.isArray(v) ? v : [])
+        .map((p) => sanitizeString(p, 5000)).filter(Boolean);
+      // A runaway highlight — a mis-tap that swept up pages of text — is
+      // noise, not a highlight. Anything longer than ~3 book pages is dropped
+      // at import, and purged from a book on re-import.
+      const KINDLE_MAX_HIGHLIGHT_CHARS = 5000; // ~250-300 words/page * 3
+      const hlsIn = (Array.isArray(b.highlights) ? b.highlights : []).map((h) => ({
+        text: sanitizeString(h && h.text, 20000),
+        before: ctx(h && h.before).slice(-2), // at most two paragraphs either side
+        after: ctx(h && h.after).slice(0, 2),
+        location: sanitizeString(h && h.location, 60),
+        note: sanitizeString(h && h.note, 20000),
+      })).filter((h) => h.text && h.text.length <= KINDLE_MAX_HIGHLIGHT_CHARS);
+      if (!hlsIn.length) return json(res, 400, { error: 'highlights[] with text is required' });
+
+      // One stable article per book: ASIN when the scraper found one,
+      // otherwise a hash of title+author.
+      const artUrl = 'kindle:' + (asin ? asin.toUpperCase()
+        : crypto.createHash('sha256').update(`${title}|${byline || ''}`).digest('hex').slice(0, 24));
+
+      // Build the body. Each highlight becomes a section: context before, the
+      // highlight paragraph (marked at view time by the normal anchoring),
+      // context after. Track each highlight's paragraph index for the app.
+      // Skip rules deliberately do NOT apply — dropping a context paragraph
+      // would break nothing, but dropping a highlight paragraph would orphan
+      // its highlight row.
+      const sections = [];
+      const paraTexts = [];
+      let paraCount = 0;
+      const hlRows = [];
+      for (const h of hlsIn) {
+        const parts2 = [];
+        // Link the heading back to the exact spot in the Kindle reader when we
+        // know the ASIN — this is the whole point of keeping the location.
+        if (h.location) {
+          const loc = escapeText(h.location);
+          parts2.push(asin
+            ? `<h2><a href="https://read.amazon.com/?asin=${encodeURIComponent(asin.toUpperCase())}&location=${encodeURIComponent(h.location)}" target="_blank" rel="noopener noreferrer">Location ${loc}</a></h2>`
+            : `<h2>Location ${loc}</h2>`);
+        }
+        for (const p of h.before) { parts2.push(`<p>${escapeText(p)}</p>`); paraTexts.push(p); paraCount++; }
+        parts2.push(`<p>${escapeText(h.text)}</p>`); paraTexts.push(h.text);
+        hlRows.push({ text: h.text, note: h.note, location: h.location, paragraphIndex: paraCount }); paraCount++;
+        for (const p of h.after) { parts2.push(`<p>${escapeText(p)}</p>`); paraTexts.push(p); paraCount++; }
+        sections.push(parts2.join('\n'));
+      }
+      const textContent = paraTexts.join(' ');
+      const now = Date.now();
+      const fields = {
+        title, byline, siteName: 'Kindle',
+        excerpt: sanitizeString(hlsIn[0].text.replace(/\s+/g, ' ').trim(), 300),
+        html: sections.join('\n<hr>\n'),
+        textContent: textContent.slice(0, 500000),
+        updatedAt: now,
+      };
+      let a = store.articleByUrl(user.id, artUrl);
+      if (a) {
+        // Re-scrape: the new payload is the fuller snapshot — rebuild the body,
+        // and purge any previously imported runaway highlights.
+        store.updateArticleContent(a.id, fields);
+        for (const h of store.highlightsForArticle(a.id)) {
+          if (h.clientId && h.clientId.startsWith('kindle-') && h.text.length > KINDLE_MAX_HIGHLIGHT_CHARS) {
+            store.deleteHighlight(h.id, user.id);
+          }
+        }
+      } else {
+        a = {
+          id: newId(), userId: user.id, url: artUrl,
+          // Archived on arrival. A book's highlights are a record of something
+          // already read, not something waiting to be read — dozens of books
+          // landing in the inbox would bury what is actually queued there. They
+          // stay fully visible on the highlights page (which ignores archived
+          // state) and under /?src=kindle. Set only when the article is FIRST
+          // created, so unarchiving a book by hand survives the next re-import.
+          savedAt: now, archived: true, favorite: false, readParagraph: 0,
+          source: 'kindle',
+          ...fields,
+        };
+        store.insertArticle(a);
+      }
+      // Highlight rows, deduped by a content-derived clientId so a re-scrape
+      // only adds what's new (and never duplicates on retry).
+      let added = 0, relocated = 0;
+      for (const h of hlRows) {
+        const clientId = 'kindle-' + crypto.createHash('sha256')
+          .update(`${artUrl}|${h.text}`).digest('hex').slice(0, 24);
+        const dup = store.highlightByClientId(user.id, clientId);
+        if (dup) {
+          // Already imported. Refresh its location anyway, so a book imported
+          // before locations were recorded gains them on the next scrape.
+          if ((dup.location || null) !== (h.location || null)) {
+            store.setHighlightLocation(dup.id, user.id, h.location || null);
+            relocated++;
+          }
+          continue;
+        }
+        store.insertHighlight({
+          id: newId(), userId: user.id, clientId, articleId: a.id,
+          text: h.text, note: h.note || null,
+          paragraphIndex: h.paragraphIndex, location: h.location || null,
+          createdAt: now,
+        });
+        added++;
+      }
+      console.log(`article saved [kindle] ${title}: ${hlsIn.length} highlights `
+        + `(${added} new, ${relocated} relocated)`);
+      return json(res, 201, {
+        article: pubArticle(store.getArticle(a.id, user.id)),
+        highlights: hlsIn.length,
+        highlightsAdded: added,
+        highlightsRelocated: relocated,
+      });
     }
 
     // ---- saved views (named filter sets shown as tabs in the clients)
@@ -1413,6 +1669,10 @@ const server = http.createServer(async (req, res) => {
           // favorites the same way the web search's state filter does.
           archivedOnly: f.archivedOnly === true,
           favoriteOnly: f.favoriteOnly === true,
+          // Save-source restriction (e.g. ['android-share']); empty = any.
+          sources: Array.isArray(f.sources)
+            ? f.sources.filter((s) => typeof s === 'string' && s).map((s) => s.slice(0, 40)).slice(0, 8)
+            : [],
         };
         const v = { id: newId(), userId: user.id, name: name.trim(), filters, createdAt: Date.now() };
         store.insertView(v);
@@ -1494,10 +1754,25 @@ const server = http.createServer(async (req, res) => {
         }
         let md = '# Highlights\n';
         for (const hs of byArticle.values()) {
-          md += `\n## ${hs[0].articleTitle || 'Unknown article'}\n`;
-          if (hs[0].articleUrl) md += `${hs[0].articleUrl}\n`;
-          for (const h of hs.sort((x, y) => x.createdAt - y.createdAt)) {
+          const head = hs[0];
+          md += `\n## ${head.articleTitle || 'Unknown article'}\n`;
+          if (head.articleByline) md += `${head.articleByline}\n`;
+          // A kindle: URL is our own key, not a link anyone can follow — show
+          // the book's Kindle reader address instead.
+          const kAsin = /^kindle:(.+)$/i.exec(head.articleUrl || '');
+          if (kAsin) md += `Kindle · https://read.amazon.com/?asin=${encodeURIComponent(kAsin[1])}\n`;
+          else if (head.articleUrl) md += `${head.articleUrl}\n`;
+          // Kindle highlights carry a location: sort by it so the export reads
+          // in book order rather than in the order the scraper happened to run.
+          const inBookOrder = hs.every((h) => h.location) &&
+            hs.slice().sort((x, y) => Number(x.location) - Number(y.location));
+          for (const h of (inBookOrder || hs.slice().sort((x, y) => x.createdAt - y.createdAt))) {
             md += `\n> ${h.text.replace(/\n/g, '\n> ')}\n`;
+            if (h.location) {
+              md += kAsin
+                ? `\n[Location ${h.location}](https://read.amazon.com/?asin=${encodeURIComponent(kAsin[1])}&location=${encodeURIComponent(h.location)})\n`
+                : `\nLocation ${h.location}\n`;
+            }
             if (h.note) md += `\n${h.note}\n`;
           }
         }

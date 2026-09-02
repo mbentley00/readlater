@@ -42,8 +42,14 @@ account. Other env overrides: `PORT`, `READLATER_DATA_DIR`.
 The server doubles as a **web reader**: log in to browse your inbox /
 favorites / archive, read articles (highlights are marked inline; select any
 text to add a new one), archive/favorite from the reader, search everything
-(full text, with domain and has-highlights filters), browse and export
-highlights, and manage your API token.
+(full text, with domain, has-highlights and saved-from filters), browse and export
+highlights, and manage your API token. **From phone** lists everything saved
+through the Android share sheet (a server-side fetch, which can miss what a
+logged-in browser sees) that hasn't since been re-saved from Firefox — each row
+links to the original so you can open it and save it again with the extension,
+which drops it off that list. The sort you pick sticks, so a Random order stays
+put across visits (new saves land at random spots) until you change the sort
+or press ↻ Shuffle.
 
 ### Importing PDFs and EPUBs
 
