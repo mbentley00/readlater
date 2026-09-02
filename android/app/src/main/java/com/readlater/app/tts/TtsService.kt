@@ -105,13 +105,51 @@ class TtsService : Service() {
         /** Current playback state, observable from anywhere. */
         val stateFlow = MutableStateFlow(TtsPlaybackState())
 
-        /** Rolling TTS event log shown under Settings → Voice diagnostics. */
+        /**
+         * Rolling TTS event log shown under Settings → Voice diagnostics. Mirrored
+         * to an app-private file so it survives the process being killed — which
+         * is exactly the event most worth diagnosing (a lost listening position
+         * after Android reclaimed the app). [initDebugLog] loads the tail back in
+         * on the next start; a "process started" line marks each boundary.
+         */
         val debugLog = MutableStateFlow<List<String>>(emptyList())
+        private const val LOG_KEEP = 400          // lines held in memory / shown
+        private const val LOG_FILE_MAX = 256 * 1024 // bytes before the file is trimmed
+        private var logFile: java.io.File? = null
+        private val logExecutor = java.util.concurrent.Executors.newSingleThreadExecutor { r ->
+            Thread(r, "tts-debug-log").apply { isDaemon = true }
+        }
+
+        fun initDebugLog(context: android.content.Context) {
+            val f = java.io.File(context.filesDir, "tts-debug.log")
+            logFile = f
+            val tail = runCatching { if (f.exists()) f.readLines().takeLast(LOG_KEEP) else emptyList() }
+                .getOrDefault(emptyList())
+            debugLog.value = tail
+            logDbg("---- process started")
+        }
 
         fun logDbg(msg: String) {
-            val ts = java.text.SimpleDateFormat("HH:mm:ss.SSS", java.util.Locale.US)
+            val ts = java.text.SimpleDateFormat("MM-dd HH:mm:ss.SSS", java.util.Locale.US)
                 .format(java.util.Date())
-            debugLog.value = (debugLog.value + "$ts $msg").takeLast(150)
+            val line = "$ts $msg"
+            debugLog.value = (debugLog.value + line).takeLast(LOG_KEEP)
+            val f = logFile ?: return
+            logExecutor.execute {
+                runCatching {
+                    f.appendText(line + "\n")
+                    if (f.length() > LOG_FILE_MAX) {
+                        val keep = f.readLines().takeLast(LOG_KEEP)
+                        f.writeText(keep.joinToString("\n") + "\n")
+                    }
+                }
+            }
+        }
+
+        fun clearDebugLog() {
+            debugLog.value = emptyList()
+            val f = logFile ?: return
+            logExecutor.execute { runCatching { f.writeText("") } }
         }
     }
 
@@ -2015,11 +2053,27 @@ class TtsService : Service() {
         return parts.joinToString(" ")
     }
 
+    /** Quotation marks carry nothing audible - a voice does not change inside a
+     *  quotation - but some device engines ANNOUNCE them, so a paragraph that
+     *  ends in a closing quote is read out as "...law enforcement. quote." It
+     *  shows up most in quote-heavy reporting (New Yorker pieces especially).
+     *  Stripped only on the way to the engine: the on-screen text keeps them.
+     *
+     *  Apostrophes (U+0027, U+2019) are deliberately NOT included - they carry
+     *  contractions and possessives, and removing them mangles the words. */
+    private val speechQuoteChars = setOf(
+        '"', '\u00AB', '\u00BB', '\u201C', '\u201D', '\u201E', '\u201F', '\u2033', '\u2036'
+    )
+
+    private fun stripSpokenQuotes(text: String): String =
+        text.filterNot { it in speechQuoteChars }.replace("  ", " ").trim()
+
     /** Text to synthesize for [idx]; the first spoken block gets the intro prepended. */
     private fun synthTextFor(idx: Int): String? {
         val base = speakableText(blocks.getOrNull(idx) ?: return null) ?: return null
         val intro = articleIntro()
-        return if (idx == speakableBlocks.firstOrNull() && intro.isNotBlank()) "$intro\n\n$base" else base
+        val full = if (idx == speakableBlocks.firstOrNull() && intro.isNotBlank()) "$intro\n\n$base" else base
+        return stripSpokenQuotes(full)
     }
 
     private fun nextSpeakable(from: Int): Int? {

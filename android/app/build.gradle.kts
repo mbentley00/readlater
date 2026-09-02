@@ -21,8 +21,8 @@ android {
         applicationId = "com.readlater.app"
         minSdk = 26
         targetSdk = 34
-        versionCode = 62
-        versionName = "5.21"
+        versionCode = 63
+        versionName = "5.22"
     }
 
     signingConfigs {

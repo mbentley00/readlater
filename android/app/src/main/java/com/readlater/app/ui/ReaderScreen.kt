@@ -227,7 +227,23 @@ fun ReaderScreen(articleId: String, onBack: () -> Unit, onOpenArticle: (String) 
     // where?" when you leave for another app and come back: that path recreates
     // the Activity, restores this as true, and the question is skipped. Opening
     // the article for real starts a fresh saveable scope, so it still gets asked.
-    var didInitialScroll by rememberSaveable { mutableStateOf(false) }
+    //
+    // Stored as the process token rather than a bare true, because a bare true
+    // also survives the process being killed — and there it lies. listState is
+    // saveable too, but it restores against `blocks`, which is empty on the
+    // first composition after a cold start (the article Flow has not emitted),
+    // so a restored index resolves to nothing and collapses to the top. The
+    // Boolean then reported "already positioned" for a scroll position that had
+    // just been thrown away, the reader kept the (top-of-article) scroll, and
+    // playback started from paragraph 0 with the real listening position sitting
+    // unread in the database. Matching the token instead means a config change
+    // still skips the question, while a new process positions the view again.
+    var scrolledInProcess by rememberSaveable { mutableStateOf("") }
+    val didInitialScroll = scrolledInProcess == ReadLaterApp.PROCESS_TOKEN
+    // Live view of the above for effects that outlive the composition that
+    // created them: onDispose below runs long after, and capturing a plain
+    // Boolean there would freeze it at the pre-positioning `false`.
+    val didInitialScrollNow by rememberUpdatedState(didInitialScroll)
 
     // The listening position as this Activity last saw it, saved beside the
     // scroll offset. Both are restored together after the system reclaims the
@@ -270,6 +286,18 @@ fun ReaderScreen(articleId: String, onBack: () -> Unit, onOpenArticle: (String) 
         }
     }
 
+    // Where a fresh listen should start. "Where the view is" is only an
+    // instruction when the view is where the user put it: until they drag,
+    // it is just wherever restore left it — and after a cold start that is the
+    // top, because the saved scroll offset resolved against a not-yet-loaded
+    // body. Returning null sends the -1 sentinel, so the service falls back to
+    // the stored listening position instead of being handed a literal 0 that
+    // outranks it (handlePlay treats any index >= 0 as an explicit request).
+    fun startFromView(): Int? =
+        if (followTts) null
+        else itemToBlock(listState.firstVisibleItemIndex)
+            .coerceIn(0, (blocks.size - 1).coerceAtLeast(0))
+
     // Restore the saved position once the body is available. When the manual
     // scroll position and the listening (TTS) position have meaningfully
     // diverged, ask which one to resume instead of guessing.
@@ -291,6 +319,14 @@ fun ReaderScreen(articleId: String, onBack: () -> Unit, onOpenArticle: (String) 
         // path scrolls itself to the spoken paragraph a moment later.
         val listeningRanOn = didInitialScroll && ttsWhenLastHere >= 0 && tts != ttsWhenLastHere &&
             !(isTtsThisArticle && ttsState.isPlaying && followTts)
+        // Into the persisted log: after a process kill, this is the one record of
+        // what the reader saw and decided when it came back.
+        val ask = read > 0 && tts > 0 && kotlin.math.abs(read - tts) > 2
+        TtsService.logDbg(
+            "reader open ${articleId.take(8)}: read=$read tts=$tts lastSeen=$ttsWhenLastHere " +
+                "restored=$didInitialScroll ranOn=$listeningRanOn svc=${isTtsThisArticle}/${ttsState.isPlaying} -> " +
+                (if (!didInitialScroll || listeningRanOn) (if (ask) "ask" else "scroll to ${maxOf(read, tts)}") else "keep scroll")
+        )
 
         if (!didInitialScroll || listeningRanOn) {
             // Ask whenever the two positions have really diverged. This used to
@@ -306,7 +342,7 @@ fun ReaderScreen(articleId: String, onBack: () -> Unit, onOpenArticle: (String) 
             } else {
                 listState.scrollToBlock(maxOf(read, tts))
             }
-            didInitialScroll = true
+            scrolledInProcess = ReadLaterApp.PROCESS_TOKEN
         }
         positionSettled = true
     }
@@ -339,7 +375,7 @@ fun ReaderScreen(articleId: String, onBack: () -> Unit, onOpenArticle: (String) 
     // Persist the reading position when leaving the screen (works without TTS too).
     DisposableEffect(articleId) {
         onDispose {
-            if (didInitialScroll && currentBlocks.isNotEmpty()) {
+            if (didInitialScrollNow && currentBlocks.isNotEmpty()) {
                 val block = itemToBlock(listState.firstVisibleItemIndex)
                     .coerceIn(0, currentBlocks.size - 1)
                 repo.saveReadPosition(articleId, block)
@@ -514,8 +550,7 @@ fun ReaderScreen(articleId: String, onBack: () -> Unit, onOpenArticle: (String) 
                                         followTts = true
                                         sendTtsCommand(
                                             context, TtsService.ACTION_PLAY, articleId,
-                                            itemToBlock(listState.firstVisibleItemIndex)
-                                                .coerceIn(0, (blocks.size - 1).coerceAtLeast(0)),
+                                            startFromView(),
                                             autoAdvance = false
                                         )
                                     }
@@ -691,8 +726,7 @@ fun ReaderScreen(articleId: String, onBack: () -> Unit, onOpenArticle: (String) 
                                     context,
                                     TtsService.ACTION_PLAY,
                                     articleId,
-                                    itemToBlock(listState.firstVisibleItemIndex)
-                                        .coerceIn(0, (blocks.size - 1).coerceAtLeast(0))
+                                    startFromView()
                                 )
                             }
                         }

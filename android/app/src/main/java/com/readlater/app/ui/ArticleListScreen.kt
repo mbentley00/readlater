@@ -170,9 +170,9 @@ fun ArticleListScreen(
         mutableStateOf(runCatching { SortMode.valueOf(app.settings.listSort) }.getOrDefault(SortMode.NEWEST))
     }
     var sortMenuOpen by remember { mutableStateOf(false) }
-    // Stable shuffle so RANDOM doesn't reshuffle on every recomposition; a new
-    // seed (re-tapping Random) gives a fresh order. Saveable so the order — and
-    // the scroll position — survive navigating into an article and back.
+    // Stable shuffle: the seed survives recomposition AND the order is derived
+    // per-article from (seed, id), so the list does not reorder when its
+    // contents change. A new seed (re-tapping Random) gives a fresh order.
     var shuffleSeed by rememberSaveable { mutableStateOf(0L) }
 
     // Jump to the top only when the sort actually CHANGES — not when returning
@@ -245,7 +245,7 @@ fun ArticleListScreen(
             SortMode.OLDEST -> filtered.sortedBy(timeKey)
             SortMode.LONGEST -> filtered.sortedByDescending { it.wordCount }
             SortMode.SHORTEST -> filtered.sortedBy { it.wordCount }
-            SortMode.RANDOM -> filtered.shuffled(kotlin.random.Random(shuffleSeed))
+            SortMode.RANDOM -> filtered.sortedBy { randomOrderKey(shuffleSeed, it.id) }
         }
     }
 
@@ -847,4 +847,26 @@ private fun ViewsDialog(
         },
         dismissButton = { TextButton(onClick = onDismiss) { Text("Close") } }
     )
+}
+
+/**
+ * Order key for [SortMode.RANDOM]. The position of an article is a hash of
+ * (seed, id), so it does not move when anything else in the list changes.
+ *
+ * `shuffled(Random(seed))` derives the permutation from the list itself, so ANY
+ * change to the list re-derived a completely different order — a sync, an
+ * archive, or the TTS service writing a listening position, which happens
+ * continuously while you listen. That is why Random still looked unstable after
+ * the seed was made sticky, and why queued playback stopped after an article or
+ * two: the queue is re-captured from the on-screen order, and the article now
+ * playing had been thrown to the end of it. Mirrors the server's
+ * shuffle(seed, id) SQL, so both clients shuffle the same way.
+ */
+private fun randomOrderKey(seed: Long, id: String): Long {
+    var h = -3750763034362895579L xor seed // FNV-1a 64-bit offset basis, seeded
+    for (ch in id) {
+        h = h xor ch.code.toLong()
+        h *= 1099511628211L // FNV-1a 64-bit prime
+    }
+    return h
 }

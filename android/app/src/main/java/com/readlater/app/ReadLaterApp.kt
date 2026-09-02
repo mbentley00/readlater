@@ -60,6 +60,26 @@ private val MIGRATION_6_7 = object : Migration(6, 7) {
  */
 class ReadLaterApp : Application() {
 
+    companion object {
+        /**
+         * Fresh on every process start. Saved UI state (rememberSaveable) also
+         * comes back after the system kills the process, but state that depends
+         * on *data* does not: a restored LazyListState resolves against an empty
+         * list while the article body is still loading and silently collapses to
+         * the top. A saved Boolean saying "the view is already positioned" then
+         * vouches for a scroll position that no longer exists. Screens compare
+         * this token to tell "same process, genuinely still positioned" from
+         * "new process, position it again".
+         */
+        val PROCESS_TOKEN: String = java.util.UUID.randomUUID().toString()
+    }
+
+    override fun onCreate() {
+        super.onCreate()
+        // File-backed so the log outlives a process kill (see TtsService.logDbg).
+        com.readlater.app.tts.TtsService.initDebugLog(this)
+    }
+
     val database: AppDatabase by lazy {
         Room.databaseBuilder(this, AppDatabase::class.java, "readlater.db")
             .addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5, MIGRATION_5_6, MIGRATION_6_7)

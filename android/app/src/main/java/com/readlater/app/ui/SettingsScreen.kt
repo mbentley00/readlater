@@ -474,7 +474,7 @@ fun SettingsScreen(onBack: () -> Unit) {
                         cm.setPrimaryClip(android.content.ClipData.newPlainText("tts-log", log.joinToString("\n")))
                         scope.launch { snackbarHostState.showSnackbar("Log copied") }
                     }) { Text("Copy") }
-                    OutlinedButton(onClick = { TtsService.debugLog.value = emptyList() }) { Text("Clear") }
+                    OutlinedButton(onClick = { TtsService.clearDebugLog() }) { Text("Clear") }
                 }
                 Surface(
                     color = MaterialTheme.colorScheme.surfaceVariant,
@@ -483,7 +483,7 @@ fun SettingsScreen(onBack: () -> Unit) {
                 ) {
                     Text(
                         text = if (log.isEmpty()) "No TTS events yet — press play on an article."
-                        else log.takeLast(60).joinToString("\n"),
+                        else log.takeLast(80).joinToString("\n"),
                         style = MaterialTheme.typography.bodySmall.copy(
                             fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace,
                             fontSize = 11.sp
