@@ -94,6 +94,10 @@ class TtsService : Service() {
         /** How many upcoming paragraphs to keep synthesized ahead of playback. */
         private const val PREFETCH_AHEAD = 3
 
+        /** Consecutive fallen-back paragraphs before the file path is abandoned
+         *  for the rest of the article. */
+        private const val MAX_FALLBACK_RUN = 3
+
         /** Deliberate pause between paragraphs for the neural (Kaldi/sherpa)
          *  voice — its delivery runs paragraphs together, so a beat helps. */
         private const val KALDI_PARAGRAPH_GAP_MS = 500L
@@ -1023,6 +1027,17 @@ class TtsService : Service() {
     private var resumePositionMs = 0
     private var usingSpeakFallback = false
     private var fallbackToasted = false
+
+    /** Paragraphs whose synthesis has already been retried once, so a file that
+     *  keeps coming back empty can't retry forever. */
+    private val synthRetried = mutableSetOf<Int>()
+
+    /** How many paragraphs in a row have fallen back to speak(). The fallback
+     *  latch is lifted at each paragraph boundary (one transient empty file
+     *  should not cost the whole article its mid-paragraph resume), but an
+     *  engine that genuinely cannot write files stops being retried once this
+     *  reaches [MAX_FALLBACK_RUN]. */
+    private var fallbackRun = 0
     private var audioStarted = false
     private var playToken = 0
 
@@ -1247,6 +1262,8 @@ class TtsService : Service() {
         awaitingIdx = -1
         usingSpeakFallback = false
         fallbackToasted = false
+        synthRetried.clear()
+        fallbackRun = 0
         serverMode = false
         cacheDir.listFiles()?.filter { it.name.startsWith("tts-") }?.forEach { it.delete() }
     }
@@ -1283,7 +1300,20 @@ class TtsService : Service() {
                             if (idx == awaitingIdx && isPlaying) { awaitingIdx = -1; startFilePlayback(idx, awaitingFromMs) }
                         } else {
                             logDbg("synth EMPTY idx=$idx")
-                            if (idx == awaitingIdx && isPlaying) { awaitingIdx = -1; beginSpeakFallback("empty synth file") }
+                            // Usually a transient engine hiccup rather than a
+                            // paragraph the engine can't say: the same engine
+                            // handles the paragraphs either side of it fine. Give
+                            // it one more go before dropping to speak(), which
+                            // cannot resume mid-paragraph. awaitingIdx stays set,
+                            // so playback still follows the retry.
+                            if (synthRetried.add(idx)) {
+                                logDbg("synth retry idx=$idx")
+                                runCatching { synthFile(idx).delete() }
+                                synthesize(idx)
+                            } else if (idx == awaitingIdx && isPlaying) {
+                                awaitingIdx = -1
+                                beginSpeakFallback("empty synth file")
+                            }
                         }
                     }
                     id.startsWith("spk-") -> {
@@ -1335,6 +1365,15 @@ class TtsService : Service() {
         } else {
             currentIndex = next
             articleId?.let { app.repository.saveTtsPositionLocal(it, next) }
+            // A new paragraph is a fresh chance at the file path. Without this
+            // the flag set for ONE bad paragraph survived to the end of the
+            // article, and every pause after it resumed from the paragraph top
+            // (resumeSpeaking hard-codes 0 in fallback). Given up on only once
+            // the engine has failed this many paragraphs in a row.
+            if (usingSpeakFallback && fallbackRun < MAX_FALLBACK_RUN) {
+                logDbg("retrying file synthesis at idx=$next (fallback run=$fallbackRun)")
+                usingSpeakFallback = false
+            }
             // Neural voice: insert a short beat before the next paragraph so it's
             // easier to follow. Skipped for the system voice (which already
             // pauses at paragraph breaks). Cancelled if the user pauses/seeks.
@@ -1515,6 +1554,7 @@ class TtsService : Service() {
             synchronized(deviceBoundaries) { deviceBoundaries.clear() }
             cancelAudioWatchdog()
             track.play()
+            fallbackRun = 0 // audio is actually coming out of the file path again
             logDbg("playing (stream) idx=$idx sr=${wav0.sampleRate} ch=${wav0.channels} from=${fromMs}ms")
             prefetchAhead(idx)
             publishState(); updatePlaybackState(); updateNotification()
@@ -1967,6 +2007,7 @@ class TtsService : Service() {
     private fun beginSpeakFallback(why: String) {
         logDbg("SPEAK FALLBACK ($why) — headset buttons may not route now")
         usingSpeakFallback = true
+        fallbackRun++
         releasePlayer()
         if (!fallbackToasted) {
             fallbackToasted = true
