@@ -185,7 +185,13 @@ article.reader .content { overflow-wrap:break-word; font-family:var(--read-famil
 article.reader h1 { font-family:var(--read-family, Georgia, 'Times New Roman', serif); }
 article.reader .content pre { overflow-x:auto; background:var(--card); padding:.8rem; border-radius:8px; font-size:.85rem; }
 article.reader .content blockquote { border-left:3px solid var(--line); margin-left:0; padding-left:1rem; color:var(--muted); }
-mark[data-hl], mark[data-hl-id] { background:var(--mark); color:inherit; padding:0 .1em; border-radius:2px; }
+mark[data-hl], mark[data-hl-id] { background:var(--mark); color:inherit; padding:0 .1em; margin:0 -.1em; border-radius:2px; }
+/* The negative margin cancels the padding's advance width, so a paragraph
+   wraps identically whether or not it carries a highlight — removing one
+   used to reflow the paragraph. It matters more than it looks: wrapRange()
+   emits one <mark> per text node, so a highlight spanning an <em> or <i>
+   becomes three marks and paid the padding at every internal seam, which
+   showed up as visible gaps around the inline element. */
 mark.flash { animation: hlflash 1.6s ease; }
 @keyframes hlflash { 0%,100% { background:var(--mark); } 25% { background:var(--accent); color:var(--accent-fg); } }
 .hl-panel { position:fixed; top:0; right:0; height:100%; width:min(360px,88vw); background:var(--card); border-left:1px solid var(--line); box-shadow:-4px 0 24px rgba(0,0,0,.15); overflow-y:auto; z-index:50; font-family:system-ui,sans-serif; }

@@ -98,6 +98,10 @@ class TtsService : Service() {
          *  for the rest of the article. */
         private const val MAX_FALLBACK_RUN = 3
 
+        /** A saved position inside this fraction of an article doesn't count as
+         *  progress worth resuming — playback starts at the top instead. */
+        private const val RESUME_FLOOR_FRACTION = 0.05f
+
         /** Deliberate pause between paragraphs for the neural (Kaldi/sherpa)
          *  voice — its delivery runs paragraphs together, so a beat helps. */
         private const val KALDI_PARAGRAPH_GAP_MS = 500L
@@ -411,12 +415,23 @@ class TtsService : Service() {
                 handleStop()
                 return@launch
             }
-            logDbg("loaded ${blocks.size} blocks, ${blocks.count { speakableText(it) != null }} speakable — ${article.title.take(40)}")
             // Default resume point: the listening position, falling back to the
             // scroll position for articles never played before.
-            val resumeAt = if (article.ttsParagraph > 0) article.ttsParagraph else article.readParagraph
+            val saved = if (article.ttsParagraph > 0) article.ttsParagraph else article.readParagraph
+            // Barely into it isn't "in progress": resuming at paragraph 2 of 60
+            // drops you past the opening for no real benefit, so the first 5%
+            // rounds down to the top. Only applies to the saved position — an
+            // explicit start index is always honoured.
+            val resumeAt = if (saved < blocks.size * RESUME_FLOOR_FRACTION) 0 else saved
             currentIndex = (if (startParagraph >= 0) startParagraph else resumeAt)
                 .coerceIn(0, blocks.size - 1)
+            // Logged after the decision, so the persisted log records what the
+            // saved positions were AND where playback actually began.
+            logDbg(
+                "loaded ${blocks.size} blocks, ${blocks.count { speakableText(it) != null }} speakable" +
+                    " — tts=${article.ttsParagraph} read=${article.readParagraph} -> start at $currentIndex" +
+                    " — ${article.title.take(40)}"
+            )
             isPlaying = true
             audioStarted = false
             clearSynthCache() // article or rate may have changed; drop stale audio
@@ -727,7 +742,12 @@ class TtsService : Service() {
                     Intent(this@TtsService, TtsService::class.java)
                         .setAction(ACTION_PLAY)
                         .putExtra(EXTRA_ARTICLE_ID, next.id)
-                        .putExtra(EXTRA_START_PARAGRAPH, 0)
+                        // -1, not 0: the queue reaching an article you were part
+                        // way through should pick up where you left off, exactly
+                        // as pressing play on it would. A literal 0 counts as an
+                        // explicit "start at the top" and outranks the saved
+                        // position, which is what used to restart these.
+                        .putExtra(EXTRA_START_PARAGRAPH, -1)
                 )
             } else {
                 handleStop()
