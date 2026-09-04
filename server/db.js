@@ -433,17 +433,58 @@ function hlWhere(userId, q, domain, domains = null, sources = null) {
  * Marcos with Duterte in a highlight — so this emits one clause per term rather
  * than a single MATCH over the whole query.
  *
- * Terms are quoted and prefix-matched. Assumes the articles table is aliased
+ * Bare terms are prefix-matched; a double-quoted phrase matches exactly and in
+ * order. Assumes the articles table is aliased
  * `a`; the highlights subquery needs no user check of its own, since `a` is
  * always already scoped to one user. Returns null when there are no terms.
  */
+/**
+ * Split a query into terms, honouring double-quoted phrases: `booker "han kang"`
+ * yields the bare term `booker` and the phrase `han kang`.
+ *
+ * Splitting on whitespace first (as this used to) tore a quoted phrase into
+ * `"han` and `kang"`, whose quotes the escaping then neutralised — so a phrase
+ * search silently became two independent prefix terms. That is worse than it
+ * sounds, because a bare term is prefix-matched: `han*` also hits "handed" and
+ * "handle", which any long article contains, so `"han kang"` matched more or
+ * less anything mentioning Kang.
+ *
+ * An unclosed quote is treated as ordinary text rather than swallowing the rest
+ * of the query.
+ */
+function parseQueryTerms(q) {
+  const out = [];
+  const re = /"([^"]+)"|(\S+)/g;
+  let m;
+  while ((m = re.exec(String(q == null ? '' : q)))) {
+    if (m[1] != null) {
+      const t = m[1].trim();
+      if (t) out.push({ text: t, phrase: true });
+    } else {
+      const t = m[2].replace(/"/g, '').trim(); // stray quote from an unclosed pair
+      if (t) out.push({ text: t, phrase: false });
+    }
+  }
+  return out;
+}
+
+/**
+ * One FTS5 expression per parsed term. A phrase matches those words adjacent
+ * and in order; a bare term keeps the trailing `*` so partial words still find
+ * things as you type.
+ */
+function ftsExpr(t) {
+  const esc = String(t.text).replace(/"/g, '""');
+  return t.phrase ? `"${esc}"` : `"${esc}"*`;
+}
+
 function ftsMatch(q) {
-  const terms = String(q).split(/\s+/).filter(Boolean);
+  const terms = parseQueryTerms(q);
   if (!terms.length) return null;
   const args = {};
   const clause = terms.map((t, i) => {
     const k = `match${i}`;
-    args[k] = `"${t.replace(/"/g, '""')}"*`;
+    args[k] = ftsExpr(t);
     return `(a.rowid IN (SELECT rowid FROM articles_fts WHERE articles_fts MATCH @${k})
       OR a.id IN (SELECT hq.articleId FROM highlights hq
                   WHERE hq.rowid IN (SELECT rowid FROM highlights_fts WHERE highlights_fts MATCH @${k})))`;
@@ -860,6 +901,48 @@ function open(dataDir) {
       }
       return out;
     },
+    /**
+     * Highlights to preview beside list rows, for the articles on ONE page.
+     * Scoped to the given ids rather than the whole account on purpose: this
+     * runs on every list render, and the whole-account form reads every
+     * highlight the user owns to show a handful of them.
+     *
+     * Search matches highlight text as well as article text (see ftsMatch), so
+     * an article can be in your results because of something you highlighted,
+     * with nothing in its title or excerpt to show why. Given [q], the
+     * highlights that matched it sort first; otherwise these are simply the
+     * first few in reading order.
+     */
+    highlightSnippetsByArticle: (userId, articleIds, { q = '', perArticle = 2 } = {}) => {
+      const out = new Map();
+      const ids = (articleIds || []).filter(Boolean);
+      if (!ids.length) return out;
+      const args = { userId };
+      ids.forEach((id, i) => { args[`hs${i}`] = id; });
+      // Parsed exactly as the search itself parses it, so a quoted phrase
+      // highlights the snippet that actually matched rather than any snippet
+      // containing one of its words.
+      const terms = parseQueryTerms(q);
+      terms.forEach((t, i) => { args[`hm${i}`] = ftsExpr(t); });
+      // Matching ALL terms, to mirror how ftsMatch decides an article matched.
+      const matched = terms.length
+        ? `CASE WHEN ${terms.map((_, i) =>
+            `h.rowid IN (SELECT rowid FROM highlights_fts WHERE highlights_fts MATCH @hm${i})`
+          ).join(' AND ')} THEN 1 ELSE 0 END`
+        : '0';
+      const rows = sqlite.prepare(`SELECT h.articleId, h.text, ${matched} AS matched
+        FROM highlights h
+        WHERE h.userId = @userId AND h.articleId IN (${ids.map((_, i) => `@hs${i}`).join(', ')})
+        ORDER BY h.articleId, matched DESC, (h.paragraphIndex IS NULL), h.paragraphIndex, h.createdAt`)
+        .all(args);
+      for (const r of rows) {
+        const cur = out.get(r.articleId);
+        if (!cur) out.set(r.articleId, [{ text: r.text, matched: !!r.matched }]);
+        else if (cur.length < perArticle) cur.push({ text: r.text, matched: !!r.matched });
+      }
+      return out;
+    },
+
     highlightByClientId: (userId, clientId) =>
       prep('hbc', 'SELECT * FROM highlights WHERE userId = ? AND clientId = ?').get(userId, clientId) || null,
 

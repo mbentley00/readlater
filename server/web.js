@@ -135,7 +135,18 @@ ul.articles .thumb { flex:none; width:84px; height:84px; object-fit:cover; borde
 @media (max-width:560px) { ul.articles .thumb { width:56px; height:56px; } }
 ul.articles .title { font-size:1.08rem; text-decoration:none; color:var(--fg); font-weight:600; }
 ul.articles .title:hover { color:var(--accent); }
+/* Highlight count, beside the title. It used to sit in the meta run, one item
+   among seven separated by dots, where the thing you most want to spot when
+   scanning results was the easiest to miss. Carrying --mark — the colour the
+   highlights themselves are drawn in — makes it recognisable without reading. */
+.hl-badge { display:inline-block; background:var(--mark); color:var(--fg); border-radius:999px; padding:.05rem .5rem; margin-left:.4rem; font-size:.72rem; font-family:system-ui,sans-serif; font-weight:600; font-variant-numeric:tabular-nums; white-space:nowrap; vertical-align:.1em; text-decoration:none; }
 .meta { color:var(--muted); font-size:.8rem; font-family: system-ui, sans-serif; margin-top:.15rem; }
+/* Highlight previews under a search result. Because search matches highlight
+   text, a result can look unrelated to what you typed until you see the
+   sentence you highlighted — these show it without opening the article. */
+.hl-snips { margin-top:.4rem; display:flex; flex-direction:column; gap:.25rem; }
+.hl-snip { font-size:.82rem; line-height:1.4; color:var(--muted); border-left:3px solid var(--mark); padding:.05rem 0 .05rem .55rem; }
+.hl-snip.on { color:var(--fg); }
 /* Dropping a PDF/EPUB anywhere on the list imports it; outline the whole page
    so the target is obviously the window and not one small strip of it. */
 body.dropping::after { content:'Drop to import'; position:fixed; inset:.5rem; z-index:90; display:flex; align-items:center; justify-content:center; border:2px dashed var(--accent); border-radius:12px; background:rgba(0,0,0,.35); color:var(--fg); font:600 1.1rem/1 system-ui,sans-serif; pointer-events:none; }
@@ -274,6 +285,25 @@ body { transition:padding-right .2s ease; }
  * rather than joins the nav so the header stays a single line on a phone.
  */
 /** "/" focuses the header search from anywhere. Present on every signed-in page. */
+/**
+ * Filter dropdowns re-run the query the moment they change. They are filters,
+ * not fields in a form you fill in: narrowing a search you had already run
+ * meant changing a dropdown and then ALSO pressing Search, a second step that
+ * never had a reason to exist. The text box travels with the form, so the
+ * query you were on is kept; dropping ?page resets to the first page, which is
+ * what you want when the result set has just changed underneath you.
+ *
+ * Selects only. The search box and the domain combobox stay on Enter/Apply:
+ * `change` fires on those when focus leaves a half-typed value, which would run
+ * a query nobody asked for against a multi-gigabyte database.
+ */
+const FILTER_SUBMIT_SCRIPT = `
+for (const sel of document.querySelectorAll('form.search select')) {
+  sel.addEventListener('change', () => {
+    if (sel.form.requestSubmit) sel.form.requestSubmit(); else sel.form.submit();
+  });
+}`;
+
 const NAV_SCRIPT = `
 document.addEventListener('keydown', (e) => {
   if (e.key !== '/' || e.metaKey || e.ctrlKey || e.altKey) return;
@@ -466,6 +496,16 @@ function domainPicker(rows, current) {
 }
 
 const PAGE_SIZE = 50;
+
+/** One highlight, trimmed to a line or two for a list row. Cuts on a word
+ *  boundary when there is a reasonable one, rather than mid-word. */
+function snipText(s, max = 150) {
+  const t = String(s == null ? '' : s).replace(/\s+/g, ' ').trim();
+  if (t.length <= max) return t;
+  const cut = t.slice(0, max);
+  const sp = cut.lastIndexOf(' ');
+  return `${(sp > max * 0.6 ? cut.slice(0, sp) : cut).trimEnd()}…`;
+}
 const SORTS = { newest: 'Newest', oldest: 'Oldest', longest: 'Longest', shortest: 'Shortest', random: 'Random' };
 
 /** A shuffle seed: kept in the URL so paging through a random order is stable. */
@@ -626,7 +666,7 @@ function listPage(ctx, user, view, url, prefs = {}) {
 ${viewChips}
 <form class="search" method="get" action="/">
   ${viewParam ? `<input type="hidden" name="view" value="${escapeHtml(viewParam)}">` : ''}
-  <input type="search" name="q" value="${escapeHtml(q)}" placeholder="Search title, author, text, highlights…">
+  <input type="search" name="q" value="${escapeHtml(q)}" placeholder="Search title, author, text, highlights — &quot;quote&quot; for an exact phrase">
   ${domainPicker(domainRows, domain)}
   <select name="len">
     <option value="">Any length</option>
@@ -662,6 +702,11 @@ ${!searching && !savedView ? `<div class="meta">${total.toLocaleString('en-US')}
 </div>` : '';
 
   const hlCounts = ctx.store.highlightCountsByArticle(user.id);
+  // Only while searching: on a plain inbox listing these would be noise on
+  // every row, and there is no query for them to be explaining.
+  const hlSnips = searching
+    ? ctx.store.highlightSnippetsByArticle(user.id, list.map((a) => a.id), { q, perArticle: 2 })
+    : new Map();
   // Every article link carries this list back with it — view, filters, sort,
   // shuffle seed and page — so the reader's Back returns to exactly this screen.
   const backTo = buildQs({});
@@ -672,7 +717,6 @@ ${!searching && !savedView ? `<div class="meta">${total.toLocaleString('en-US')}
       a.byline, fmtDate(a.savedAt),
       a.wordCount > 0 ? `~${Math.max(1, Math.round(a.wordCount / 225))} min` : null,
       a.readParagraph > 0 ? `¶${a.readParagraph} in progress` : null,
-      hlCount ? `${hlCount} highlight${hlCount > 1 ? 's' : ''}` : null,
       // So it's visible from the list which articles are readable by anyone
       // holding a link, without opening each one.
       a.shareId ? 'shared' : null,
@@ -684,12 +728,20 @@ ${!searching && !savedView ? `<div class="meta">${total.toLocaleString('en-US')}
     const openOriginal = /^https?:\/\//i.test(a.url || '')
       ? `${meta ? ' · ' : ''}<a href="${escapeHtml(a.url)}" target="_blank" rel="noopener noreferrer">open original ↗</a>`
       : '';
+    const hlLabel = `${hlCount} highlight${hlCount > 1 ? 's' : ''}`;
+    const hlBadge = hlCount ? `<span class="hl-badge">${hlLabel}</span>` : '';
+    const snips = hlSnips.get(a.id) || [];
+    const snipHtml = snips.length
+      ? `<div class="hl-snips">${snips.map((h) =>
+          `<div class="hl-snip${h.matched ? ' on' : ''}">${escapeHtml(snipText(h.text))}</div>`
+        ).join('')}</div>`
+      : '';
     const thumb = a.imageUrl && /^https?:\/\//i.test(a.imageUrl)
       ? `<img class="thumb" src="${escapeHtml(a.imageUrl)}" alt="" loading="lazy" decoding="async" referrerpolicy="no-referrer">`
       : '';
     return `<li data-id="${a.id}">
-      <div class="main"><a class="title" href="${escapeHtml(readHref(a.id, backTo))}">${escapeHtml(a.title)}</a>
-      <div class="meta">${meta}${openOriginal}</div></div>
+      <div class="main"><a class="title" href="${escapeHtml(readHref(a.id, backTo))}">${escapeHtml(a.title)}</a>${hlBadge}
+      <div class="meta">${meta}${openOriginal}</div>${snipHtml}</div>
       ${thumb}
       <div class="actions">
         <button class="act fav" data-act="favorite" data-val="${a.favorite ? 'false' : 'true'}" title="Favorite">${a.favorite ? '★' : '☆'}</button>
@@ -858,7 +910,7 @@ document.addEventListener('drop', (e) => {
   document.body.classList.remove('dropping');
   importDocs(e.dataTransfer.files);
 });`;
-  return { body, script, setCookie };
+  return { body, script: `${script}\n${FILTER_SUBMIT_SCRIPT}`, setCookie };
 }
 
 /**
@@ -1724,7 +1776,7 @@ function highlightsPage(ctx, user, url, prefs = {}) {
     .concat(Object.entries(SOURCES).map(([k, v]) =>
       `<option value="${k}" ${k === src ? 'selected' : ''}>${escapeHtml(v.label)}</option>`)).join('');
   const searchForm = `<form class="search" method="get" action="/highlights">
-  <input type="search" name="q" value="${escapeHtml(q)}" placeholder="Search highlight text, titles…">
+  <input type="search" name="q" value="${escapeHtml(q)}" placeholder="Search highlight text, titles — &quot;quote&quot; for an exact phrase">
   ${domainPicker(domainRows, domain)}
   <select name="src" title="Where the highlighted article came from">${srcOpts}</select>
   <select name="sort">${sortOpts}</select>
@@ -1739,7 +1791,7 @@ ${total ? `<div class="meta">${total.toLocaleString('en-US')} article${total ===
 <ul class="articles">${items}</ul>${pager}`
     : `<div class="empty">${q || domain || src ? 'No highlighted articles match those filters.' : 'No highlights yet — long-press a paragraph in the Android app, or select text in the reader.'}</div>`}
 <p class="meta"><a href="/api/highlights/export.md">Export all as Markdown</a></p>`;
-  return { body, script: '', setCookie };
+  return { body, script: FILTER_SUBMIT_SCRIPT, setCookie };
 }
 
 function settingsPage(ctx, user, url, req) {
