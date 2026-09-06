@@ -93,7 +93,7 @@ async function reparse({ url, title, hint, sourceHtml, currentTextLen, fetchUrl 
   if (isEmail) {
     // Readability is built for web pages and mangles newsletters; our own email
     // restructuring is the better heuristic for them.
-    const html = emailToCleanHtml(raw);
+    const html = emailToCleanHtml(raw, { title });
     if (html) candidates.push({ method: 'email-structure', article: pack({ html, textContent: textOf(html) }) });
   }
   const readable = extractReadable(ensureDoc(raw), url);

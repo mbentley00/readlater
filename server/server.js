@@ -690,7 +690,7 @@ function saveEmailArticle({ userId, messageId, subject, from, date, html, text }
   // store an empty article.
   let articleHtml;
   if (typeof html === 'string' && html.trim()) {
-    articleHtml = emailToCleanHtml(html) || sanitizeEmailHtml(html);
+    articleHtml = emailToCleanHtml(html, { title: subject }) || sanitizeEmailHtml(html);
   } else {
     articleHtml = `<pre>${escapeText(body)}</pre>`;
   }

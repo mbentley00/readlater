@@ -26,6 +26,39 @@ const { parseHTML } = require('linkedom');
  *  probably meant to appear more than once, so duplicates are kept. */
 const MIN_DEDUP_WORDS = 8;
 
+/** A paragraph of this many words is real prose, so the masthead is over. Used
+ *  to bound the region the preamble trimming below is allowed to touch. */
+const PROSE_WORDS = 25;
+
+/** ...and never trim further than this many blocks in, however late the prose
+ *  starts, so an article built entirely of short lines keeps its body. */
+const MAX_PREAMBLE_BLOCKS = 20;
+
+// A forwarded message carries the envelope in the body, and Gmail's rule above
+// it. Matched only in the preamble, so an article quoting "Subject:" survives.
+const FORWARD_RULE = /^-+\s*forwarded message\s*-+$/i;
+const ENVELOPE_LINE = /^(from|date|subject|to|cc|bcc|sent|reply-to)\s*:/i;
+
+// Newsletters pad the preheader with invisible characters so the inbox preview
+// truncates where they want. It renders as a paragraph of nothing, gets counted
+// in the word count, and is handed to the speech engine.
+const INVISIBLE_ONLY = /^[\s\u00ad\u034f\u200b-\u200d\u2060\ufeff\u180e]*$/;
+
+// Open-tracking pixels. Substack's is eotrx.substackcdn.com/o/<id>/p.gif?token=
+const TRACKING_PIXEL = /(?:^|\/)(?:p|open|pixel|beacon|spacer)\.gif(?:$|\?)|(?:^|\/\/)eotrx\./i;
+
+/** A bare date line under a masthead ("Aug 25", "25 August 2026"). */
+const SHORT_DATE = /^(?:\w{3,9}\.?\s+\d{1,2}(?:,?\s+\d{4})?|\d{1,2}\s+\w{3,9}\.?(?:,?\s+\d{4})?)$/i;
+
+/** Compare human text ignoring case, punctuation and curly-quote variants. */
+function normalizeLine(str) {
+  return String(str || '')
+    .replace(/[\u2018\u2019\u02bc]/g, "'")
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}']+/gu, ' ')
+    .trim();
+}
+
 // Subtrees dropped entirely (non-content or unsafe).
 const DROP = new Set([
   'script', 'style', 'head', 'title', 'noscript', 'svg', 'template', 'iframe',
@@ -145,6 +178,64 @@ function dedupeBlocks(blocks, minWords = MIN_DEDUP_WORDS) {
   return out;
 }
 
+/**
+ * Drop the masthead a newsletter opens with, which restates what the reader is
+ * already showing in its own header.
+ *
+ * A forwarded Substack post begins: the envelope Gmail put in the body
+ * ("From: Matt Alt from Pure Invention <…>", Date, Subject), an open-tracking
+ * pixel, the preheader's invisible padding, the publication's banner, and then
+ * the post's own title, author and date. So the title arrives three times (page
+ * header, "Subject:", masthead) and the author twice, before a word of the
+ * article.
+ *
+ * dedupeBlocks cannot see this: it matches whole paragraphs exactly and only at
+ * eight words or more, whereas these are short and differently worded
+ * ("Subject: X" vs "X").
+ *
+ * Only the run before the first real paragraph is touched, so nothing here can
+ * reach into the body. [title] is optional — without it every other rule still
+ * applies.
+ */
+function trimEmailPreamble(blocks, title) {
+  // The envelope names the author, which is how the masthead's bare name can be
+  // recognised as a repeat rather than as a line of the article. Read it before
+  // the envelope itself is dropped.
+  let author = '';
+  for (const b of blocks.slice(0, 8)) {
+    if (b.type === 'img') continue;
+    const m = /^from\s*:\s*(.+)$/i.exec(collapse(b.text));
+    if (!m) continue;
+    author = m[1].replace(/<[^>]*>/g, '').replace(/\s+from\s+.*$/i, '').trim();
+    break;
+  }
+
+  // Padding and pixels go first, and must go before the prose scan below: the
+  // preheader's filler characters are not whitespace, so wordCount reads that
+  // one paragraph as hundreds of words and the scan stops at it — leaving the
+  // masthead, which follows it, outside the region this is allowed to trim.
+  const kept = blocks.filter((b) => (b.type === 'img'
+    ? !TRACKING_PIXEL.test(b.src || '')
+    : !INVISIBLE_ONLY.test(collapse(b.text))));
+
+  let prose = kept.findIndex((b) => b.type !== 'img' && wordCount(b.text) >= PROSE_WORDS);
+  if (prose < 0) prose = kept.length;
+  const limit = Math.min(prose, MAX_PREAMBLE_BLOCKS);
+
+  const wantTitle = normalizeLine(title);
+  const wantAuthor = normalizeLine(author);
+  return kept.filter((b, i) => {
+    if (i >= limit || b.type === 'img') return true;
+    const text = collapse(b.text);
+    if (FORWARD_RULE.test(text) || ENVELOPE_LINE.test(text)) return false;
+    const norm = normalizeLine(text);
+    if (wantTitle && norm === wantTitle) return false;
+    if (wantAuthor && norm === wantAuthor) return false;
+    if (SHORT_DATE.test(text)) return false;
+    return true;
+  });
+}
+
 /** Serialize blocks back to a compact, inert article HTML string. */
 function blocksToHtml(blocks) {
   const out = [];
@@ -175,11 +266,11 @@ function blocksToHtml(blocks) {
  * article HTML. Returns '' when the input yields no usable blocks, so the caller
  * can fall back to the raw-sanitized body rather than storing nothing.
  */
-function emailToCleanHtml(rawHtml) {
-  const blocks = dedupeBlocks(emailToBlocks(rawHtml));
+function emailToCleanHtml(rawHtml, { title = '' } = {}) {
+  const blocks = dedupeBlocks(trimEmailPreamble(emailToBlocks(rawHtml), title));
   return blocks.length ? blocksToHtml(blocks) : '';
 }
 
 module.exports = {
-  emailToCleanHtml, emailToBlocks, dedupeBlocks, blocksToHtml, MIN_DEDUP_WORDS,
+  emailToCleanHtml, emailToBlocks, dedupeBlocks, trimEmailPreamble, blocksToHtml, MIN_DEDUP_WORDS,
 };

@@ -1715,10 +1715,142 @@ function testChunkedBodyMerge() {
   console.log('  Condé Nast chunked-body merge ✔');
 }
 
+/**
+ * Literary Review puts the reviewer in front of the headline in og:title
+ * ("Stephen Smith - The Narcissist Test") and ships no author metadata, then
+ * ends each page with a "Read more by <author>" list of that author's OTHER
+ * pieces. Readability takes a byline from the first element whose class looks
+ * like `byline|author|dateline`, so it was bylining every review with the
+ * headline of a different review. All 19 saved LR articles were wrong this way.
+ */
+function testLiteraryReviewByline() {
+  const { parseHTML } = require('linkedom');
+  const { stripAuthorTrailers, splitBylineFromTitle, extractReadable } = require('./extract');
+
+  const body = '<article><p>Jon Ronson has spent years chronicling the more improbable '
+    + 'manifestations of what Philip Roth called the American berserk, and this book gathers '
+    + 'the strangest of them into one sustained argument about modern credulity.</p>'
+    + '<p>The middle of the review keeps going with several more sentences of ordinary '
+    + 'critical prose, enough that Readability scores this container as the real body copy '
+    + 'and returns an article rather than rejecting the fixture as too thin.</p>'
+    + '<p>A closing paragraph brings the review to its end without ceremony.</p></article>';
+  const trailer = '<section><header><span class="boldtitle">Read more by</span>'
+    + '<h1>Stephen Smith</h1></header>'
+    + '<article class="article-author-excerpt"><hgroup><h1>California Dreaming</h1></hgroup></article>'
+    + '<article class="article-author-excerpt"><hgroup><h1>Heirs And Graces</h1></hgroup></article>'
+    + '</section>';
+  const page = '<html><head>'
+    + '<title>The Castle by Jon Ronson - review by Stephen Smith</title>'
+    + '<meta property="og:title" content="Stephen Smith - The Narcissist Test">'
+    + '<meta property="og:site_name" content="Literary Review">'
+    + '</head><body>' + body + trailer + '</body></html>';
+
+  // The trailer is what supplies the bogus byline; it goes before Readability runs.
+  const { document } = parseHTML(page);
+  stripAuthorTrailers(document);
+  assert.strictEqual(document.querySelectorAll('article.article-author-excerpt').length, 0,
+    'author teasers removed');
+  assert.ok(!/California Dreaming/.test(document.body.textContent), 'sibling headline gone from text');
+  assert.ok(!/Read more by/.test(document.body.textContent), 'trailer heading gone from text');
+
+  // End to end: reviewer becomes the byline, headline loses its "<author> - " prefix.
+  const art = extractReadable(page, 'https://literaryreview.co.uk/the-narcissist-test');
+  assert.ok(art, 'page still extracts an article');
+  assert.strictEqual(art.title, 'The Narcissist Test', 'author prefix stripped from the title');
+  assert.strictEqual(art.byline, 'Stephen Smith', 'reviewer used as the byline');
+  assert.ok(/American berserk/.test(art.textContent), 'body survives the trailer removal');
+
+  // The split needs the document title to name the same person. Without that
+  // corroboration an ordinary dashed headline must survive untouched.
+  const plain = parseHTML('<html><head><title>Reading List - 09/05/2026</title></head><body></body></html>');
+  const kept = splitBylineFromTitle(plain.document, { title: 'Reading List - 09/05/2026', byline: null });
+  assert.strictEqual(kept.title, 'Reading List - 09/05/2026', 'dashed title without a reviewer is left alone');
+  assert.strictEqual(kept.byline, null, 'no byline invented');
+
+  // Named reviewer, but the title does not start with that name: leave it.
+  const other = parseHTML('<html><head><title>Some Book - review by Jane Doe</title></head><body></body></html>');
+  const untouched = splitBylineFromTitle(other.document, { title: 'An Unrelated Headline', byline: 'Set Already' });
+  assert.strictEqual(untouched.title, 'An Unrelated Headline', 'title kept when the prefix does not match');
+  assert.strictEqual(untouched.byline, 'Set Already', 'existing byline kept');
+
+  // A page with no such trailer must come through unchanged.
+  const clean = parseHTML('<html><body><header><h1>A Normal Header</h1></header><p>Body.</p></body></html>');
+  stripAuthorTrailers(clean.document);
+  assert.ok(/A Normal Header/.test(clean.document.body.textContent), 'ordinary headers survive');
+
+  console.log('  Literary Review title/byline ✔');
+}
+
+/**
+ * A forwarded Substack post opens with the envelope Gmail put in the body, an
+ * open-tracking pixel, the preheader's invisible padding, the banner, and then
+ * the post's own title, author and date — so the title arrived three times
+ * (page header, "Subject:", masthead) and the author twice before any article.
+ * dedupeBlocks can't see it: these are short and differently worded.
+ */
+function testEmailPreambleTrim() {
+  const { emailToCleanHtml, trimEmailPreamble, emailToBlocks } = require('./email');
+
+  const title = 'Did Japan stop dreaming of androids?';
+  const prose = 'Humanoid robots have been promised for decades and the promise keeps '
+    + 'receding, which is the real subject here rather than any particular machine on '
+    + 'any particular stage in any particular year of the long wait.';
+  const raw = '<div>---------- Forwarded message ---------</div>'
+    + '<div>From: Matt Alt from Pure Invention &lt;pureinvention@substack.com&gt;</div>'
+    + '<div>Date: Tue, Aug 25, 2026, 8:18 PM</div>'
+    + '<div>Subject: Did Japan stop dreaming of androids?</div>'
+    + '<div>To: &lt;reader@example.com&gt;</div>'
+    + '<img src="https://eotrx.substackcdn.com/o/9e88479e/p.gif?token=abc" alt="">'
+    + '<div>\u034f \u00ad\u034f \u00ad\u034f \u00ad\u034f \u00ad\u034f \u00ad\u034f</div>'
+    + '<img src="https://substackcdn.com/image/fetch/banner.png" alt="">'
+    + '<h1>Did Japan stop dreaming of androids?</h1>'
+    + '<div>Matt Alt</div>'
+    + '<div>Aug 25</div>'
+    + `<p>${prose}</p>`;
+
+  const html = emailToCleanHtml(raw, { title });
+  const text = html.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ');
+
+  assert.ok(!/Forwarded message/i.test(text), 'forwarding rule dropped');
+  assert.ok(!/\b(From|Subject|Date|To):/.test(text), 'envelope headers dropped');
+  assert.ok(!/Did Japan stop dreaming/i.test(text), 'masthead title dropped (the page header has it)');
+  assert.ok(!/Matt Alt/.test(text), 'masthead author dropped');
+  assert.ok(!/Aug 25/.test(text), 'masthead date dropped');
+  assert.ok(!/p\.gif/.test(html), 'tracking pixel dropped');
+  assert.ok(!/\u034f|\u00ad/.test(text), 'preheader padding dropped');
+  assert.ok(/promise keeps receding/.test(text), 'the article itself survives');
+  assert.ok(/banner\.png/.test(html), 'real images survive');
+
+  // The padding paragraph is not whitespace, so wordCount reads it as hundreds
+  // of words. If the prose scan runs before it is dropped it stops there and
+  // the masthead after it escapes trimming — the bug this guards.
+  const blocks = emailToBlocks(raw);
+  const padIdx = blocks.findIndex((b) => b.type !== 'img' && /\u034f/.test(b.text));
+  assert.ok(padIdx > -1 && padIdx < blocks.findIndex((b) => b.type === 'h'),
+    'fixture really does put padding before the masthead');
+
+  // Nothing to trim: an ordinary message must come through whole.
+  const plain = emailToCleanHtml(`<p>${prose}</p>`, { title: 'Unrelated' });
+  assert.ok(/promise keeps receding/.test(plain), 'ordinary email kept');
+
+  // Without a title every other rule still applies, and no title is invented.
+  const noTitle = emailToCleanHtml(raw).replace(/<[^>]+>/g, ' ');
+  assert.ok(!/Subject:/.test(noTitle), 'envelope still dropped with no title given');
+  assert.ok(/Did Japan stop dreaming/i.test(noTitle), 'masthead kept when there is no title to match');
+
+  // Only the preamble is in scope: a body line matching the title is left be.
+  const late = emailToCleanHtml(`<p>${prose}</p><p>${title}</p>`, { title });
+  assert.ok(/Did Japan stop dreaming/i.test(late), 'a match after the prose starts is untouched');
+
+  console.log('  Email preamble/masthead trim ✔');
+}
+
 testEmailNormalization();
 testEconomistEndMark();
 testNewYorkerCartoons();
 testChunkedBodyMerge();
+testLiteraryReviewByline();
+testEmailPreambleTrim();
 testReparseEngine().catch((e) => { console.error(e); process.exit(1); });
 checkDockerfileCopiesEveryModule();
 main().catch((e) => { console.error(e); process.exit(1); });
