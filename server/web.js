@@ -86,9 +86,11 @@ const TYPE_SCRIPT = `
 const FAVICON = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Ctext y='13' font-size='13'%3E%F0%9F%93%9A%3C/text%3E%3C/svg%3E";
 
 const CSS = `
-:root { --bg:#faf9f7; --fg:#1a1a18; --muted:#77726a; --card:#ffffff; --line:#e6e2db; --accent:#3d6b52; --accent-fg:#ffffff; --mark:#f4e9c8; }
+:root { --bg:#faf9f7; --fg:#1a1a18; --muted:#77726a; --card:#ffffff; --line:#e6e2db; --accent:#3d6b52; --accent-fg:#ffffff; --mark:#f4e9c8;
+  --archive:#3d6b52; --archive-fg:#ffffff; --restore:#8f5618; --restore-fg:#ffffff; }
 @media (prefers-color-scheme: dark) {
-  :root { --bg:#191a1c; --fg:#e8e6e1; --muted:#96918a; --card:#212326; --line:#33363a; --accent:#7fb99a; --accent-fg:#14150f; --mark:#4a4223; }
+  :root { --bg:#191a1c; --fg:#e8e6e1; --muted:#96918a; --card:#212326; --line:#33363a; --accent:#7fb99a; --accent-fg:#14150f; --mark:#4a4223;
+    --archive:#7fb99a; --archive-fg:#14150f; --restore:#d9a464; --restore-fg:#14150f; }
 }
 * { box-sizing: border-box; }
 body { margin:0; background:var(--bg); color:var(--fg); font:16px/1.6 Georgia, 'Times New Roman', serif; }
@@ -226,10 +228,31 @@ code.token { background:var(--card); border:1px solid var(--line); border-radius
 .end-actions .act { font-size:.95rem; padding:.6rem 1.1rem; border-radius:8px; text-decoration:none; border:1px solid var(--line); color:var(--muted); background:none; cursor:pointer; }
 .end-actions .act:hover { color:var(--fg); border-color:var(--muted); }
 .end-actions button.act { color:var(--accent-fg); background:var(--accent); border-color:var(--accent); }
+.end-actions button.act.arch[data-val="true"] { background:var(--archive); border-color:var(--archive); color:var(--archive-fg); }
+.end-actions button.act.arch[data-val="false"] { background:var(--restore); border-color:var(--restore); color:var(--restore-fg); }
 .end-actions button.act:hover { color:var(--accent-fg); opacity:.9; }
 /* Public (shared) reader: a quiet strip saying where this came from. */
 .pub-note { font-family:system-ui,sans-serif; font-size:.8rem; color:var(--muted); border-top:1px solid var(--line); margin-top:2.5rem; padding-top:.8rem; }
 button.act.on { color:var(--accent); border-color:var(--accent); }
+/* Archive and Unarchive are opposite actions that shared one neutral button and
+   differed by two letters, so in the reader they read as the same control. Each
+   gets a filled colour of its own — green to file it away, ochre to pull it
+   back out — and the labels carry a direction glyph, so the pair still tells
+   itself apart with the colour taken away. Only the reader's three: a list row
+   sets one of these beside several other buttons, where a filled one would
+   shout. Keyed on .arch rather than [data-act] so this stylesheet, which is
+   inlined into every page including the public share view, never carries the
+   markup of a control that page does not have. */
+button.act.arch { border:1px solid transparent; font-weight:600; }
+button.act.arch[data-val="true"] {
+  background:var(--archive); border-color:var(--archive); color:var(--archive-fg);
+}
+button.act.arch[data-val="false"] {
+  background:var(--restore); border-color:var(--restore); color:var(--restore-fg);
+}
+button.act.arch:hover { opacity:.88; }
+button.act.arch[data-val="true"]:hover { color:var(--archive-fg); }
+button.act.arch[data-val="false"]:hover { color:var(--restore-fg); }
 /* article count on a view chip — present but never louder than the name */
 .chip-n { color:var(--muted); font-size:.85em; font-variant-numeric:tabular-nums; }
 .view-chip.active .chip-n { color:inherit; opacity:.75; }
@@ -261,6 +284,8 @@ article.reader .content { touch-action:manipulation; }
 #float-bar.show { transform:translate(-50%, 0); opacity:1; pointer-events:auto; }
 #float-bar .act, #float-bar a.act { font-size:.9rem; padding:.45rem .85rem; border-radius:999px; text-decoration:none; border:none; background:none; color:var(--fg); cursor:pointer; white-space:nowrap; }
 #float-bar .act.primary { background:var(--accent); color:var(--accent-fg); }
+#float-bar .act.arch[data-val="true"] { background:var(--archive); color:var(--archive-fg); }
+#float-bar .act.arch[data-val="false"] { background:var(--restore); color:var(--restore-fg); }
 #float-bar .sel-only { display:none; }
 #float-bar.has-sel .sel-only { display:inline-block; }
 /* Full-screen reading: just the text. The site header goes; the floating bar
@@ -982,6 +1007,10 @@ function readerPage(ctx, user, article, url) {
       <div class="hl-item-actions"><button class="act del-hl" data-id="${h.id}">Delete</button></div>
     </div>`).join('\n');
 
+  // One label for the three places the reader offers it (header, end bar,
+  // floating bar), so the glyph and the wording cannot drift apart between them.
+  const archiveLabel = article.archived ? '\u21ba Unarchive' : '\u2193 Archive';
+
   const body = `
 <article class="reader">
   <header>
@@ -989,7 +1018,7 @@ function readerPage(ctx, user, article, url) {
     <div class="meta">${meta}${originalLink}</div>
     <div class="actions reader-actions">
       <button class="act fav" data-act="favorite" data-val="${article.favorite ? 'false' : 'true'}" title="Favorite">${article.favorite ? '★' : '☆'}</button>
-      <button class="act" data-act="archive" data-val="${article.archived ? 'false' : 'true'}">${article.archived ? 'Unarchive' : 'Archive'}</button>
+      <button class="act arch" data-act="archive" data-val="${article.archived ? 'false' : 'true'}">${archiveLabel}</button>
       <button class="act${article.shareId ? ' on' : ''}" id="share-btn" title="Public link to the parsed article — your highlights are not shown">${article.shareId ? 'Shared ✓' : 'Share'}</button>
       <button class="act" id="type-btn" title="Text size, spacing, width and typeface">Aa</button>
       <button class="act" id="fs-btn" title="Full screen (f)">&#x26F6;</button>
@@ -1002,7 +1031,7 @@ function readerPage(ctx, user, article, url) {
        happens at the BOTTOM. Scrolling back up to the header to archive was the
        one thing the reader made you do twice. -->
   <div class="end-actions">
-    <button class="act big" data-act="archive" data-val="${article.archived ? 'false' : 'true'}">${article.archived ? 'Unarchive' : 'Archive'}${article.archived ? '' : ' and go back'}</button>
+    <button class="act big arch" data-act="archive" data-val="${article.archived ? 'false' : 'true'}">${archiveLabel}${article.archived ? '' : ' and go back'}</button>
     <a class="act big" href="${escapeHtml(backTo)}">Back to the list</a>
   </div>
 </article>
@@ -1013,7 +1042,7 @@ function readerPage(ctx, user, article, url) {
 <div id="hl-tip" hidden><button id="hl-save">Highlight</button><button id="skip-save" title="Drop this text from articles saved in future">Never import</button></div>
 <div id="float-bar">
   <a class="act" href="${escapeHtml(backTo)}">&larr; Back</a>
-  <button class="act" data-act="archive" data-val="${article.archived ? 'false' : 'true'}">${article.archived ? 'Unarchive' : 'Archive'}</button>
+  <button class="act arch" data-act="archive" data-val="${article.archived ? 'false' : 'true'}">${archiveLabel}</button>
   <button class="act" id="fs-float" title="Full screen">&#x26F6;</button>
   <button class="act primary sel-only" id="hl-save-float">Highlight</button>
   <button class="act sel-only" id="skip-save-float" title="Drop this text from articles saved in future">Never import</button>

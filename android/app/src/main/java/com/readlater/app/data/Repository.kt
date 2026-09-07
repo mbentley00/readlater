@@ -25,6 +25,12 @@ class Repository(
     private val highlightDao = db.highlightDao()
     private val bgScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
+    private companion object {
+        /** Consecutive failed body fetches that make [nextAfterInView] give up
+         *  rather than keep trying every remaining article in the view. */
+        const val MAX_BODY_FETCH_FAILURES = 3
+    }
+
     fun articles(archived: Boolean): Flow<List<ArticleEntity>> =
         articleDao.articlesByArchived(archived)
 
@@ -128,9 +134,26 @@ class Repository(
             val q = playQueue
             val i = q.indexOf(current.id)
             if (i < 0) return@withContext nextInboxArticle(current)
+            var failedFetches = 0
             for (j in i + 1 until q.size) {
-                val a = articleDao.getById(q[j])
-                if (a != null) return@withContext a
+                val a = articleDao.getById(q[j]) ?: continue
+                if (!a.html.isNullOrBlank()) return@withContext a
+                // No cached body. Archived articles never get one eagerly (see
+                // syncNow step 5), and neither do inbox rows that predate the last
+                // full sync — so an unfiltered queue used to hand one of these to
+                // the service, which stops dead on a missing body. Fetch it the
+                // way the reader does on open instead of ending the queue here.
+                // Only a *network* failure gets us past the fetch, so a short run
+                // of them means we're offline: give up rather than walk thousands
+                // of ids. (Skipping is right either way — the article keeps its
+                // place in the view and plays fine once a body is available.)
+                if (fetchArticleBody(a.id).isSuccess) {
+                    articleDao.getById(a.id)
+                        ?.takeIf { !it.html.isNullOrBlank() }
+                        ?.let { return@withContext it }
+                } else if (++failedFetches >= MAX_BODY_FETCH_FAILURES) {
+                    return@withContext null
+                }
             }
             null // reached the end of the view
         }
