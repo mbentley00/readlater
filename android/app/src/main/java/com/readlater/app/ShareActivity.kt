@@ -143,7 +143,20 @@ class ShareActivity : ComponentActivity() {
                 Toast.makeText(applicationContext, "Transcribing: $title", Toast.LENGTH_LONG).show()
                 runCatching { app.repository.syncNow() } // the stub shows up in the list
             } catch (e: Exception) {
-                Toast.makeText(applicationContext, "Couldn't send: ${e.message ?: "error"}", Toast.LENGTH_LONG).show()
+                // An upload that failed *here* has often landed there. The server
+                // creates the article the moment it has the bytes and only then
+                // replies, so a connection lost at the end — or a player that
+                // pulls its file out from under us as we finish — looks like
+                // failure on this side while the episode is already transcribing
+                // on that one. Syncing before reporting means the article turns
+                // up in the list instead of seeming lost. Sharing again is safe
+                // regardless: the server dedupes on the file's content hash.
+                runCatching { app.repository.syncNow() }
+                Toast.makeText(
+                    applicationContext,
+                    "Couldn't confirm: ${e.message ?: "error"} — check the list, it may have saved anyway",
+                    Toast.LENGTH_LONG
+                ).show()
             } finally {
                 spool?.delete()
                 finish()
