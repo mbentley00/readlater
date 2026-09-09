@@ -914,6 +914,19 @@ async function main() {
     res = await upload('/api/import/file?filename=My_Podcast_Episode.mp3', mp3Buf);
     assert.strictEqual(res.status, 200, 'audio re-import is idempotent');
     assert.strictEqual((await res.json()).id, audioArticle.id, 'audio re-import dedupes');
+    // The Android share posts to the explicitly-named endpoint (it knows it is
+    // sending audio) rather than letting /import/file sniff it, and URL-encodes
+    // the episode's filename into the query.
+    const mp3Buf2 = Buffer.concat([Buffer.from('ID3'), Buffer.alloc(65)]);
+    res = await upload('/api/import/audio?filename=' + encodeURIComponent('Shared Episode 1.mp3'), mp3Buf2);
+    assert.strictEqual(res.status, 202, '/import/audio accepts a named audio upload');
+    const shared = await res.json();
+    assert.strictEqual(shared.siteName, 'Podcast');
+    assert.strictEqual(shared.title, 'Shared Episode 1', 'encoded filename survives as the title');
+    res = await upload('/api/import/audio?filename=notaudio.mp3', Buffer.from('just some text'));
+    assert.strictEqual(res.status, 400, '/import/audio rejects a file that is not audio');
+    await api('DELETE', `/api/articles/${shared.id}`);
+
     await api('DELETE', `/api/articles/${audioArticle.id}`);
     console.log('  Audio (podcast) import + transcription ✔');
 

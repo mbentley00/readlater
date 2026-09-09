@@ -48,6 +48,17 @@
                 <category android:name="android.intent.category.DEFAULT" />
                 <data android:mimeType="text/plain" />
             </intent-filter>
+            <!-- A podcast episode shared out of a player: the file itself, which
+                 the server transcribes. A player's link to an episode is no use
+                 here — nothing resolves a podcast URL to its audio. application/ogg
+                 is listed because some providers type an .ogg/.opus episode that
+                 way rather than audio/*. -->
+            <intent-filter>
+                <action android:name="android.intent.action.SEND" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="audio/*" />
+                <data android:mimeType="application/ogg" />
+            </intent-filter>
         </activity>
 
         <service

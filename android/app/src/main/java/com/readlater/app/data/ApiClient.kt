@@ -5,9 +5,14 @@ import kotlinx.coroutines.withContext
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import okhttp3.RequestBody
 import okhttp3.RequestBody.Companion.toRequestBody
+import okio.BufferedSink
+import okio.source
 import org.json.JSONObject
 import java.io.IOException
+import java.io.InputStream
+import java.net.URLEncoder
 import java.util.concurrent.TimeUnit
 
 /** Article metadata (plus body when fetched individually) as returned by the server. */
@@ -68,7 +73,18 @@ class ApiClient(private val settings: Settings) {
         .writeTimeout(30, TimeUnit.SECONDS)
         .build()
 
+    // Uploading a two-hour episode over mobile data takes far longer than any
+    // other call this app makes, and the write timeout above is what would end
+    // it. Shares the connection pool with [client]; only the clocks differ.
+    private val uploadClient by lazy {
+        client.newBuilder()
+            .writeTimeout(0, TimeUnit.MILLISECONDS)
+            .readTimeout(5, TimeUnit.MINUTES)
+            .build()
+    }
+
     private val jsonMediaType = "application/json; charset=utf-8".toMediaType()
+    private val audioMediaType = "application/octet-stream".toMediaType()
 
     private fun builder(path: String): Request.Builder {
         val base = settings.serverUrl
@@ -80,9 +96,12 @@ class ApiClient(private val settings: Settings) {
             .header("Authorization", "Bearer ${settings.token}")
     }
 
-    private suspend fun execute(request: Request): String = withContext(Dispatchers.IO) {
+    private suspend fun execute(
+        request: Request,
+        httpClient: OkHttpClient = client,
+    ): String = withContext(Dispatchers.IO) {
         val response = try {
-            client.newCall(request).execute()
+            httpClient.newCall(request).execute()
         } catch (e: IOException) {
             throw IOException("Network error: ${e.message}", e)
         }
@@ -282,6 +301,39 @@ class ApiClient(private val settings: Settings) {
                 .build()
         )
         return JSONObject(body).optString("title", "Saved")
+    }
+    /**
+     * POST /api/import/audio — a podcast episode shared out of a player, which
+     * the server transcribes in the background. Returns straight away with a
+     * "Transcribing…" stub; the text lands on a later sync.
+     *
+     * The body is streamed from [openStream] rather than passed as a ByteArray:
+     * a two-hour episode is ~85MB, and holding that in the heap is how a phone
+     * running low on memory loses the share instead of saving it. [openStream]
+     * is called per attempt, so a retry re-reads from the beginning.
+     *
+     * The server sniffs the format from the bytes, so the media type sent here
+     * is only a hint and a wrong one costs nothing.
+     */
+    suspend fun importAudio(
+        filename: String,
+        contentLength: Long,
+        openStream: () -> InputStream,
+    ): String {
+        val body = object : RequestBody() {
+            override fun contentType() = audioMediaType
+            override fun contentLength() = contentLength
+            override fun writeTo(sink: BufferedSink) {
+                openStream().use { input -> sink.writeAll(input.source()) }
+            }
+        }
+        val response = execute(
+            builder("/api/import/audio?filename=" + URLEncoder.encode(filename, "UTF-8"))
+                .post(body)
+                .build(),
+            uploadClient,
+        )
+        return JSONObject(response).optString("title", "Episode")
     }
 
     /**
