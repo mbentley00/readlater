@@ -53,6 +53,29 @@ private val WarmDarkColors = darkColorScheme(
     onSurfaceVariant = Color(0xFFD5C3B5)
 )
 
+/**
+ * Archive and Unarchive are opposite actions that Material draws as the same
+ * box one arrow-direction apart, so at toolbar size they read as one control.
+ * They get a colour each — green to file it away, ochre to pull it back out,
+ * the pair the web reader uses.
+ *
+ * Fixed values rather than theme roles: from Android 12 this app takes its
+ * palette from the wallpaper, and two dynamic roles can land close enough to
+ * each other to undo the distinction on someone's device. These cannot.
+ */
+val ArchiveGreen = Color(0xFF3D6B52)
+val ArchiveGreenDark = Color(0xFF7FB99A)
+val RestoreOchre = Color(0xFF8F5618)
+val RestoreOchreDark = Color(0xFFD9A464)
+
+/** The tint for an archive/unarchive control, by what tapping it will do. */
+@Composable
+fun archiveTint(archived: Boolean): Color = if (isSystemInDarkTheme()) {
+    if (archived) RestoreOchreDark else ArchiveGreenDark
+} else {
+    if (archived) RestoreOchre else ArchiveGreen
+}
+
 /** Comfortable serif style for article body text. */
 val ReadingTextStyle = TextStyle(
     fontFamily = FontFamily.Serif,

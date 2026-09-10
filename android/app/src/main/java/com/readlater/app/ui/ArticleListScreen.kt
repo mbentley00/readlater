@@ -32,7 +32,7 @@ import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Star
 import androidx.compose.material.icons.filled.StarBorder
 import androidx.compose.material.icons.filled.SystemUpdate
-import androidx.compose.material.icons.filled.Unarchive
+import androidx.compose.material.icons.filled.Undo
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.AssistChip
 import androidx.compose.material3.OutlinedTextField
@@ -655,7 +655,13 @@ private fun ArticleCard(
                 DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
                     DropdownMenuItem(
                         text = { Text(if (article.archived) "Unarchive" else "Archive") },
-                        leadingIcon = { Icon(if (article.archived) Icons.Filled.Unarchive else Icons.Filled.Archive, null) },
+                        leadingIcon = {
+                            Icon(
+                                if (article.archived) Icons.Filled.Undo else Icons.Filled.Archive,
+                                null,
+                                tint = archiveTint(article.archived)
+                            )
+                        },
                         onClick = { menuOpen = false; onToggleArchive() }
                     )
                     DropdownMenuItem(

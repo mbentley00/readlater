@@ -63,7 +63,7 @@ import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.KeyboardArrowUp
 import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.StarBorder
-import androidx.compose.material.icons.filled.Unarchive
+import androidx.compose.material.icons.filled.Undo
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.BottomAppBar
 import androidx.compose.material3.Button
@@ -612,8 +612,14 @@ fun ReaderScreen(articleId: String, onBack: () -> Unit, onOpenArticle: (String) 
                             }
                         }) {
                             Icon(
-                                if (a.archived) Icons.Filled.Unarchive else Icons.Filled.Archive,
-                                contentDescription = if (a.archived) "Unarchive" else "Archive"
+                                // Undo, not Material's Unarchive: that is the Archive
+                                // box with the arrow flipped, which is the whole
+                                // problem. A curved arrow shares no silhouette with a
+                                // box, so the two stay apart at a glance and for
+                                // anyone who cannot use the colour.
+                                if (a.archived) Icons.Filled.Undo else Icons.Filled.Archive,
+                                contentDescription = if (a.archived) "Unarchive" else "Archive",
+                                tint = archiveTint(a.archived)
                             )
                         }
                         Box {
