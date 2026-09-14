@@ -15,6 +15,7 @@
     <uses-permission android:name="android.permission.WAKE_LOCK" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
     <application
@@ -60,6 +61,14 @@
                 <data android:mimeType="application/ogg" />
             </intent-filter>
         </activity>
+
+        <!-- Uploads a shared podcast episode. Outlives the noHistory share
+             activity, whose own scope was cancelled mid-upload whenever the user
+             returned to their player. -->
+        <service
+            android:name=".ShareUploadService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
 
         <service
             android:name=".tts.TtsService"

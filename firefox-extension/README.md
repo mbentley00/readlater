@@ -54,6 +54,25 @@ The `Ctrl+Shift+…` family is the safe one for a default. Whatever you pick,
 `about:addons` → gear → **Manage Extension Shortcuts** lets each user rebind it
 and flags conflicts live.
 
+### Re-save phone shares automatically
+
+A link shared from the Android app is fetched by the server, which isn't logged
+in to anything — so a paywalled or login-walled page arrives as a teaser. Turn on
+Options → **Re-save phone shares when I open them here** and opening such an
+article in Firefox captures the page as you see it and replaces the phone copy
+(a ✓ on the icon, and an "Updated in Earmark" notification).
+
+- It asks for access to all sites (an optional permission, requested only when you
+  tick the box and dropped again when you untick it).
+- The extension fetches the list of phone saves from the last 90 days
+  (`GET /api/resave-candidates`, refreshed every 10 minutes) and matches tabs
+  against it locally. Browsing never sends a URL to the server; only a page that is
+  already one of those saves is captured, and private windows are ignored.
+- The server has the last word, and skips the re-save when the article has
+  highlights (they're anchored to its current paragraphs), was already re-saved,
+  or the capture is much thinner than the stored copy (a cookie wall, say). A
+  skipped article isn't captured again for a week.
+
 ## Publish an update
 
 `./publish.sh` signs the extension (Mozilla "unlisted") and uploads the `.xpi` to
@@ -94,5 +113,6 @@ the server publishes and exits non-zero if they differ.
 | `options.html/js` | Server URL + token settings with connection test |
 
 Permissions are minimal: `activeTab` (read the page only when you invoke the
-extension), `storage`, `contextMenus`, `notifications`. Your server must allow
+extension), `storage`, `contextMenus`, `notifications` — plus the optional
+all-sites permission, only if you turn on automatic re-save. Your server must allow
 CORS (the bundled server does).

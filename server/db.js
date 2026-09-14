@@ -492,6 +492,87 @@ function ftsMatch(q) {
   return { clause, args };
 }
 
+// ------------------------------------------------------------ related articles
+
+/** Words too common to say what an article is about (beyond the idf cut). */
+const STOPWORDS = new Set(`
+  about above after again against also although always among another anyone anything around
+  because been before being below between both came cannot could does doing done down during each
+  either else enough even ever every first from further gets getting give given goes going gone
+  good great have having here hers herself himself however into itself just keep know known last
+  least less like likely little long made make makes making many maybe might more most much must
+  myself never next nothing often once only other others otherwise ours ourselves over own part
+  people perhaps please put quite rather really said same saying says seem seemed seems several
+  shall should show since some something sometimes soon still such take taken than that their
+  theirs them themselves then there these they thing things think this those though three through
+  thus time times today together told took toward towards under until upon used using very want
+  wants well were what whatever when where whether which while whom whose will with within without
+  work would year years your yours yourself also just like said says want get got new one two
+`.split(/\s+/).filter(Boolean));
+
+/** Roughly FTS5's unicode61 tokenizer: lower case, diacritics removed. */
+const tokenize = (s) => String(s || '').normalize('NFKD').replace(/[̀-ͯ]/g, '')
+  .toLowerCase().split(/[^\p{L}\p{N}]+/u);
+
+/**
+ * A crude stem, so "ploughing", "ploughed" and "ploughs" count as one term
+ * instead of crowding every other word out of the list. Null when stripping
+ * would leave too little to prefix-match safely ("dates" → "dat" would match
+ * "data"); such a word is matched exactly instead.
+ */
+const stemOf = (t) => {
+  const s = t.replace(/(?:ies|ing|ed|es|ly|s)$/, '');
+  return s.length >= 5 ? s : null;
+};
+
+/**
+ * The terms that say what an article is about: frequent in it (title words
+ * count extra) and rare across the library. dfOf(word) is the number of
+ * articles containing the word. Each term comes back as
+ * { display, expr (an FTS5 expression), weight }.
+ */
+function distinctiveTerms({ title, textContent }, docs, dfOf, max = 12) {
+  const groups = new Map();
+  const add = (text, weight) => {
+    for (const t of tokenize(text)) {
+      if (t.length < 4 || t.length > 30 || /^\d+$/.test(t) || STOPWORDS.has(t)) continue;
+      const stem = stemOf(t);
+      const key = stem || t;
+      let g = groups.get(key);
+      if (!g) groups.set(key, (g = { key, prefix: !!stem, tf: 0, forms: new Map() }));
+      g.tf += weight;
+      g.forms.set(t, (g.forms.get(t) || 0) + weight);
+    }
+  };
+  add(title, 4);
+  add(String(textContent || '').slice(0, 60000), 1);
+  const scored = [];
+  for (const g of [...groups.values()].sort((x, y) => y.tf - x.tf).slice(0, 80)) {
+    if (g.tf < 2) continue;
+    const df = Math.max(...[...g.forms.keys()].map(dfOf));
+    if (df < 2) continue;                        // in no other article
+    if (docs >= 50 && df > docs * 0.2) continue; // too common to mean anything
+    const display = [...g.forms].sort((x, y) => y[1] - x[1])[0][0];
+    const word = (g.prefix ? g.key : display).replace(/"/g, '""');
+    scored.push({
+      display,
+      expr: g.prefix ? `"${word}"*` : `"${word}"`,
+      weight: (1 + Math.log(g.tf)) * Math.log(1 + docs / df),
+    });
+  }
+  return scored.sort((x, y) => y.weight - x.weight).slice(0, max);
+}
+
+/** A related article must share at least this many of the terms… */
+const RELATED_MIN_SHARED = 2;
+/** …weighing at least this fraction of the article's top three terms together.
+ *  Stops one rare name in passing (a painter's article that mentions Pétain)
+ *  from pulling in everything else about it. */
+const RELATED_MIN_STRENGTH = 0.45;
+
+/** Library size per database, for idf. Refreshed every few minutes. */
+const docCounts = new WeakMap();
+
 function open(dataDir) {
   const file = path.join(dataDir, 'readlater.db');
   const sqlite = new Database(file);
@@ -594,6 +675,9 @@ function open(dataDir) {
   // The "From phone" list filters on source; without this, its count reads
   // every (blob-laden) row of the account. Same reasoning as articles_user_arch_saved.
   sqlite.exec('CREATE INDEX IF NOT EXISTS articles_user_source ON articles(userId, source)');
+  // Per-term document counts straight from the FTS index (no copy of the data),
+  // so "how rare is this word" is one index lookup — see distinctiveTerms.
+  sqlite.exec("CREATE VIRTUAL TABLE IF NOT EXISTS articles_fts_vocab USING fts5vocab(articles_fts, 'row')");
   // one-time recompute after the script/style-stripping fix (imported
   // articles were over-counted by embedded JSON-LD / scripts).
   if (sqlite.pragma('user_version', { simple: true }) < 2) {
@@ -728,6 +812,13 @@ function open(dataDir) {
       (prep('ags', 'SELECT sourceHtml FROM articles WHERE id = ? AND userId = ?').get(id, userId) || {}).sourceHtml || '',
     articleByUrl: (userId, url) =>
       rowArticle(prep('abu', `SELECT ${ARTICLE_COLS} FROM articles WHERE userId = ? AND url = ?`).get(userId, url)),
+    /** Recent phone saves, for the extension's automatic re-save. Only id/url/
+     *  savedAt are read, all ahead of the content blobs, and source is covered
+     *  by articles_user_source — so this never walks overflow pages. */
+    resaveCandidates: (userId, sinceSavedAt) =>
+      prep('resaveCands', `SELECT id, url FROM articles
+        WHERE userId = ? AND source = 'android-share' AND savedAt >= ?
+        ORDER BY savedAt DESC LIMIT 1000`).all(userId, sinceSavedAt),
     // Deliberately NOT scoped to a user: the whole point of a share slug is
     // that whoever holds it can read the article without being anyone.
     articleByShareId: (shareId) =>
@@ -847,6 +938,107 @@ function open(dataDir) {
 
     // ---------------- highlights
     highlightCount: (userId) => prep('hc', 'SELECT COUNT(*) c FROM highlights WHERE userId = ?').get(userId).c,
+    /**
+     * Highlighted articles related to one article, for the web reader's
+     * "Related" panel. The article's most distinctive terms are OR-searched
+     * against everything the user highlighted (the passages they chose to
+     * keep) and against the highlighted articles themselves (title weighted
+     * most), and the two bm25 rankings are blended. Null when the article isn't
+     * the user's.
+     */
+    relatedHighlighted: (userId, articleId, { limit = 8 } = {}) => {
+      const src = prep('relSrc', 'SELECT title, textContent FROM articles WHERE id = ? AND userId = ?').get(articleId, userId);
+      if (!src) return null;
+      let docs = docCounts.get(sqlite);
+      if (!docs || Date.now() - docs.at > 10 * 60 * 1000) {
+        docs = { n: prep('relDocs', 'SELECT COUNT(*) c FROM articles').get().c, at: Date.now() };
+        docCounts.set(sqlite, docs);
+      }
+      const dfStmt = prep('relDf', 'SELECT doc FROM articles_fts_vocab WHERE term = ?');
+      const terms = distinctiveTerms(src, docs.n, (t) => (dfStmt.get(t) || {}).doc || 0);
+      const display = terms.map((t) => t.display);
+      if (!terms.length) return { terms: display, articles: [] };
+
+      const q = terms.map((t) => t.expr).join(' OR ');
+      const bind = { q, userId, id: articleId };
+      const hlRows = prep('relHl', `SELECT h.articleId, h.text, h.note, bm25(highlights_fts) AS s
+        FROM highlights_fts JOIN highlights h ON h.rowid = highlights_fts.rowid
+        WHERE highlights_fts MATCH @q AND h.userId = @userId AND h.articleId != @id
+        ORDER BY s LIMIT 300`).all(bind);
+      // bm25 weights follow the FTS columns: title, byline, siteName, excerpt, textContent.
+      const artRows = prep('relArt', `SELECT a.id, bm25(articles_fts, 8.0, 0.5, 0.5, 2.0, 1.0) AS s
+        FROM articles_fts JOIN articles a ON a.rowid = articles_fts.rowid
+        WHERE articles_fts MATCH @q AND a.userId = @userId AND a.id != @id
+          AND EXISTS (SELECT 1 FROM highlights hx WHERE hx.articleId = a.id)
+        ORDER BY s LIMIT 300`).all(bind);
+
+      // bm25 is negative, best first: dividing by the best score puts each
+      // ranking on a 0–1 scale so the two can be added.
+      const scaled = (s, rows) => (rows.length && rows[0].s < 0 ? s / rows[0].s : 0);
+      const byArticle = new Map();
+      const entry = (id) => {
+        if (!byArticle.has(id)) byArticle.set(id, { id, art: 0, hls: [] });
+        return byArticle.get(id);
+      };
+      for (const r of artRows) entry(r.id).art = scaled(r.s, artRows);
+      for (const r of hlRows) entry(r.articleId).hls.push({ text: r.text, note: r.note, w: scaled(r.s, hlRows) });
+      const ranked = [...byArticle.values()]
+        .map((e) => ({ ...e, score: e.art + 0.7 * e.hls.slice(0, 3).reduce((sum, h) => sum + h.w, 0) }))
+        .sort((x, y) => y.score - x.score);
+      // An OR query ranks a single strong word highly. Check, for the leading
+      // candidates, which terms each one really shares — in its own text or its
+      // highlights — and keep only those sharing enough of what this article is about.
+      const pool = ranked.slice(0, 40);
+      if (!pool.length) return { terms: display, articles: [] };
+      const cph = pool.map((_, i) => `@c${i}`).join(', ');
+      const cands = Object.fromEntries(pool.map((e, i) => [`c${i}`, e.id]));
+      const artHas = sqlite.prepare(`SELECT a.id FROM articles_fts JOIN articles a ON a.rowid = articles_fts.rowid
+        WHERE articles_fts MATCH @expr AND a.id IN (${cph})`);
+      const hlHas = sqlite.prepare(`SELECT DISTINCT h.articleId AS id FROM highlights_fts JOIN highlights h ON h.rowid = highlights_fts.rowid
+        WHERE highlights_fts MATCH @expr AND h.articleId IN (${cph})`);
+      const shared = new Map(pool.map((e) => [e.id, []]));
+      for (const t of terms) {
+        const bindT = { ...cands, expr: t.expr };
+        const hits = new Set([...artHas.all(bindT), ...hlHas.all(bindT)].map((r) => r.id));
+        for (const id of hits) shared.get(id).push(t);
+      }
+      const topWeight = terms.slice(0, 3).reduce((sum, t) => sum + t.weight, 0) || 1;
+      const picked = pool
+        .map((e) => {
+          const ts = shared.get(e.id);
+          const strength = ts.reduce((sum, t) => sum + t.weight, 0) / topWeight;
+          return { ...e, matched: ts.map((t) => t.display), strength, final: e.score * Math.min(1, strength) };
+        })
+        .filter((e) => e.matched.length >= RELATED_MIN_SHARED && e.strength >= RELATED_MIN_STRENGTH)
+        .sort((x, y) => y.final - x.final)
+        .slice(0, limit);
+      if (!picked.length) return { terms: display, articles: [] };
+
+      const ph = picked.map((_, i) => `@r${i}`).join(', ');
+      const ids = Object.fromEntries(picked.map((e, i) => [`r${i}`, e.id]));
+      // Early columns only — never the content blobs.
+      const meta = new Map(sqlite.prepare(`SELECT id, title, siteName FROM articles WHERE id IN (${ph})`)
+        .all(ids).map((r) => [r.id, r]));
+      const counts = new Map(sqlite.prepare(`SELECT articleId, COUNT(*) n FROM highlights WHERE articleId IN (${ph}) GROUP BY articleId`)
+        .all(ids).map((r) => [r.articleId, r.n]));
+      const clip = (s) => (s && s.length > 280 ? `${s.slice(0, 280)}…` : s);
+      const hfa = prep('relFirstHls', 'SELECT text, note FROM highlights WHERE articleId = ? ORDER BY createdAt LIMIT 2');
+      return {
+        terms: display,
+        articles: picked.filter((e) => meta.has(e.id)).map((e) => ({
+          id: e.id,
+          title: meta.get(e.id).title,
+          siteName: meta.get(e.id).siteName,
+          highlightCount: counts.get(e.id) || 0,
+          matched: e.matched,
+          // The highlights that matched, best first; otherwise its first ones.
+          snippets: (e.hls.length ? e.hls.slice(0, 2) : hfa.all(e.id))
+            .map((h) => ({ text: clip(h.text), note: clip(h.note) || null })),
+        })),
+      };
+    },
+    highlightCountForArticle: (articleId) =>
+      prep('hlCountArticle', 'SELECT COUNT(*) c FROM highlights WHERE articleId = ?').get(articleId).c,
     highlightsForArticle: (articleId) =>
       prep('hfa', 'SELECT * FROM highlights WHERE articleId = ? ORDER BY createdAt').all(articleId),
     highlightsForUser: (userId) => prep('hfu', `SELECT h.*, a.title articleTitle, a.url articleUrl,

@@ -16,16 +16,35 @@ function setStatus(text, cls) {
 const baseUrl = () => (urlEl.value.trim() || DEFAULT_SERVER).replace(/\/+$/, '');
 
 const notifyEl = document.getElementById('notifyMode');
+const autoResaveEl = document.getElementById('autoResave');
+const ALL_SITES = { origins: ['<all_urls>'] };
 
 async function load() {
   const s = await browser.storage.local.get({
-    serverUrl: '', token: '', username: '', notifyMode: 'summary',
+    serverUrl: '', token: '', username: '', notifyMode: 'summary', autoResave: false,
   });
   urlEl.value = s.serverUrl || DEFAULT_SERVER;
   userEl.value = s.username;
   tokenEl.value = s.token;
   notifyEl.value = s.notifyMode;
+  // Off if the permission was revoked in about:addons, whatever was stored.
+  autoResaveEl.checked = s.autoResave && await browser.permissions.contains(ALL_SITES);
 }
+
+autoResaveEl.addEventListener('change', () => {
+  if (autoResaveEl.checked) {
+    // permissions.request must run inside the click itself — no await before it.
+    browser.permissions.request(ALL_SITES).then(async (granted) => {
+      autoResaveEl.checked = granted;
+      await browser.storage.local.set({ autoResave: granted });
+      setStatus(granted ? 'Phone shares will be re-saved when you open them ✔' : 'Not enabled — Firefox access was declined.', granted ? 'ok' : 'err');
+    });
+  } else {
+    browser.storage.local.set({ autoResave: false })
+      .then(() => browser.permissions.remove(ALL_SITES))
+      .then(() => setStatus('Automatic re-save off ✔', 'ok'));
+  }
+});
 
 // Saved on change: it's a preference, not part of the sign-in form.
 notifyEl.addEventListener('change', async () => {

@@ -380,6 +380,58 @@ async function main() {
     w = await webGet(`/?view=v:${r.body.id}`, aliceCookie);
     assert.ok(w.html.includes('Shared From The Phone') && !w.html.includes('A Great Story'), 'saved view filters by source');
     await api('DELETE', `/api/views/${r.body.id}`);
+    // automatic re-save from the extension: the candidate list, and the guards
+    r = await api('GET', '/api/resave-candidates');
+    assert.ok(r.body.articles.some((x) => x.id === phoneId && x.url === 'https://example.com/from-phone'),
+      'a phone save is a re-save candidate');
+    const fullText = 'A complete server-fetched article paragraph with plenty of words in it. '.repeat(40);
+    r = await api('POST', '/api/articles', {
+      url: 'https://example.com/phone-good', title: 'Good Phone Copy',
+      html: `<p>${fullText}</p>`, textContent: fullText, source: 'android-share',
+    });
+    const goodId = r.body.id;
+    r = await api('POST', '/api/articles', {
+      url: 'https://example.com/phone-good', title: 'Consent wall', html: '<p>Accept cookies to continue.</p>',
+      textContent: 'Accept cookies to continue.', source: 'browser-page', autoResave: true,
+    });
+    assert.strictEqual(r.body.skipped, 'capture is shorter', 'a thinner capture never replaces a good copy');
+    r = await api('GET', `/api/articles/${goodId}`);
+    assert.ok(r.body.html.includes('server-fetched article') && r.body.source === 'android-share', 'good copy untouched');
+
+    r = await api('POST', '/api/articles', {
+      url: 'https://example.com/phone-hl', title: 'Highlighted', html: '<p>Subscribe to read.</p>', source: 'android-share',
+    });
+    const phoneHlId = r.body.id;
+    await api('POST', '/api/highlights', { url: 'https://example.com/phone-hl', text: 'Subscribe to read.' });
+    r = await api('POST', '/api/articles', {
+      url: 'https://example.com/phone-hl', title: 'Highlighted', html: `<p>${fullText}</p>`,
+      textContent: fullText, source: 'browser-page', autoResave: true,
+    });
+    assert.strictEqual(r.body.skipped, 'has highlights', 'highlighted articles keep the copy they were made on');
+
+    r = await api('POST', '/api/articles', { url: 'https://example.com/never-saved', title: 'X', html: '<p>x</p>', autoResave: true });
+    assert.strictEqual(r.body.skipped, 'not saved', 'an automatic re-save never creates an article');
+
+    r = await api('POST', '/api/articles', {
+      url: 'https://example.com/phone-teaser', title: 'Teaser', html: '<p>Subscribe to read.</p>', source: 'android-share',
+    });
+    const teaserId = r.body.id;
+    r = await api('POST', '/api/articles', {
+      url: 'https://example.com/phone-teaser', title: 'The Whole Story', html: `<p>${fullText}</p>`,
+      textContent: fullText, source: 'browser-page', autoResave: true,
+    });
+    assert.strictEqual(r.body.id, teaserId, 'teaser replaced in place');
+    assert.strictEqual(r.body.source, 'browser-page', 'and no longer a phone save');
+    assert.ok(r.body.html.includes('server-fetched article'), 'with the captured page');
+    r = await api('GET', '/api/resave-candidates');
+    assert.ok(!r.body.articles.some((x) => x.id === teaserId), 'a re-saved article leaves the candidate list');
+    r = await api('POST', '/api/articles', {
+      url: 'https://example.com/phone-teaser', title: 'Again', html: `<p>${fullText}</p>`,
+      textContent: fullText, source: 'browser-page', autoResave: true,
+    });
+    assert.strictEqual(r.body.skipped, 'already re-saved', 'a second automatic capture is a no-op');
+    for (const id of [goodId, phoneHlId, teaserId]) await api('DELETE', `/api/articles/${id}`);
+
     // re-saving from the Firefox extension flips the source, so it drops off the list
     r = await api('POST', '/api/articles', {
       url: 'https://example.com/from-phone', title: 'Shared From The Phone',
@@ -923,6 +975,12 @@ async function main() {
     const shared = await res.json();
     assert.strictEqual(shared.siteName, 'Podcast');
     assert.strictEqual(shared.title, 'Shared Episode 1', 'encoded filename survives as the title');
+    // A player's episode-id filename is not a title.
+    const opaqueBuf = Buffer.concat([Buffer.from('ID3'), Buffer.alloc(66)]);
+    res = await upload('/api/import/audio?filename=45e41c9b-f365-4349-b5f6-9ce130ede034.mp3', opaqueBuf);
+    const opaque = await res.json();
+    assert.strictEqual(opaque.title, 'Podcast episode', 'episode-id filename replaced by a placeholder');
+    await api('DELETE', `/api/articles/${opaque.id}`);
     res = await upload('/api/import/audio?filename=notaudio.mp3', Buffer.from('just some text'));
     assert.strictEqual(res.status, 400, '/import/audio rejects a file that is not audio');
     await api('DELETE', `/api/articles/${shared.id}`);
@@ -1356,6 +1414,36 @@ async function main() {
     assert.ok((r.body.textContent || '').includes('second thing'), 'quotes are searchable');
     r = await api('GET', '/api/articles?q=keeping&includeArchived=1');
     assert.ok(r.body.articles.some((a) => a.id === stubId), 'stub found by quote text');
+
+    // ---- related highlights (web reader "Related" panel) -------------------
+    const mkArticle = async (url, title, text) =>
+      (await api('POST', '/api/articles', { url, title, html: `<p>${text}</p>`, textContent: text })).body.id;
+    const timberText = 'Mass timber towers use cross-laminated timber panels. Engineers say laminated timber '
+      + 'sways less than expected, and timber construction cuts embodied carbon. ';
+    const relSrc = await mkArticle('https://example.com/rel-src', 'Why timber towers sway', timberText.repeat(3));
+    const relHit = await mkArticle('https://example.com/rel-hit', 'Building with cross-laminated timber',
+      'A report on laminated timber panels and fire. '.repeat(4) + 'Timber construction is growing.');
+    await api('POST', '/api/highlights', { url: 'https://example.com/rel-hit', text: 'Cross-laminated timber panels resist fire better than expected.' });
+    const relMiss = await mkArticle('https://example.com/rel-miss', 'Sourdough at home',
+      'Sourdough starter fermentation needs flour, water and patience. '.repeat(4));
+    await api('POST', '/api/highlights', { url: 'https://example.com/rel-miss', text: 'The starter needs feeding twice a day.' });
+    const relPlain = await mkArticle('https://example.com/rel-unhighlighted', 'Timber towers again', timberText.repeat(2));
+    r = await api('GET', `/api/articles/${relSrc}/related`);
+    assert.strictEqual(r.status, 200, 'related endpoint answers');
+    const relIds = r.body.articles.map((x) => x.id);
+    assert.ok(relIds.includes(relHit), 'a highlighted article on the same subject is related');
+    assert.ok(!relIds.includes(relMiss), 'an off-topic highlighted article is not');
+    assert.ok(!relIds.includes(relPlain), 'articles without highlights are not offered');
+    assert.ok(!relIds.includes(relSrc), 'nor is the article itself');
+    const relFound = r.body.articles.find((x) => x.id === relHit);
+    assert.strictEqual(relFound.highlightCount, 1);
+    assert.ok(relFound.matched.length >= 2 && relFound.matched.includes('timber'), 'says which words it shares');
+    assert.ok(/resist fire/.test(relFound.snippets[0].text), 'the matching highlight comes along');
+    assert.ok(r.body.terms.includes('timber'), 'the terms that drove the match are returned');
+    r = await api('GET', '/api/articles/no-such-article/related');
+    assert.strictEqual(r.status, 404, 'unknown article');
+    for (const id of [relSrc, relHit, relMiss, relPlain]) await api('DELETE', `/api/articles/${id}`);
+    console.log('  Related highlights ✔');
 
     r = await api('POST', '/api/highlights', { url: quotedUrl, text: '   ' });
     assert.strictEqual(r.status, 400, 'empty selection rejected');
@@ -1858,6 +1946,93 @@ function testEmailPreambleTrim() {
   console.log('  Email preamble/masthead trim ✔');
 }
 
+/** Image captions, credits and alt text are never spoken. */
+function testTtsSkipsCaptions() {
+  const { paragraphsOf } = require('./tts');
+  const say = (html) => paragraphsOf({ html });
+
+  // A figure: picture, caption paragraph, figcaption credit.
+  assert.deepStrictEqual(say('<p>Before the picture.</p>'
+    + '<figure><img src="a.jpg" alt="Protesters in the square"><p>Protesters gathered at dawn.</p>'
+    + '<figcaption><span>Photograph: Jane Doe</span></figcaption></figure><p>After the picture.</p>'),
+  ['Before the picture.', 'After the picture.'], 'figure caption and credit skipped');
+
+  // A figure with no picture (a pull quote) keeps its text.
+  assert.deepStrictEqual(say('<figure><p>A quoted aside worth hearing.</p></figure>'),
+    ['A quoted aside worth hearing.'], 'media-less figure still spoken');
+
+  // Flattened: image then an italic caption line, then a credit line.
+  assert.deepStrictEqual(say('<p><img src="a.jpg" alt=""></p><p><em>The harbour at low tide.</em></p>'
+    + '<p>Jane Doe / Getty Images</p><p>The article continues here.</p>'),
+  ['The article continues here.'], 'loose italic caption and agency credit skipped');
+
+  // Flattened: a line that repeats the alt text.
+  assert.deepStrictEqual(say('<img src="a.jpg" alt="A heron standing in reeds"><p>A heron standing in reeds.</p><p>Prose.</p>'),
+    ['Prose.'], 'caption matching alt text skipped');
+
+  // Guardrails: an ordinary paragraph after an image is still the article, and
+  // a credit-looking line with no image before it is left alone.
+  assert.deepStrictEqual(say('<img src="a.jpg" alt="x"><p>The morning began with rain.</p><p>Photo by the author, she said, was lost.</p>'),
+    ['The morning began with rain.', 'Photo by the author, she said, was lost.'], 'prose after an image kept');
+  assert.deepStrictEqual(say('<p><em>An italic opening line of real prose.</em></p>'),
+    ['An italic opening line of real prose.'], 'italic line with no image kept');
+
+  console.log('  TTS skips image captions ✔');
+}
+
+/** Transcript paragraphing and episode titles. */
+function testTranscriptShaping() {
+  const { segmentsToParagraphs, textToParagraphs, audioMeta, PARA_MAX } = require('./transcribe');
+  const sentence = (i) => `This is sentence number ${i} of a long stretch of talk about building in timber.`;
+
+  // Segment boundaries mid-sentence, with a long breath inside a sentence: the
+  // sentence is stitched back together and not broken at the breath.
+  const stitched = segmentsToParagraphs([
+    { start: 0, end: 2, text: ' We went up to the top of' },
+    { start: 5, end: 7, text: ' the tower, and it moved.' },
+  ]);
+  assert.deepStrictEqual(stitched, ['We went up to the top of the tower, and it moved.'], 'no break mid-sentence');
+
+  // A monologue with no pauses: capped paragraphs, each ending a sentence.
+  const mono = segmentsToParagraphs(Array.from({ length: 40 }, (_, i) =>
+    ({ start: i * 4, end: i * 4 + 4, text: ' ' + sentence(i) })));
+  assert.ok(mono.length > 3, 'monologue splits');
+  assert.ok(mono.every((p) => p.length <= PARA_MAX && /\.$/.test(p)), 'capped, and every break is between sentences');
+
+  // An answer after a question starts a paragraph.
+  const qa = segmentsToParagraphs([
+    ...Array.from({ length: 4 }, (_, i) => ({ start: i * 4, end: i * 4 + 4, text: ' ' + sentence(i) })),
+    { start: 16, end: 18, text: ' So how safe is it, really?' },
+    { start: 18.5, end: 22, text: ' Honestly, safer than steel.' },
+  ]);
+  assert.ok(/^Honestly/.test(qa[qa.length - 1]), 'answer after a question starts a paragraph');
+
+  // Abbreviations don't end sentences (so can't host a break).
+  const abbrev = segmentsToParagraphs([
+    ...Array.from({ length: 11 }, (_, i) => ({ start: i, end: i + 1, text: ' ' + sentence(i) })),
+    { start: 11, end: 12, text: ' We asked Dr.' },
+    { start: 15, end: 16, text: ' Smith about it.' },
+  ]);
+  assert.ok(abbrev.some((p) => /Dr\. Smith/.test(p)), '"Dr." does not split a sentence');
+
+  // Unpunctuated run-on text still comes out in readable pieces.
+  const runOn = textToParagraphs(Array.from({ length: 300 }, (_, i) => `word${i}`).join(' '));
+  assert.ok(runOn.length > 1 && runOn.every((p) => p.length <= 1000), 'run-on text is cut up');
+
+  // Titles: embedded tags win; an episode id is no title; a real filename is.
+  assert.deepStrictEqual(audioMeta('45e41c9b-f365-4349-b5f6-9ce130ede034.mp3',
+    { TITLE: 'Why Wood Towers Sway', album: 'The Build Show', artist: 'Jane Host' }),
+  { title: 'Why Wood Towers Sway', siteName: 'The Build Show', byline: 'Jane Host' });
+  assert.strictEqual(audioMeta('45e41c9b-f365-4349-b5f6-9ce130ede034.mp3', {}).title, null, 'uuid is no title');
+  assert.strictEqual(audioMeta('audio.mp3', {}).title, null, '"audio" is no title');
+  assert.strictEqual(audioMeta('Ep. 42_The Thing.mp3', {}).title, 'Ep. 42 The Thing', 'real filename kept');
+  assert.strictEqual(audioMeta('x.mp3', { album: 'Show', artist: 'Show' }).byline, null, 'host equal to show is not a byline');
+
+  console.log('  Transcript paragraphs + episode titles ✔');
+}
+
+testTtsSkipsCaptions();
+testTranscriptShaping();
 testEmailNormalization();
 testEconomistEndMark();
 testNewYorkerCartoons();

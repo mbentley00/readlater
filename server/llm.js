@@ -77,6 +77,37 @@ async function extractArticle({ url, title, pageHtml, hint }) {
   }
 }
 
+const TITLE_SYSTEM = `You name podcast episodes. Given the opening of an episode's transcript, reply with a concise, specific title (3 to 10 words) saying what the episode is about.
+Reply with the title only: no quotes, no trailing period, no "Episode" prefix, and no show name unless the show itself is the subject.`;
+
+/** A title for an episode that arrived with no usable name, from the start of
+ *  its transcript. Null when disabled, on error, or when the reply isn't a
+ *  plausible one-line title — the caller keeps its placeholder. */
+async function titleForTranscript(text) {
+  const c = getClient();
+  if (!c || !text) return null;
+  try {
+    const response = await c.messages.create({
+      model: MODEL,
+      max_tokens: 60,
+      system: TITLE_SYSTEM,
+      messages: [{ role: 'user', content: String(text).slice(0, 12000) }],
+    });
+    const title = response.content
+      .filter((b) => b.type === 'text')
+      .map((b) => b.text)
+      .join('')
+      .trim()
+      .replace(/^["'“‘]+|["'”’.]+$/g, '')
+      .trim();
+    if (title.length < 3 || title.length > 120 || /[\n<>]/.test(title)) return null;
+    return title;
+  } catch (e) {
+    console.error(`LLM episode title failed: ${e.message}`);
+    return null;
+  }
+}
+
 const enabled = () => Boolean(process.env.ANTHROPIC_API_KEY);
 
-module.exports = { extractArticle, enabled };
+module.exports = { extractArticle, titleForTranscript, enabled };

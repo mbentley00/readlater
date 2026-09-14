@@ -190,6 +190,11 @@ let ttsRunning = false;
 // transcription runs at a time, and the article is filled in in place. The
 // audio itself is spooled to disk while queued (an episode is tens of MB; the
 // 512 MB machine should not hold several in memory) and deleted after.
+// Related-highlights answers, keyed user:article. Each is several FTS queries on
+// a single-threaded server, and the panel is often reopened while reading.
+const relatedCache = new Map();
+const RELATED_TTL_MS = 2 * 60 * 1000;
+
 const sttQueued = new Set();
 const sttPending = [];
 let sttRunning = false;
@@ -200,10 +205,11 @@ for (const f of fs.readdirSync(DATA_DIR)) {
   if (f.startsWith('stt-upload-')) { try { fs.unlinkSync(path.join(DATA_DIR, f)); } catch {} }
 }
 
-function enqueueTranscription(articleId, userId, buf, filename) {
+/** Queue a transcription whose audio the caller has already spooled to
+ *  sttSpoolFile(articleId). */
+function enqueueTranscription(articleId, userId, filename) {
   if (sttQueued.has(articleId)) return;
   sttQueued.add(articleId);
-  fs.writeFileSync(sttSpoolFile(articleId), buf);
   sttPending.push({ articleId, userId, filename });
   pumpStt();
 }
@@ -218,8 +224,12 @@ async function pumpStt() {
       const a = store.getArticle(job.articleId, job.userId);
       if (a) {
         const r = await transcribe.transcribeToArticle(fs.readFileSync(spool), job.filename);
+        // No filename or tag named the episode: let the transcript name it.
+        const title = a.title === transcribe.PLACEHOLDER_TITLE
+          ? (await require('./llm').titleForTranscript(r.textContent)) || a.title
+          : a.title;
         store.updateArticleContent(a.id, withSkipRules(job.userId, {
-          title: a.title,
+          title,
           byline: a.byline,
           siteName: a.siteName,
           excerpt: sanitizeString(r.textContent.replace(/\s+/g, ' ').trim(), 300),
@@ -1080,6 +1090,23 @@ const server = http.createServer(async (req, res) => {
           fields.sourceHtml = b.fallbackHtml.slice(0, SOURCE_CAP);
         }
         let a = store.articleByUrl(user.id, artUrl);
+        // Automatic re-save: the extension noticed a phone save open in a tab
+        // and captured it, without being asked. Unlike a deliberate save it may
+        // only ever improve an article, so it backs off whenever replacing the
+        // content could lose something.
+        if (b.autoResave === true) {
+          const curLen = a ? (a.textContent || '').length : 0;
+          const capLen = (fields.textContent || String(fields.html).replace(/<[^>]+>/g, ' ')).trim().length;
+          const skipped = !a ? 'not saved'
+            : a.source !== 'android-share' ? 'already re-saved'
+            // highlights and reading position are anchored to paragraph indices
+            : store.highlightCountForArticle(a.id) > 0 ? 'has highlights'
+            // a consent wall or teaser must not replace a copy that was fine
+            : curLen >= 1000 && capLen < curLen * 0.8 ? 'capture is shorter'
+            : null;
+          if (skipped) return json(res, 200, { skipped, id: a ? a.id : null });
+          console.log(`auto re-save from browser ${artUrl} (${curLen} → ${capLen} chars)`);
+        }
         if (a) {
           store.updateArticleContent(a.id, fields);
           // The row may have been a highlight stub (quotes only, no page). It
@@ -1166,6 +1193,14 @@ const server = http.createServer(async (req, res) => {
       const before = now - days * 24 * 60 * 60 * 1000;
       const archived = store.bulkArchiveBefore(user.id, before, now);
       return json(res, 200, { archived, olderThanDays: days });
+    }
+
+    // ---- phone saves a browser capture could improve. The extension matches
+    // open tabs against this list itself, so ordinary browsing never reports a
+    // URL to the server; only a match leads to a (guarded) POST /api/articles.
+    if (req.method === 'GET' && parts[1] === 'resave-candidates' && parts.length === 2) {
+      const RESAVE_WINDOW_MS = 90 * 24 * 60 * 60 * 1000;
+      return json(res, 200, { articles: store.resaveCandidates(user.id, Date.now() - RESAVE_WINDOW_MS) });
     }
 
     // ---- save by URL: create a placeholder immediately and respond fast, then
@@ -1372,6 +1407,19 @@ const server = http.createServer(async (req, res) => {
       }
     }
 
+    // ---- highlighted articles related to this one (web reader "Related" panel)
+    if (req.method === 'GET' && parts.length === 4 && parts[1] === 'articles' && parts[3] === 'related') {
+      const key = `${user.id}:${parts[2]}`;
+      const hit = relatedCache.get(key);
+      if (hit && Date.now() - hit.at < RELATED_TTL_MS) return json(res, 200, hit.body);
+      const body = store.relatedHighlighted(user.id, parts[2]);
+      if (!body) return json(res, 404, { error: 'article not found' });
+      relatedCache.delete(key);
+      relatedCache.set(key, { at: Date.now(), body });
+      if (relatedCache.size > 200) relatedCache.delete(relatedCache.keys().next().value);
+      return json(res, 200, body);
+    }
+
     // ---- highlights nested under an article
     if (parts[1] === 'articles' && parts.length === 4 && parts[3] === 'highlights') {
       const a = store.getArticle(parts[2], user.id);
@@ -1425,26 +1473,35 @@ const server = http.createServer(async (req, res) => {
         }
         // dedupe on content hash, like the other imports
         const artUrl = 'audio:' + crypto.createHash('sha256').update(buf).digest('hex').slice(0, 24);
-        const now = Date.now();
         let a = store.articleByUrl(user.id, artUrl);
         if (a && (a.textContent || '').trim()) {
           return json(res, 200, pubArticle(a)); // already transcribed — don't redo it
         }
+        // Spooled before the article exists so its embedded tags can title it.
+        const id = a ? a.id : newId();
+        if (!sttQueued.has(id)) fs.writeFileSync(sttSpoolFile(id), buf);
         if (!a) {
-          a = {
-            id: newId(), userId: user.id, url: artUrl,
-            savedAt: now, archived: false, favorite: false, readParagraph: 0,
-            source: 'audio',
-            title: filename.replace(/\.[a-z0-9]{1,5}$/i, '').replace(/[_]+/g, ' ').trim() || 'Podcast episode',
-            byline: null, siteName: 'Podcast',
-            excerpt: 'Transcribing…',
-            html: '<p>Transcribing… A long episode can take a few minutes; the text appears here when it is done.</p>',
-            textContent: '', updatedAt: now,
-          };
-          store.insertArticle(a);
-          console.log(`article saved [audio] ${filename} (${buf.length} bytes, transcribing)`);
+          const meta = transcribe.audioMeta(filename, await transcribe.probeTags(sttSpoolFile(id)));
+          a = store.articleByUrl(user.id, artUrl); // the same file may have landed during the probe
+          if (!a) {
+            const now = Date.now();
+            a = {
+              id, userId: user.id, url: artUrl,
+              savedAt: now, archived: false, favorite: false, readParagraph: 0,
+              source: 'audio',
+              title: meta.title || transcribe.PLACEHOLDER_TITLE,
+              byline: meta.byline, siteName: meta.siteName,
+              excerpt: 'Transcribing…',
+              html: '<p>Transcribing… A long episode can take a few minutes; the text appears here when it is done.</p>',
+              textContent: '', updatedAt: now,
+            };
+            store.insertArticle(a);
+            console.log(`article saved [audio] ${filename} as "${a.title}" (${buf.length} bytes, transcribing)`);
+          } else {
+            try { fs.unlinkSync(sttSpoolFile(id)); } catch {}
+          }
         }
-        enqueueTranscription(a.id, user.id, buf, filename);
+        enqueueTranscription(a.id, user.id, filename);
         return json(res, 202, pubArticle(store.getArticle(a.id, user.id)));
       }
       let parsed;

@@ -14,6 +14,8 @@
     #status.ok { color: #15803d; }
     #status.err { color: #b91c1c; }
     .hint { color: #666; font-size: 12px; margin-top: 4px; }
+    label.check { display: flex; gap: 6px; align-items: center; margin-top: 16px; }
+    label.check input { width: auto; }
     details { margin-top: 16px; }
     summary { cursor: pointer; color: #666; font-size: 12px; }
     @media (prefers-color-scheme: dark) {
@@ -48,6 +50,9 @@
     <option value="none">Never (toolbar badge only)</option>
   </select>
   <div class="hint">The toolbar icon always shows … while saving, then ✓ or !.</div>
+
+  <label class="check"><input id="autoResave" type="checkbox"> Re-save phone shares when I open them here</label>
+  <div class="hint">Articles shared from your phone are fetched by the server, which isn't logged in anywhere — paywalled pages arrive as teasers. With this on, opening one in Firefox saves the page as you see it instead. Needs access to all sites; only pages already in your phone saves are ever read, and articles with highlights are left alone.</div>
 
   <details>
     <summary>Advanced: use an API token directly</summary>

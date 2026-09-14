@@ -1238,7 +1238,8 @@ private fun blockPlainText(block: Block): String = when (block) {
     is Block.Paragraph -> block.text
     is Block.Heading -> block.text
     is Block.Quote -> block.text
-    is Block.ImageBlock -> block.alt.orEmpty()
+    is Block.Caption -> block.text
+    is Block.ImageBlock -> "" // alt text isn't shown, so it mustn't match a search
 }
 
 private val SearchMatchColor = Color(0x804FC3F7) // distinct from the amber highlight
@@ -1285,22 +1286,35 @@ private fun BlockItem(
             )
         }
 
+        // Just a marker that a picture was here. Alt text is written for screen
+        // readers and usually repeats the caption, so it isn't shown.
         is Block.ImageBlock -> {
             Surface(
                 color = MaterialTheme.colorScheme.surfaceVariant,
                 shape = MaterialTheme.shapes.small,
-                modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp)
+                modifier = Modifier.padding(vertical = 8.dp)
             ) {
                 Text(
-                    text = "[image: ${block.alt ?: block.src}]",
-                    style = MaterialTheme.typography.bodySmall,
-                    fontStyle = FontStyle.Italic,
-                    maxLines = 2,
-                    overflow = TextOverflow.Ellipsis,
-                    modifier = Modifier.padding(12.dp)
+                    text = "Image",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp)
                 )
             }
         }
+
+        is Block.Caption -> HighlightableText(
+            text = block.text,
+            isQuote = false,
+            isCaption = true,
+            paraHighlights = paraHighlights,
+            searchQuery = searchQuery,
+            isSpoken = isSpoken,
+            selRange = selRange,
+            onDoubleTap = onDoubleTap,
+            onWordSelect = onWordSelect,
+            onTap = onTap
+        )
 
         is Block.Paragraph -> HighlightableText(
             text = block.text,
@@ -1345,6 +1359,7 @@ private fun Modifier.spokenOutline(isSpoken: Boolean): Modifier =
 private fun HighlightableText(
     text: String,
     isQuote: Boolean,
+    isCaption: Boolean = false,
     paraHighlights: List<HighlightEntity>,
     searchQuery: String,
     isSpoken: Boolean,
@@ -1447,7 +1462,14 @@ private fun HighlightableText(
     } else {
         Text(
             text = annotated,
-            style = ReadingTextStyle,
+            style = if (isCaption) {
+                ReadingTextStyle.copy(
+                    fontSize = ReadingTextStyle.fontSize * 0.78f,
+                    lineHeight = ReadingTextStyle.lineHeight * 0.75f,
+                    fontStyle = FontStyle.Italic,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            } else ReadingTextStyle,
             onTextLayout = { layout = it },
             modifier = Modifier
                 .fillMaxWidth()

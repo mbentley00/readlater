@@ -418,6 +418,149 @@ refreshToolbarTitle();
 browser.runtime.onInstalled.addListener(refreshToolbarTitle);
 browser.runtime.onStartup.addListener(refreshToolbarTitle);
 
+// ------------------------------------------------------------ auto re-save
+//
+// Something shared from the phone was fetched by the server, which isn't
+// logged in anywhere — so paywalled or login-walled pages arrive as teasers.
+// With this on (Options; needs the optional all-sites permission), opening
+// such an article in Firefox captures the page as you see it and replaces the
+// phone copy. The list of phone saves is fetched and matched HERE: browsing
+// never sends a URL to the server unless it is already one of those articles.
+// The server has the last word and skips anything with highlights, anything
+// already re-saved, and captures thinner than the copy it has.
+
+const RESAVE_PERMISSION = { origins: ['<all_urls>'] };
+const RESAVE_LIST_TTL_MS = 10 * 60 * 1000;       // refresh the candidate list this often
+const RESAVE_SETTLE_MS = 4000;                   // let late scripts (paywall unlocks) finish
+const RESAVE_RETRY_MS = 7 * 24 * 60 * 60 * 1000; // don't re-capture a skipped article for a week
+const NOTIF_RESAVED = 'earmark-resaved';
+
+/** Comparable form of a URL: no fragment, www., tracking params or trailing
+ *  slash, and http≡https — enough that the tab and the shared link line up. */
+function normUrl(u) {
+  try {
+    const x = new URL(u);
+    for (const k of [...x.searchParams.keys()]) {
+      if (/^(utm_|mc_)|^(fbclid|gclid|ref|smid|cmpid|share|s|t)$/i.test(k)) x.searchParams.delete(k);
+    }
+    x.searchParams.sort();
+    const host = x.host.toLowerCase().replace(/^www\./, '');
+    return `${host}${x.pathname.replace(/\/+$/, '')}${x.search}`;
+  } catch (e) {
+    return null;
+  }
+}
+
+let resaveIndex = null; // normUrl → {id, url}
+let resaveFetchedAt = 0;
+let resaveLoading = null;
+
+browser.storage.onChanged.addListener((changes) => {
+  if (changes.serverUrl || changes.token || changes.autoResave) { resaveIndex = null; resaveFetchedAt = 0; }
+});
+
+async function autoResaveOn() {
+  const { autoResave } = await browser.storage.local.get({ autoResave: false });
+  return autoResave === true && browser.permissions.contains(RESAVE_PERMISSION);
+}
+
+async function resaveCandidates() {
+  if (resaveIndex && Date.now() - resaveFetchedAt < RESAVE_LIST_TTL_MS) return resaveIndex;
+  if (!resaveLoading) {
+    resaveLoading = (async () => {
+      const { serverUrl, token } = await getSettings();
+      try {
+        const res = await fetch(`${serverUrl}/api/resave-candidates`, {
+          headers: { Authorization: `Bearer ${token}` },
+          signal: AbortSignal.timeout(20000),
+        });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const idx = new Map();
+        for (const a of (await res.json()).articles || []) {
+          const k = normUrl(a.url);
+          if (k) idx.set(k, a);
+        }
+        resaveIndex = idx;
+      } catch (e) {
+        // Keep whatever list we had; try again after the TTL rather than on
+        // every page load while the server is unreachable.
+        console.warn('Earmark: could not fetch re-save candidates:', e.message || e);
+        resaveIndex = resaveIndex || new Map();
+      }
+      resaveFetchedAt = Date.now();
+      return resaveIndex;
+    })().finally(() => { resaveLoading = null; });
+  }
+  return resaveLoading;
+}
+
+async function markResaveTried(id) {
+  const { resaveTried = {} } = await browser.storage.local.get('resaveTried');
+  const now = Date.now();
+  for (const [k, t] of Object.entries(resaveTried)) if (now - t > RESAVE_RETRY_MS) delete resaveTried[k];
+  resaveTried[id] = now;
+  await browser.storage.local.set({ resaveTried });
+}
+
+const queueResaved = batcher(async (items) => {
+  const { serverUrl, notifyMode } = await getSettings();
+  if (notifyMode !== 'summary') return;
+  if (items.length === 1) {
+    show(NOTIF_RESAVED, 'Updated in Earmark', `${items[0].title} — replaced the phone copy with this page`, items[0].url);
+    return;
+  }
+  show(NOTIF_RESAVED, `Updated ${items.length} phone saves in Earmark`,
+    items.slice(0, 3).map((i) => `• ${i.title}`).join('\n'), serverUrl || null);
+});
+
+const resaveInFlight = new Set();
+
+async function maybeAutoResave(tabId, url) {
+  const { serverUrl, token } = await getSettings();
+  if (!serverUrl || !token || !(await autoResaveOn())) return;
+  const key = normUrl(url);
+  if (!key) return;
+  const idx = await resaveCandidates();
+  const cand = idx.get(key);
+  if (!cand || resaveInFlight.has(cand.id)) return;
+  const { resaveTried = {} } = await browser.storage.local.get('resaveTried');
+  if (resaveTried[cand.id] && Date.now() - resaveTried[cand.id] < RESAVE_RETRY_MS) return;
+
+  resaveInFlight.add(cand.id);
+  try {
+    await new Promise((r) => setTimeout(r, RESAVE_SETTLE_MS));
+    const tab = await browser.tabs.get(tabId).catch(() => null);
+    if (!tab || normUrl(tab.url) !== key) return; // navigated away meanwhile
+
+    await browser.tabs.executeScript(tabId, { file: 'Readability.js', runAt: 'document_idle' });
+    const results = await browser.tabs.executeScript(tabId, { file: 'extractor.js', runAt: 'document_idle' });
+    const article = results && results[0];
+    if (!article || !article.html) { await markResaveTried(cand.id); return; }
+
+    // Posted under the stored URL, not the page's og:url, so it can only ever
+    // update the phone save — never mint a second article beside it.
+    const { savedAt, ...capture } = article;
+    const data = await postJson('/api/articles', {
+      ...capture, url: cand.url, source: 'browser-page', autoResave: true,
+    });
+    await markResaveTried(cand.id);
+    if (data && data.skipped) {
+      if (data.skipped === 'already re-saved') idx.delete(key);
+      return;
+    }
+    idx.delete(key);
+    badgeFor(tabId)('✓', null, BADGE_HOLD_MS);
+    queueResaved({ title: article.title, url: data && data.id ? `${serverUrl}/read/${data.id}` : null });
+  } finally {
+    resaveInFlight.delete(cand.id);
+  }
+}
+
+browser.tabs.onUpdated.addListener((tabId, change, tab) => {
+  if (change.status !== 'complete' || !tab || tab.incognito || !/^https?:/i.test(tab.url || '')) return;
+  maybeAutoResave(tabId, tab.url).catch((e) => console.warn('Earmark auto re-save failed:', e.message || e));
+}, { properties: ['status'] });
+
 // Messages from the popup.
 browser.runtime.onMessage.addListener((msg) => {
   if (msg && msg.type === 'save-page') return savePage(msg.tabId);

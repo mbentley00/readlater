@@ -221,6 +221,12 @@ mark.flash { animation: hlflash 1.6s ease; }
 .hl-block .note { color:var(--muted); font-size:.9rem; }
 .hl-block .from { font-size:.8rem; font-family:system-ui,sans-serif; margin-top:.2rem; }
 .hl-count { font-size:.8rem; font-family:system-ui,sans-serif; color:var(--accent); white-space:nowrap; }
+.rel-msg { padding:.4rem .8rem; }
+.rel-item { padding:.7rem .8rem; border-bottom:1px solid var(--line); }
+.rel-item:last-child { border-bottom:0; }
+.rel-title { display:block; font-weight:600; line-height:1.3; color:var(--fg); text-decoration:none; }
+.rel-title:hover { text-decoration:underline; }
+.rel-shared { font-size:.75rem; margin-top:.1rem; }
 code.token { background:var(--card); border:1px solid var(--line); border-radius:6px; padding:.25rem .5rem; font-size:.85rem; user-select:all; overflow-wrap:anywhere; }
 .reader-actions { margin-top:.6rem; }
 /* Archive/Back repeated at the end of the article, where you actually finish. */
@@ -982,6 +988,7 @@ function readerPage(ctx, user, article, url) {
       <a class="back" href="${escapeHtml(backTo)}">&larr; Back</a>
       <span class="hdr-title">${escapeHtml(article.title)}</span>
       <button class="act" id="hl-toggle">Highlights (${hls.length})</button>
+      <button class="act" id="rel-toggle" title="Your highlights from related articles (r)">Related</button>
     </div>`;
   const meta = [article.siteName, article.byline, fmtDate(article.savedAt)].filter(Boolean).map(escapeHtml).join(' · ');
   // An uploaded PDF/EPUB has no original to go back to: nothing to re-fetch (the
@@ -1038,6 +1045,10 @@ function readerPage(ctx, user, article, url) {
 <aside id="hl-panel" class="hl-panel" hidden>
   <div class="hl-panel-head"><strong>Highlights (${hls.length})</strong><button class="act" id="hl-close">×</button></div>
   <div class="hl-panel-body">${hls.length ? hlItems : '<div class="meta">No highlights yet. Select text in the article to add one.</div>'}</div>
+</aside>
+<aside id="rel-panel" class="hl-panel" hidden>
+  <div class="hl-panel-head"><strong>Related highlights</strong><button class="act" id="rel-close">×</button></div>
+  <div class="hl-panel-body"></div>
 </aside>
 <div id="hl-tip" hidden><button id="hl-save">Highlight</button><button id="skip-save" title="Drop this text from articles saved in future">Never import</button></div>
 <div id="float-bar">
@@ -1132,6 +1143,8 @@ document.addEventListener('keydown', (e) => {
   if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.tagName === 'SELECT' || t.isContentEditable)) return;
   if (e.key === 'o') {
     if (HAS_ORIGINAL) window.open('/read/' + ARTICLE + '/original', '_blank', 'noopener');
+  } else if (e.key === 'r') {
+    setRelPanel(relPanel.hidden);
   } else if (e.key === 'e') {
     e.preventDefault();
     fetch('/api/articles/' + ARTICLE, {
@@ -1237,9 +1250,81 @@ for (const h of HLS) anchorHighlight(h);
 
 // Highlights side panel: toggle (pushes the page aside), jump-to, and delete.
 const panel = document.getElementById('hl-panel');
-function setPanel(open) { panel.hidden = !open; document.body.classList.toggle('hl-open', open); }
+function setPanel(open) {
+  if (open) document.getElementById('rel-panel').hidden = true; // one side panel at a time
+  panel.hidden = !open;
+  document.body.classList.toggle('hl-open', open);
+}
 document.getElementById('hl-toggle').addEventListener('click', () => setPanel(panel.hidden));
 document.getElementById('hl-close').addEventListener('click', () => setPanel(false));
+
+// Related highlights: other articles you highlighted that share this one's
+// distinctive words, with the passages that matched. Fetched on first open —
+// it costs the server a few full-text queries, so not on every page view.
+const relPanel = document.getElementById('rel-panel');
+const relBody = relPanel.querySelector('.hl-panel-body');
+let relLoaded = false;
+function setRelPanel(open) {
+  if (open) setPanel(false);
+  relPanel.hidden = !open;
+  document.body.classList.toggle('hl-open', open);
+  if (open && !relLoaded) loadRelated();
+}
+function relMessage(text) {
+  relBody.textContent = '';
+  const d = document.createElement('div');
+  d.className = 'meta rel-msg';
+  d.textContent = text;
+  relBody.appendChild(d);
+}
+function loadRelated() {
+  relLoaded = true;
+  relMessage('Finding related highlights…');
+  fetch('/api/articles/' + encodeURIComponent(ARTICLE) + '/related')
+    .then((r) => { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
+    .then(renderRelated)
+    .catch((err) => { relLoaded = false; relMessage('Could not load related highlights (' + err.message + ').'); });
+}
+function renderRelated(data) {
+  const list = (data && data.articles) || [];
+  if (!list.length) return relMessage('None of your highlighted articles look related to this one yet.');
+  relBody.textContent = '';
+  // Back from the related article returns here.
+  const from = location.pathname + location.search;
+  for (const a of list) {
+    const item = document.createElement('div');
+    item.className = 'rel-item';
+    const link = document.createElement('a');
+    link.className = 'rel-title';
+    link.href = '/read/' + encodeURIComponent(a.id) + '?from=' + encodeURIComponent(from);
+    link.textContent = a.title || '(untitled)';
+    item.appendChild(link);
+    const meta = document.createElement('div');
+    meta.className = 'meta';
+    meta.textContent = [a.siteName, a.highlightCount + (a.highlightCount === 1 ? ' highlight' : ' highlights')]
+      .filter(Boolean).join(' · ');
+    item.appendChild(meta);
+    // Why it's here: the words it shares with this article.
+    if (a.matched && a.matched.length) {
+      const shared = document.createElement('div');
+      shared.className = 'meta rel-shared';
+      shared.textContent = 'Shared: ' + a.matched.slice(0, 5).join(', ');
+      item.appendChild(shared);
+    }
+    const snips = document.createElement('div');
+    snips.className = 'hl-snips';
+    for (const s of a.snippets || []) {
+      const q = document.createElement('div');
+      q.className = 'hl-snip on';
+      q.textContent = s.text;
+      snips.appendChild(q);
+    }
+    item.appendChild(snips);
+    relBody.appendChild(item);
+  }
+}
+document.getElementById('rel-toggle').addEventListener('click', () => setRelPanel(relPanel.hidden));
+document.getElementById('rel-close').addEventListener('click', () => setRelPanel(false));
 function flashMark(id) {
   const mark = root.querySelector('mark[data-hl-id="' + CSS.escape(id) + '"]');
   if (mark) {

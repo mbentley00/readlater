@@ -2101,6 +2101,7 @@ class TtsService : Service() {
         is Block.Heading -> block.text
         is Block.Quote -> block.text
         is Block.ImageBlock -> null
+        is Block.Caption -> null // reads as a non sequitur mid-article
     }
 
     /** Spoken preamble: title, author, publisher — announced before the article. */

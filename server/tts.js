@@ -62,9 +62,33 @@ const decodeEntities = (s) => String(s)
   .replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&#39;|&apos;/g, "'")
   .replace(/&#(\d+);/g, (_, n) => String.fromCharCode(parseInt(n, 10)));
 
+// Caption rules — mirror android HtmlParser.kt (CAPTION_MAX, CREDIT_MAX,
+// creditLead, creditTail) so server audio and the app skip the same blocks and
+// paragraph mapping stays 1:1.
+const CAPTION_MAX = 500;
+const CREDIT_MAX = 200;
+const CREDIT_LEAD = /^(photo(graph)?s?|image|illustration|artwork|picture|video|map|chart|graphic|credit|source|courtesy)\b\s*(by\b|:|credit\b|courtesy\b|of\b)/i;
+const CREDIT_TAIL = /(getty images|reuters|associated press|ap photo|shutterstock|alamy|afp|epa(-efe)?|bloomberg|pa images|nurphoto|redux|contributor)\s*[).]?$/i;
+const WRAPPED_INLINE = /^\s*<(em|i|small|cite)\b[^>]*>((?:(?!<\/\1\s*>)[\s\S])*)<\/\1\s*>\s*$/i;
+
+const isCredit = (text) => text.length <= CREDIT_MAX && (CREDIT_LEAD.test(text) || CREDIT_TAIL.test(text));
+const normCap = (s) => String(s).toLowerCase().replace(/\s+/g, ' ').trim().replace(/^[.\s]+|[.\s]+$/g, '');
+
+/** Is this text block a caption for the image just before it (outside any figure)? */
+function isLooseCaption(text, inner, prev) {
+  if (text.length > CAPTION_MAX) return false;
+  if (prev.type === 'caption') return isCredit(text);
+  if (prev.type !== 'img') return false;
+  const alt = normCap(prev.alt);
+  const t = normCap(text);
+  return (alt.length >= 12 && t.length >= 12 && (t.includes(alt) || alt.includes(t))) ||
+    isCredit(text) ||
+    (text.length <= 300 && WRAPPED_INLINE.test(inner));
+}
+
 /** Extract speakable paragraphs from article HTML in document order. Mirrors
  *  the kinds of blocks the reader speaks (paragraphs, headings, quotes, list
- *  items); images and empty blocks are skipped. */
+ *  items); images, image captions/credits and empty blocks are skipped. */
 function paragraphsOf(article) {
   const html = String(article.html || '');
   if (!html) {
@@ -75,13 +99,36 @@ function paragraphsOf(article) {
   // drop non-content blocks entirely
   const cleaned = html
     .replace(/<(script|style|head|noscript|svg|template)\b[\s\S]*?<\/\1\s*>/gi, ' ')
-    .replace(/<!--[\s\S]*?-->/g, ' ');
+    .replace(/<!--[\s\S]*?-->/g, ' ')
+    // A figcaption is one caption block, whatever it nests.
+    .replace(/<figcaption\b[^>]*>([\s\S]*?)<\/figcaption\s*>/gi,
+      (_, inner) => `<p data-cap>${inner.replace(/<[^>]+>/g, ' ')}</p>`)
+    // Text inside a figure that holds a picture is that picture's caption.
+    .replace(/<figure\b[\s\S]*?<\/figure\s*>/gi, (fig) => (/<(img|picture|video)\b/i.test(fig)
+      ? fig.replace(/<(p|li)\b(?![^>]*data-cap)/gi, '<$1 data-cap')
+      : fig));
   const out = [];
-  const re = /<(p|h[1-6]|blockquote|li)\b[^>]*>([\s\S]*?)<\/\1>/gi;
+  const re = /<(p|h[1-6]|blockquote|li)\b([^>]*)>([\s\S]*?)<\/\1>/gi;
   let m;
+  let lastEnd = 0;
+  let prev = { type: 'text' };
   while ((m = re.exec(cleaned)) !== null) {
-    const text = decodeEntities(m[2].replace(/<[^>]+>/g, ' ')).replace(/\s+/g, ' ').trim();
-    if (text) out.push(text);
+    const [, tag, attrs, inner] = m;
+    const text = decodeEntities(inner.replace(/<[^>]+>/g, ' ')).replace(/\s+/g, ' ').trim();
+    if (!text) continue; // e.g. a <p> wrapping only an <img>: left in the next gap
+    const imgs = [...cleaned.slice(lastEnd, m.index).matchAll(/<img\b[^>]*>/gi)]
+      .filter((i) => /\ssrc\s*=\s*["']?[^"'\s>]/i.test(i[0]));
+    if (imgs.length) {
+      const alt = /\salt\s*=\s*(?:"([^"]*)"|'([^']*)')/i.exec(imgs[imgs.length - 1][0]);
+      prev = { type: 'img', alt: alt ? decodeEntities(alt[1] ?? alt[2]) : '' };
+    }
+    lastEnd = re.lastIndex;
+    const para = /^(p|li)$/i.test(tag);
+    const caption = para && (
+      ((/data-cap/.test(attrs) || /class\s*=\s*["'][^"']*(^|[\s_-])(caption|credits?)([\s_-]|["'])/i.test(attrs)) && text.length <= CAPTION_MAX) ||
+      isLooseCaption(text, inner, prev));
+    prev = { type: caption ? 'caption' : 'text' };
+    if (!caption) out.push(text);
   }
   if (!out.length) {
     const text = decodeEntities(cleaned.replace(/<[^>]+>/g, ' ')).replace(/\s+/g, ' ').trim();
