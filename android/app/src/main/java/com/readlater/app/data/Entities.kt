@@ -36,7 +36,12 @@ data class ArticleEntity(
     val source: String? = null,
     /** When this was archived (ms), so the Archive tab can order by it. Local
      *  only; set on archive, cleared on unarchive, null if never archived. */
-    val archivedAt: Long? = null
+    val archivedAt: Long? = null,
+    /** The server thinks this save didn't work — a 403, a consent wall, a page
+     *  that never parsed (server/quality.js). Kept out of the main list. */
+    @ColumnInfo(defaultValue = "0") val problem: Boolean = false,
+    /** One line saying what went wrong, for the Problems list. */
+    val problemDetail: String? = null
 )
 
 @Entity(tableName = "highlights")

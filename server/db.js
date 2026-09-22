@@ -13,6 +13,7 @@
 const fs = require('fs');
 const path = require('path');
 const Database = require('better-sqlite3');
+const quality = require('./quality');
 
 /**
  * Hostname of an article URL, lowercased, without www. Emailed articles get
@@ -249,6 +250,26 @@ CREATE TABLE IF NOT EXISTS skip_rules (
 CREATE INDEX IF NOT EXISTS skip_rules_user ON skip_rules(userId);
 CREATE UNIQUE INDEX IF NOT EXISTS skip_rules_user_phrase ON skip_rules(userId, phrase COLLATE NOCASE);
 
+-- Articles that didn't really save: a 403, a consent wall, a page that never
+-- parsed (see quality.js). They are kept out of the main list and shown in
+-- their own, so a failed save is something to fix rather than something that
+-- quietly looks like an article.
+--
+-- A side table rather than an articles column, deliberately. Every column added
+-- to articles lands after the html/textContent blobs, so reading it for a list
+-- of rows walks each row's overflow pages — the thing that made the old sorts
+-- take 15 seconds. Asking a small table "is this id in here?" touches none of
+-- that. The row is rewritten from scratch whenever an article's content
+-- changes, so nothing here is ever stale.
+CREATE TABLE IF NOT EXISTS article_problems (
+  articleId TEXT PRIMARY KEY REFERENCES articles(id) ON DELETE CASCADE,
+  userId TEXT NOT NULL,
+  reason TEXT NOT NULL,
+  detail TEXT NOT NULL,
+  detectedAt INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS article_problems_user ON article_problems(userId, detectedAt DESC);
+
 CREATE VIRTUAL TABLE IF NOT EXISTS articles_fts USING fts5(
   title, byline, siteName, excerpt, textContent,
   content='articles', content_rowid='rowid'
@@ -288,7 +309,14 @@ END;
 `;
 
 const rowUser = (r) => r || null;
-const rowArticle = (r) => r && { ...r, archived: !!r.archived, favorite: !!r.favorite };
+const rowArticle = (r) => r && {
+  ...r,
+  archived: !!r.archived,
+  favorite: !!r.favorite,
+  // Only the list query asks about the badly-saved flag; leave it absent (not
+  // false) on the full-article reads, which say nothing about it either way.
+  ...(r.problemDetail === undefined ? {} : { problem: r.problemDetail != null, problemDetail: r.problemDetail || null }),
+};
 
 // Every article column EXCEPT the (potentially huge) raw sourceHtml, which is
 // only ever fetched on demand via getArticleSource — never in the full-article
@@ -355,7 +383,7 @@ const ARTICLE_SORTS = {
 function buildArticleWhere(userId, {
   q = '', domain = '', domains = null, highlighted = false, includeArchived = false, since = 0,
   favoriteOnly = false, archivedOnly = false, minWords = 0, maxWords = 0, minHighlights = 0,
-  sources = null,
+  sources = null, problemsOnly = false, excludeProblems = false,
 } = {}) {
   const where = ['a.userId = @userId'];
   const args = { userId };
@@ -365,6 +393,9 @@ function buildArticleWhere(userId, {
     where.push(`a.source IN (${sources.map((_, i) => `@src${i}`).join(', ')})`);
     sources.forEach((s, i) => { args[`src${i}`] = String(s); });
   }
+  // Badly-saved articles (see quality.js): their own list, and out of the main one.
+  if (problemsOnly) where.push('EXISTS (SELECT 1 FROM article_problems p WHERE p.articleId = a.id)');
+  else if (excludeProblems) where.push('NOT EXISTS (SELECT 1 FROM article_problems p WHERE p.articleId = a.id)');
   if (archivedOnly) where.push('a.archived = 1');
   else if (!includeArchived) where.push('a.archived = 0');
   if (favoriteOnly) where.push('a.favorite = 1');
@@ -776,6 +807,24 @@ function open(dataDir) {
   const S = {}; // prepared statements
   const prep = (k, sql) => (S[k] ||= sqlite.prepare(sql));
 
+  /** Write (or clear) an article's badly-saved flag (see quality.js). */
+  function setProblem(id, userId, problem) {
+    if (!problem) {
+      prep('pdel', 'DELETE FROM article_problems WHERE articleId = ?').run(id);
+      return;
+    }
+    prep('pset', `INSERT INTO article_problems (articleId, userId, reason, detail, detectedAt)
+      VALUES (@articleId, @userId, @reason, @detail, @detectedAt)
+      ON CONFLICT(articleId) DO UPDATE SET reason = @reason, detail = @detail, detectedAt = @detectedAt`)
+      .run({
+        articleId: id,
+        userId,
+        reason: String(problem.reason),
+        detail: String(problem.detail || ''),
+        detectedAt: Date.now(),
+      });
+  }
+
   const db = {
     sqlite,
     close: () => sqlite.close(),
@@ -833,19 +882,35 @@ function open(dataDir) {
       prep('agsi', 'SELECT shareId FROM articles WHERE id = ? AND userId = ?').get(id, userId),
     setArticleShareId: (id, userId, shareId) =>
       prep('assh', 'UPDATE articles SET shareId = ? WHERE id = ? AND userId = ?').run(shareId, id, userId),
-    insertArticle: (a) => prep('ai', `INSERT INTO articles
+    insertArticle: (a) => {
+      const r = prep('ai', `INSERT INTO articles
       (id, userId, url, domain, savedAt, archived, favorite, readParagraph, title, byline, siteName, excerpt, html, textContent, sourceHtml, imageUrl, publishedAt, source, wordCount, archivedAt, updatedAt)
       VALUES (@id, @userId, @url, @domain, @savedAt, @archived, @favorite, @readParagraph, @title, @byline, @siteName, @excerpt, @html, @textContent, @sourceHtml, @imageUrl, @publishedAt, @source, @wordCount, @archivedAt, @updatedAt)`)
       // An article created straight into the archive (a Kindle book, an
       // importer) is archived as of now unless the caller says otherwise.
-      .run({ imageUrl: null, publishedAt: null, sourceHtml: null, source: null, ...a, ...articleIdentity(a), archived: a.archived ? 1 : 0, favorite: a.favorite ? 1 : 0, archivedAt: a.archived ? (a.archivedAt || a.updatedAt || a.savedAt) : null, textContent: searchText(a), wordCount: articleWordCount(a) }),
+        .run({ imageUrl: null, publishedAt: null, sourceHtml: null, source: null, ...a, ...articleIdentity(a), archived: a.archived ? 1 : 0, favorite: a.favorite ? 1 : 0, archivedAt: a.archived ? (a.archivedAt || a.updatedAt || a.savedAt) : null, textContent: searchText(a), wordCount: articleWordCount(a) });
+      setProblem(a.id, a.userId, quality.detectProblem({ ...a, textContent: searchText(a) }));
+      return r;
+    },
     // Update content; only overwrites imageUrl/publishedAt/sourceHtml when new ones are provided.
-    updateArticleContent: (id, f) => prep('auc', `UPDATE articles SET
+    updateArticleContent: (id, f) => {
+      const r = prep('auc', `UPDATE articles SET
       title = @title, byline = @byline, siteName = @siteName, excerpt = @excerpt,
       html = @html, textContent = @textContent, imageUrl = COALESCE(@imageUrl, imageUrl),
       publishedAt = COALESCE(@publishedAt, publishedAt), sourceHtml = COALESCE(@sourceHtml, sourceHtml),
       wordCount = @wordCount, updatedAt = @updatedAt WHERE id = @id`)
-      .run({ imageUrl: null, publishedAt: null, sourceHtml: null, ...f, id, textContent: searchText(f), wordCount: articleWordCount(f) }),
+        .run({ imageUrl: null, publishedAt: null, sourceHtml: null, ...f, id, textContent: searchText(f), wordCount: articleWordCount(f) });
+      // Re-decided from the content that just landed, so a re-save or a reparse
+      // that fixes an article also clears its flag (and a fetch that fails on
+      // retry re-raises it). Reads only the early columns.
+      const meta = prep('aucm', 'SELECT userId, url, source FROM articles WHERE id = ?').get(id);
+      if (meta) {
+        setProblem(id, meta.userId, quality.detectProblem({
+          ...f, textContent: searchText(f), url: meta.url, source: meta.source,
+        }));
+      }
+      return r;
+    },
     // Adopt a new canonical URL (e.g. after resolving an email tracking
     // redirect to the publisher's real link). Keeps `domain` in step with it.
     setArticleUrl: (id, url) => prep('asu', 'UPDATE articles SET url = @url, domain = @domain WHERE id = @id')
@@ -884,8 +949,25 @@ function open(dataDir) {
 
     deleteArticle: (id) => {
       prep('adh', 'DELETE FROM highlights WHERE articleId = ?').run(id);
+      prep('adp', 'DELETE FROM article_problems WHERE articleId = ?').run(id);
       return prep('ad', 'DELETE FROM articles WHERE id = ?').run(id);
     },
+
+    /** Why this article is flagged as badly saved, or undefined. */
+    articleProblem: (id) =>
+      prep('agp', 'SELECT reason, detail, detectedAt FROM article_problems WHERE articleId = ?').get(id),
+
+    /** Articles flagged for this user, newest first (id + url + why). */
+    listProblems: (userId, limit = 1000) =>
+      prep('alp', `SELECT p.articleId AS id, p.reason, p.detail, a.url, a.title
+        FROM article_problems p JOIN articles a ON a.id = p.articleId
+        WHERE p.userId = ? ORDER BY p.detectedAt DESC LIMIT ?`).all(userId, limit),
+
+    countProblems: (userId) =>
+      prep('acp', 'SELECT COUNT(*) AS n FROM article_problems WHERE userId = ?').get(userId).n,
+
+    /** Flag or unflag by hand — the list's "this one is fine" / "this is bad". */
+    setArticleProblem: (id, userId, problem) => setProblem(id, userId, problem),
 
     /**
      * Search/filter a user's articles (metadata only — html/textContent never
@@ -898,7 +980,8 @@ function open(dataDir) {
       const order = ARTICLE_SORTS[sortKey];
       const cols = `a.id, a.userId, a.url, a.domain, a.savedAt, a.archived, a.favorite, a.readParagraph,
           a.ttsParagraph, a.title, a.byline, a.siteName, a.excerpt, a.imageUrl, a.publishedAt, a.wordCount,
-          a.shareId, a.source, a.updatedAt`;
+          a.shareId, a.source, a.updatedAt,
+          (SELECT p.detail FROM article_problems p WHERE p.articleId = a.id) AS problemDetail`;
       const lim = Number(filters.limit) || 0;
       if (lim <= 0) {
         // Unpaged (exports, sync): nothing to gain from the two-step below.

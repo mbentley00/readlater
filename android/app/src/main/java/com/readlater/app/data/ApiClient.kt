@@ -35,7 +35,11 @@ data class RemoteArticle(
     val html: String?,
     /** How the article was saved (browser-page / browser-link / android-share /
      *  email / …), for diagnosing parse failures. Null on older articles. */
-    val source: String?
+    val source: String?,
+    /** The server flagged this save as not having worked (server/quality.js). */
+    val problem: Boolean = false,
+    /** One line saying what went wrong. */
+    val problemDetail: String? = null
 )
 
 /** Saved filter view as returned by the server. */
@@ -441,7 +445,9 @@ class ApiClient(private val settings: Settings) {
         imageUrl = o.stringOrNull("imageUrl"),
         publishedAt = if (o.has("publishedAt") && !o.isNull("publishedAt")) o.optLong("publishedAt") else null,
         html = o.stringOrNull("html"),
-        source = o.stringOrNull("source")
+        source = o.stringOrNull("source"),
+        problem = o.optBoolean("problem", false),
+        problemDetail = o.stringOrNull("problemDetail")
     )
 
     private fun parseHighlight(o: JSONObject): RemoteHighlight = RemoteHighlight(

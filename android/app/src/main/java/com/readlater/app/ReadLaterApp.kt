@@ -55,6 +55,15 @@ private val MIGRATION_6_7 = object : Migration(6, 7) {
     }
 }
 
+/** v7 → v8: the server's "this save didn't work" flag, so the phone can keep
+ *  those out of the list too. Both default to "fine" until the next sync says. */
+private val MIGRATION_7_8 = object : Migration(7, 8) {
+    override fun migrate(db: SupportSQLiteDatabase) {
+        db.execSQL("ALTER TABLE articles ADD COLUMN problem INTEGER NOT NULL DEFAULT 0")
+        db.execSQL("ALTER TABLE articles ADD COLUMN problemDetail TEXT")
+    }
+}
+
 /**
  * Application class doubling as a tiny manual DI container.
  * All singletons are created lazily on first use.
@@ -83,7 +92,7 @@ class ReadLaterApp : Application() {
 
     val database: AppDatabase by lazy {
         Room.databaseBuilder(this, AppDatabase::class.java, "readlater.db")
-            .addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5, MIGRATION_5_6, MIGRATION_6_7)
+            .addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5, MIGRATION_5_6, MIGRATION_6_7, MIGRATION_7_8)
             .fallbackToDestructiveMigration()
             .build()
     }

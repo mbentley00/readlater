@@ -76,6 +76,11 @@ fun archiveTint(archived: Boolean): Color = if (isSystemInDarkTheme()) {
     if (archived) RestoreOchre else ArchiveGreen
 }
 
+/** The colour of a "this save didn't work" note. The same ochre as Unarchive:
+ *  both mean "this one needs pulling back and dealing with". */
+@Composable
+fun problemTint(): Color = if (isSystemInDarkTheme()) RestoreOchreDark else RestoreOchre
+
 /** Comfortable serif style for article body text. */
 val ReadingTextStyle = TextStyle(
     fontFamily = FontFamily.Serif,

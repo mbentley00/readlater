@@ -14,14 +14,18 @@ interface ArticleDao {
     @Query(
         "SELECT id, url, title, byline, siteName, excerpt, NULL AS html, savedAt, updatedAt, " +
             "archived, favorite, readParagraph, dirty, wordCount, paragraphCount, ttsParagraph, " +
-            "imageUrl, publishedAt FROM articles WHERE archived = :archived ORDER BY savedAt DESC"
+            "imageUrl, publishedAt, problem, problemDetail FROM articles " +
+            // Flagged saves are kept out of the INBOX only: once you have archived
+            // one it is filed away like anything else, and hiding it there too
+            // would leave it in no list at all.
+            "WHERE archived = :archived AND (problem = 0 OR :archived = 1) ORDER BY savedAt DESC"
     )
     fun articlesByArchived(archived: Boolean): Flow<List<ArticleEntity>>
 
     @Query(
         "SELECT id, url, title, byline, siteName, excerpt, NULL AS html, savedAt, updatedAt, " +
             "archived, favorite, readParagraph, dirty, wordCount, paragraphCount, ttsParagraph, " +
-            "imageUrl, publishedAt FROM articles ORDER BY savedAt DESC"
+            "imageUrl, publishedAt, problem, problemDetail FROM articles ORDER BY savedAt DESC"
     )
     fun allArticlesFlow(): Flow<List<ArticleEntity>>
 
@@ -35,9 +39,19 @@ interface ArticleDao {
     @Query(
         "SELECT id, url, title, byline, siteName, excerpt, NULL AS html, savedAt, updatedAt, " +
             "archived, favorite, readParagraph, dirty, wordCount, paragraphCount, ttsParagraph, " +
-            "imageUrl, publishedAt FROM articles"
+            "imageUrl, publishedAt, problem, problemDetail FROM articles"
     )
     suspend fun allArticlesOnce(): List<ArticleEntity>
+
+    /** Saves that didn't really work (a 403, a consent wall, a page that never
+     *  parsed) — flagged by the server, kept out of the lists above. */
+    @Query(
+        "SELECT id, url, title, byline, siteName, excerpt, NULL AS html, savedAt, updatedAt, " +
+            "archived, favorite, readParagraph, dirty, wordCount, paragraphCount, ttsParagraph, " +
+            "imageUrl, publishedAt, problem, problemDetail FROM articles " +
+            "WHERE problem = 1 AND archived = 0 ORDER BY savedAt DESC"
+    )
+    fun problemArticles(): Flow<List<ArticleEntity>>
 
     @Query("SELECT * FROM articles WHERE id = :id")
     fun articleFlow(id: String): Flow<ArticleEntity?>

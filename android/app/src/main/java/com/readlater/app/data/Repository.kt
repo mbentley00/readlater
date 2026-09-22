@@ -37,6 +37,10 @@ class Repository(
 
     fun allArticles(): Flow<List<ArticleEntity>> = articleDao.allArticlesFlow()
 
+    /** Saves the server flagged as not having worked — their own list, and not
+     *  in [articles]. Opening one in Firefox is what repairs it. */
+    fun problemArticles(): Flow<List<ArticleEntity>> = articleDao.problemArticles()
+
     /** Whole library + per-article highlight counts, fetched once off the main
      *  thread. Used to size the view chips without putting the entire library
      *  behind the inbox list. */
@@ -254,7 +258,9 @@ class Repository(
                         publishedAt = r.publishedAt,
                         source = r.source,
                         // archivedAt is local-only; keep whatever we recorded on archive.
-                        archivedAt = local?.archivedAt
+                        archivedAt = local?.archivedAt,
+                        problem = r.problem,
+                        problemDetail = r.problemDetail
                     )
                     if (local == null || local.copy(html = null, paragraphCount = 0) !=
                         merged.copy(html = null, paragraphCount = 0)

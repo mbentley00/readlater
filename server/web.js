@@ -87,10 +87,10 @@ const FAVICON = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' vi
 
 const CSS = `
 :root { --bg:#faf9f7; --fg:#1a1a18; --muted:#77726a; --card:#ffffff; --line:#e6e2db; --accent:#3d6b52; --accent-fg:#ffffff; --mark:#f4e9c8;
-  --archive:#3d6b52; --archive-fg:#ffffff; --restore:#8f5618; --restore-fg:#ffffff; }
+  --archive:#3d6b52; --archive-fg:#ffffff; --restore:#8f5618; --restore-fg:#ffffff; --warn:#9a3b12; }
 @media (prefers-color-scheme: dark) {
   :root { --bg:#191a1c; --fg:#e8e6e1; --muted:#96918a; --card:#212326; --line:#33363a; --accent:#7fb99a; --accent-fg:#14150f; --mark:#4a4223;
-    --archive:#7fb99a; --archive-fg:#14150f; --restore:#d9a464; --restore-fg:#14150f; }
+    --archive:#7fb99a; --archive-fg:#14150f; --restore:#d9a464; --restore-fg:#14150f; --warn:#e0a37e; }
 }
 * { box-sizing: border-box; }
 body { margin:0; background:var(--bg); color:var(--fg); font:16px/1.6 Georgia, 'Times New Roman', serif; }
@@ -143,6 +143,8 @@ ul.articles .title:hover { color:var(--accent); }
    highlights themselves are drawn in — makes it recognisable without reading. */
 .hl-badge { display:inline-block; background:var(--mark); color:var(--fg); border-radius:999px; padding:.05rem .5rem; margin-left:.4rem; font-size:.72rem; font-family:system-ui,sans-serif; font-weight:600; font-variant-numeric:tabular-nums; white-space:nowrap; vertical-align:.1em; text-decoration:none; }
 .meta { color:var(--muted); font-size:.8rem; font-family: system-ui, sans-serif; margin-top:.15rem; }
+/* Why a row is flagged as badly saved (see server/quality.js). */
+.meta.problem-note { color:var(--warn); }
 /* Highlight previews under a search result. Because search matches highlight
    text, a result can look unrelated to what you typed until you see the
    sentence you highlighted — these show it without opening the article. */
@@ -352,6 +354,7 @@ function page({ title, body, user, active = '', nonce = '', script = '', article
     <nav>
       <a href="/" class="${active === 'inbox' ? 'active' : ''}">Inbox</a>
       <a href="/?view=archive" class="${active === 'archive' ? 'active' : ''}">Archive</a>
+      <a href="/?problems=1" class="${active === 'problems' ? 'active' : ''}" title="Saves that didn't really work — a 403, a consent wall, a page that never parsed. They are kept out of the Inbox; open one in Firefox and the extension re-saves it">Problems</a>
       <a href="/?src=phone" class="${active === 'phone' ? 'active' : ''}" title="Saved from the phone's share sheet and short enough (under ~5 minutes of text) that the fetch may have missed content — open the original and re-save from Firefox to be sure the right version was kept">From phone</a>
       <a href="/highlights" class="${active === 'highlights' ? 'active' : ''}">Highlights</a>
       <a href="/highlights?sort=random" class="${active === 'highlights-random' ? 'active' : ''}">Random Highlights</a>
@@ -506,6 +509,8 @@ function filtersFromParams(get, knownDomains = []) {
   return {
     sources: src ? SOURCES[src].sources : [],
     ...phoneCap,
+    // Badly-saved articles (server/quality.js): their own list, never the Inbox.
+    problemsOnly: get('problems') === '1',
     q: (get('q') || '').trim(),
     ...domainFilter(get('domain'), knownDomains),
     highlighted: hl === '1',
@@ -598,11 +603,12 @@ function listPage(ctx, user, view, url, prefs = {}) {
   const len = get('len');
   const state = cleanState(get('state'));
   const src = cleanSrc(get('src'));
+  const problems = get('problems') === '1';
   // Sort (and the random order's seed) persist across visits — see stickySort.
   const { sort, seed, setCookie } = stickySort(get, prefs.sort, SORTS, 'newest');
   // Narrowing the state counts as searching on its own: "show me everything
   // still in my inbox" is a useful query with no words in it.
-  const searching = Boolean(q || domain || hl || len || src || state !== 'any');
+  const searching = Boolean(q || domain || hl || len || src || problems || state !== 'any');
   const pageNum = Math.max(1, parseInt(get('page'), 10) || 1);
   const offset = (pageNum - 1) * PAGE_SIZE;
   // On the Archive tab "Newest" means most recently archived — the list is a
@@ -634,12 +640,16 @@ function listPage(ctx, user, view, url, prefs = {}) {
     // filtersFromParams already resolved the state (defaulting to 'any', which
     // spans the archive) — don't override it here.
     baseFilters = filtersFromParams(get, knownDomains);
-    empty = src === 'phone' && !q && !domain && !hl && !len && state === 'any'
+    empty = problems
+      ? 'Nothing is flagged — every article saved so far has real text in it.'
+      : src === 'phone' && !q && !domain && !hl && !len && state === 'any'
       ? 'Nothing saved from the phone is waiting — everything shared from it has since been re-saved from Firefox (or deleted).'
       : 'No articles match this search.';
   } else if (view === 'favorites') { baseFilters = { favoriteOnly: true, includeArchived: true }; empty = 'No favorites yet — star an article to keep it here.'; }
   else if (view === 'archive') { baseFilters = { archivedOnly: true }; empty = 'Nothing archived yet.'; }
-  else { baseFilters = {}; empty = 'Inbox empty — save something with the Firefox extension, or check <a href="/settings">Settings</a> to connect it.'; }
+  // The Inbox leaves out the flagged ones: a save that didn't work is a job,
+  // not something to read. They are one click away under Problems.
+  else { baseFilters = { excludeProblems: true }; empty = 'Inbox empty — save something with the Firefox extension, or check <a href="/settings">Settings</a> to connect it.'; }
 
   const total = ctx.countArticles(user, baseFilters);
   const list = ctx.searchArticles(user, { ...baseFilters, ...paging });
@@ -654,15 +664,20 @@ function listPage(ctx, user, view, url, prefs = {}) {
     try { return ctx.store.countArticles(user.id, filters); }
     catch { return null; } // never let a count break the page
   };
-  const inboxCount = countFor({});
+  const inboxCount = countFor({ excludeProblems: true }); // same filter as the Inbox itself, or the chip disagrees with the list
+  const problemCount = ctx.store.countProblems(user.id);
   const chipCount = (n) => (n === null ? '' : ` <span class="chip-n">${n}</span>`);
 
   // saved views as chips; × deletes (via the page script)
-  const viewChips = savedViews.length ? `
+  const problemChip = problemCount ? `
+  <span class="view-chip ${problems ? 'active' : ''}">
+    <a href="/?problems=1" title="Saves that didn't really work">Problems${chipCount(problemCount)}</a>
+  </span>` : '';
+  const viewChips = savedViews.length || problemChip ? `
 <div class="views">
   <span class="view-chip ${!savedView && !searching && !['favorites', 'archive'].includes(view) ? 'active' : ''}">
     <a href="/">Inbox${chipCount(inboxCount)}</a>
-  </span>${savedViews.map((v) => `
+  </span>${problemChip}${savedViews.map((v) => `
   <span class="view-chip ${savedView && savedView.id === v.id ? 'active' : ''}">
     <a href="/?view=v:${v.id}">${escapeHtml(v.name)}${chipCount(countFor({ ...v.filters, ...domainFilter(v.filters.domain, knownDomains), includeArchived: !!v.filters.includeArchived }))}</a><button class="act del-view" data-view-id="${v.id}" title="Delete view">×</button>
   </span>`).join('')}
@@ -677,6 +692,7 @@ function listPage(ctx, user, view, url, prefs = {}) {
   <input type="hidden" name="len" value="${escapeHtml(len)}">
   <input type="hidden" name="state" value="${escapeHtml(state)}">
   <input type="hidden" name="src" value="${escapeHtml(src)}">
+  <input type="hidden" name="problems" value="${problems ? '1' : ''}">
   <input name="name" placeholder="Name this view…" required maxlength="64">
   <button class="act" type="submit">Save as view</button>
 </form>` : '';
@@ -684,7 +700,7 @@ function listPage(ctx, user, view, url, prefs = {}) {
   const viewParam = get('view');
   // Build a URL preserving the current view/filters/sort with overrides.
   const buildQs = (overrides) => {
-    const cur = { view: viewParam, q, domain, len, hl, src, state: state === 'any' ? '' : state, sort, seed, ...overrides };
+    const cur = { view: viewParam, q, domain, len, hl, src, problems: problems ? '1' : '', state: state === 'any' ? '' : state, sort, seed, ...overrides };
     const p = new URLSearchParams();
     for (const [k, v] of Object.entries(cur)) if (v && !(k === 'sort' && v === 'newest')) p.set(k, String(v));
     const s = p.toString();
@@ -723,7 +739,8 @@ ${viewChips}
   ${searching || savedView ? `<a class="back" href="${viewParam ? `/?view=${escapeHtml(viewParam)}` : '/'}">Clear</a>` : ''}
 </form>
 ${savedView ? `<div class="meta">${total.toLocaleString('en-US')} article${total === 1 ? '' : 's'} in “${escapeHtml(savedView.name)}”</div>` : ''}
-${searching && !savedView ? `<div class="meta">${total.toLocaleString('en-US')} result${total === 1 ? '' : 's'}${q ? ` for “${escapeHtml(q)}”` : ''}${domain ? ` from ${escapeHtml(domain)}` : ''}${state !== 'any' ? ` · ${escapeHtml(STATE_LABELS[state].toLowerCase())}` : ''}${src ? ` · ${escapeHtml(SOURCES[src].label.toLowerCase())}` : ''}${src === 'phone' && total ? ' — open the original and save it again from Firefox to be sure the right version was kept' : ''}</div>${saveViewForm}` : ''}
+${problems && !savedView ? `<div class="meta">${total.toLocaleString('en-US')} article${total === 1 ? '' : 's'} didn't save properly — they are kept out of the Inbox. Open one in Firefox and the extension re-saves it from the rendered page; or delete it.</div>` : ''}
+${searching && !savedView && !problems ? `<div class="meta">${total.toLocaleString('en-US')} result${total === 1 ? '' : 's'}${q ? ` for “${escapeHtml(q)}”` : ''}${domain ? ` from ${escapeHtml(domain)}` : ''}${state !== 'any' ? ` · ${escapeHtml(STATE_LABELS[state].toLowerCase())}` : ''}${src ? ` · ${escapeHtml(SOURCES[src].label.toLowerCase())}` : ''}${src === 'phone' && total ? ' — open the original and save it again from Firefox to be sure the right version was kept' : ''}</div>${saveViewForm}` : ''}
 ${!searching && !savedView ? `<div class="meta">${total.toLocaleString('en-US')} article${total === 1 ? '' : 's'}</div>` : ''}`;
 
   const pager = pageCount > 1 ? `<div class="pager">
@@ -753,6 +770,11 @@ ${!searching && !savedView ? `<div class="meta">${total.toLocaleString('en-US')}
       a.shareId ? 'shared' : null,
       a.source === 'android-share' ? 'saved from phone' : null,
     ].filter(Boolean).map(escapeHtml).join(' · ');
+    // Why this one is flagged. Shown wherever it turns up, not just in the
+    // Problems list — a flagged article reached a search result for a reason.
+    const problemNote = a.problemDetail
+      ? `<div class="meta problem-note">⚠ ${escapeHtml(a.problemDetail)}</div>`
+      : '';
     // The real page, in a new tab: from here you can re-save it with the
     // extension. (The reader's "view original" shows the *captured* copy,
     // which is the wrong thing when the point is to check the capture.)
@@ -772,7 +794,7 @@ ${!searching && !savedView ? `<div class="meta">${total.toLocaleString('en-US')}
       : '';
     return `<li data-id="${a.id}">
       <div class="main"><a class="title" href="${escapeHtml(readHref(a.id, backTo))}">${escapeHtml(a.title)}</a>${hlBadge}
-      <div class="meta">${meta}${openOriginal}</div>${snipHtml}</div>
+      <div class="meta">${meta}${openOriginal}</div>${problemNote}${snipHtml}</div>
       ${thumb}
       <div class="actions">
         <button class="act fav" data-act="favorite" data-val="${a.favorite ? 'false' : 'true'}" title="Favorite">${a.favorite ? '★' : '☆'}</button>
@@ -2188,7 +2210,9 @@ async function handle(ctx, req, res, url) {
     const view = url.searchParams.get('view') || 'inbox';
     made = listPage(ctx, user, view, url, prefs);
     if (made.setCookie) extraHeaders['Set-Cookie'] = prefCookie('rl_sort', made.setCookie);
-    if (url.searchParams.get('src') === 'phone' && !url.searchParams.get('q')) {
+    if (url.searchParams.get('problems') === '1') {
+      active = 'problems'; title = 'Problems';
+    } else if (url.searchParams.get('src') === 'phone' && !url.searchParams.get('q')) {
       active = 'phone'; title = 'From phone';
     } else {
       active = ['favorites', 'archive'].includes(view) ? view : 'inbox';

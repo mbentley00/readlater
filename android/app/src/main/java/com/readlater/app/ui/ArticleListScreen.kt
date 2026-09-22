@@ -152,6 +152,9 @@ fun ArticleListScreen(
     // Saveable so the current tab/view survives opening an article and coming
     // back (e.g. after archiving) — otherwise you'd be kicked to the inbox.
     var showArchived by rememberSaveable { mutableStateOf(false) }
+    // The Problems tab: saves the server flagged as not having worked. They are
+    // absent from Inbox and Archive, so this is the only place they show up.
+    var showProblems by rememberSaveable { mutableStateOf(false) }
     var selectedViewId by rememberSaveable { mutableStateOf<String?>(null) }
     var views by remember { mutableStateOf(repo.cachedViews()) }
     val selectedView = remember(views, selectedViewId) { views.firstOrNull { it.id == selectedViewId } }
@@ -160,8 +163,12 @@ fun ArticleListScreen(
 
     // While searching, look across the whole library (incl. archived), not just
     // the current inbox/archive tab.
-    val unsorted by remember(showArchived, selectedView, searchActive) {
-        if (selectedView != null || searchActive) repo.allArticles() else repo.articles(showArchived)
+    val unsorted by remember(showArchived, showProblems, selectedView, searchActive) {
+        when {
+            selectedView != null || searchActive -> repo.allArticles()
+            showProblems -> repo.problemArticles()
+            else -> repo.articles(showArchived)
+        }
     }.collectAsState(initial = emptyList())
     val hlCounts by repo.highlightCounts().collectAsState(initial = emptyList())
     var syncing by remember { mutableStateOf(false) }
@@ -196,12 +203,14 @@ fun ArticleListScreen(
     // each sync and whenever the views change, which is close enough for a label.
     var inboxCount by remember { mutableStateOf<Int?>(null) }
     var archiveCount by remember { mutableStateOf<Int?>(null) }
+    var problemCount by remember { mutableStateOf<Int?>(null) }
     var viewCounts by remember { mutableStateOf<Map<String, Int>>(emptyMap()) }
     LaunchedEffect(views, syncing) {
         if (syncing) return@LaunchedEffect // recount once it settles, not mid-write
         runCatching { repo.articlesForCounting() }.onSuccess { (all, hl) ->
-            inboxCount = all.count { !it.archived }
+            inboxCount = all.count { !it.archived && !it.problem }
             archiveCount = all.count { it.archived }
+            problemCount = all.count { it.problem && !it.archived }
             viewCounts = views.associate { v ->
                 v.id to all.count { matchesView(it, v, hl[it.id] ?: 0) }
             }
@@ -237,7 +246,7 @@ fun ArticleListScreen(
         // archived, so it defaults to what you just archived. Elsewhere it's by
         // when the article was saved. (archivedAt falls back to updatedAt for rows
         // archived before it was tracked, or archived on another device.)
-        val archiveOrder = showArchived && view == null && !searchActive
+        val archiveOrder = showArchived && !showProblems && view == null && !searchActive
         val timeKey: (ArticleEntity) -> Long =
             if (archiveOrder) { a -> a.archivedAt ?: a.updatedAt } else { a -> a.savedAt }
         when (sortMode) {
@@ -488,19 +497,29 @@ fun ArticleListScreen(
                 horizontalArrangement = Arrangement.spacedBy(8.dp)
             ) {
                 FilterChip(
-                    selected = !showArchived && selectedView == null,
-                    onClick = { showArchived = false; selectedViewId = null },
+                    selected = !showArchived && !showProblems && selectedView == null,
+                    onClick = { showArchived = false; showProblems = false; selectedViewId = null },
                     label = { Text(chipLabel("Inbox", inboxCount), maxLines = 1) }
                 )
                 FilterChip(
                     selected = showArchived && selectedView == null,
-                    onClick = { showArchived = true; selectedViewId = null },
+                    onClick = { showArchived = true; showProblems = false; selectedViewId = null },
                     label = { Text(chipLabel("Archive", archiveCount), maxLines = 1) }
                 )
+                // Hidden until there is something in it — an empty Problems tab
+                // is a chip asking about a problem you don't have.
+                if ((problemCount ?: 0) > 0 || showProblems) {
+                    FilterChip(
+                        selected = showProblems && selectedView == null,
+                        onClick = { showProblems = true; showArchived = false; selectedViewId = null },
+                        label = { Text(chipLabel("Problems", problemCount), maxLines = 1) }
+                    )
+                }
                 views.forEach { v ->
                     FilterChip(
                         selected = selectedView?.id == v.id,
                         onClick = {
+                            showProblems = false
                             selectedViewId = if (selectedViewId == v.id) null else v.id
                         },
                         label = { Text(chipLabel(v.name, viewCounts[v.id]), maxLines = 1) }
@@ -706,6 +725,18 @@ private fun ArticleCard(
                             modifier = Modifier.padding(start = 6.dp, top = 3.dp).size(16.dp)
                         )
                     }
+                }
+
+                // Why this one is flagged as a bad save, wherever it turns up.
+                if (article.problem) {
+                    Spacer(modifier = Modifier.height(4.dp))
+                    Text(
+                        text = "⚠ " + (article.problemDetail ?: "This didn't save properly"),
+                        style = MaterialTheme.typography.labelMedium,
+                        color = problemTint(),
+                        maxLines = 2,
+                        overflow = TextOverflow.Ellipsis
+                    )
                 }
 
                 // date · excerpt

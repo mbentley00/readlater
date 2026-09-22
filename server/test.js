@@ -1168,6 +1168,48 @@ async function main() {
     await api('DELETE', `/api/articles/${newSaveId}`);
     console.log('  Archive ordering + view chips ✔');
 
+    // ---- badly-saved articles: flagged, kept out of the inbox, repairable
+    const badUrl = 'https://paywalled.example.com/2026/09/17/world/a-story.html';
+    r = await api('POST', '/api/articles', {
+      url: badUrl,
+      title: 'paywalled.example.com',
+      excerpt: 'Fetch failed (403)',
+      html: `<p>Couldn't fetch this page (HTTP 403). Original: ${badUrl}</p>`,
+      source: 'android-share',
+    });
+    const badId = r.body.id;
+    r = await api('GET', '/api/articles?problems=1');
+    const flagged = r.body.articles.find((a) => a.id === badId);
+    assert.ok(flagged, 'the failed save is flagged');
+    assert.strictEqual(flagged.problem, true, 'and says so to the app');
+    assert.ok(/403/.test(flagged.problemDetail), `with a reason (${flagged.problemDetail})`);
+    r = await api('GET', '/api/articles?problems=0');
+    assert.ok(!r.body.articles.some((a) => a.id === badId), 'and is left out when asked');
+
+    let inboxNow = await (await fetch(BASE + '/', { headers: { Cookie: aliceCookie2 } })).text();
+    assert.ok(!inboxNow.includes(badId), 'a flagged article is not in the web inbox');
+    const problemsHtml = await (await fetch(BASE + '/?problems=1', { headers: { Cookie: aliceCookie2 } })).text();
+    assert.ok(problemsHtml.includes(badId), 'it is in the Problems list');
+    assert.ok(/problem-note/.test(problemsHtml), 'which says why');
+
+    // The extension's automatic re-save is what fixes these, so they have to
+    // reach it — whatever their age or how they were saved.
+    r = await api('GET', '/api/resave-candidates');
+    assert.ok(r.body.articles.some((a) => a.id === badId), 'flagged articles are offered for re-save');
+
+    // A real capture of the same page clears the flag, with no unflag step.
+    const realText = Array.from({ length: 120 }, (_, i) => `sentence ${i} of the actual article`).join('. ');
+    r = await api('POST', '/api/articles', {
+      url: badUrl, title: 'A Story', html: `<p>${realText}</p>`, source: 'browser-page', autoResave: true,
+    });
+    assert.ok(!r.body.skipped, `the re-save was accepted (${r.body.skipped || ''})`);
+    r = await api('GET', '/api/articles?problems=1');
+    assert.ok(!r.body.articles.some((a) => a.id === badId), 're-saving it clears the flag');
+    inboxNow = await (await fetch(BASE + '/', { headers: { Cookie: aliceCookie2 } })).text();
+    assert.ok(inboxNow.includes(badId), 'and it returns to the inbox');
+    await api('DELETE', `/api/articles/${badId}`);
+    console.log('  Bad saves flagged, hidden, and repaired ✔');
+
     r = await api('POST', '/api/articles/bulk-archive', { olderThanDays: 365 });
     assert.ok(r.body.archived >= 1, 'bulk-archive archived at least the ancient article');
     r = await api('GET', `/api/articles/${ancientId}`);
@@ -2049,6 +2091,51 @@ function testTranscriptShaping() {
   console.log('  Transcript paragraphs + episode titles ✔');
 }
 
+/** Which saves count as badly parsed (quality.js). */
+function testProblemDetection() {
+  const { detectProblem } = require('./quality');
+  const url = 'https://www.nytimes.com/2026/09/17/world/americas/mexico-city-endho-dam.html';
+  const long = Array.from({ length: 300 }, (_, i) => `word${i}`).join(' ');
+
+  const failed = detectProblem({
+    url, source: 'android-share', title: 'nytimes.com', excerpt: 'Fetch failed (403)',
+    html: "<p>Couldn't fetch this page (HTTP 403). Original: " + url + '</p>', textContent: '',
+  });
+  assert.strictEqual(failed && failed.reason, 'fetch-failed', 'a 403 stub is a problem');
+  assert.ok(/403/.test(failed.detail), 'and the status is in the reason');
+
+  assert.strictEqual(detectProblem({ url, title: 'Are you a robot?', textContent: 'Please enable JavaScript and cookies to continue.' }).reason,
+    'blocked', 'a bot wall is a problem');
+  assert.strictEqual(detectProblem({ url, title: 'A Story', textContent: 'The first paragraph. Subscribe to continue reading.' }).reason,
+    'paywall', 'a subscriber teaser is a problem');
+  assert.strictEqual(detectProblem({ url, title: 'A Story', html: '<p></p>', textContent: '' }).reason,
+    'empty', 'no text at all is a problem');
+  assert.strictEqual(detectProblem({ url, title: 'A Story', textContent: 'Three words here.' }).reason,
+    'thin', 'three words is a problem');
+  const someText = Array.from({ length: 120 }, (_, i) => `word${i}`).join(' ');
+  assert.strictEqual(detectProblem({ url, title: 'nytimes.com', textContent: someText }).reason,
+    'unparsed', 'a domain for a title, with nothing much under it, is a problem');
+  assert.strictEqual(detectProblem({ url, title: 'nytimes.com', textContent: long }), null,
+    'but a domain title over a full-length article is left alone');
+
+  // And the things that must NOT be flagged, which matter more.
+  assert.strictEqual(detectProblem({ url, title: 'A Story', textContent: long }), null, 'a real article is fine');
+  assert.strictEqual(detectProblem({
+    url, title: 'On Paywalls', textContent: `${long} Publishers now ask you to subscribe to continue reading, which is the subject of this piece. ${long}`,
+  }), null, 'a long article about paywalls is not a paywall');
+  assert.strictEqual(detectProblem({ url: 'https://example.com/', title: 'Example', textContent: 'A short note.' }), null,
+    'a homepage is short by nature');
+  assert.strictEqual(detectProblem({ url: 'audio:abc123', source: 'audio', title: 'Episode', textContent: '' }), null,
+    'an episode waiting for its transcript is not a problem');
+  assert.strictEqual(detectProblem({ url, source: 'kindle', title: 'A Book', textContent: 'One highlight.' }), null,
+    'a Kindle import is short on purpose');
+  assert.strictEqual(detectProblem({ url, title: 'A Story', html: '', textContent: '', excerpt: '' }), null,
+    'a placeholder waiting on its fetch is not yet a problem');
+
+  console.log('  Bad-save detection ✔');
+}
+
+testProblemDetection();
 testTtsSkipsCaptions();
 testTranscriptShaping();
 testEmailNormalization();

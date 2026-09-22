@@ -1058,6 +1058,11 @@ const server = http.createServer(async (req, res) => {
           // saved ('kindle', 'android-share', 'email', …). Comma-separated.
           sources: (url.searchParams.get('source') || '')
             .split(',').map((x) => x.trim()).filter(Boolean),
+          // Badly-saved articles (quality.js): ?problems=1 for just those, =0
+          // to leave them out. The Android app asks for everything and sorts
+          // them out itself, since each article carries the flag.
+          problemsOnly: url.searchParams.get('problems') === '1',
+          excludeProblems: url.searchParams.get('problems') === '0',
           limit: num('limit'),
         });
         return json(res, 200, { articles: list.map(pubArticleMeta) });
@@ -1097,8 +1102,11 @@ const server = http.createServer(async (req, res) => {
         if (b.autoResave === true) {
           const curLen = a ? (a.textContent || '').length : 0;
           const capLen = (fields.textContent || String(fields.html).replace(/<[^>]+>/g, ' ')).trim().length;
+          // A flagged article (403, consent wall, never parsed) is worth
+          // replacing however it was saved: there is nothing there to lose.
+          const flagged = a ? !!store.articleProblem(a.id) : false;
           const skipped = !a ? 'not saved'
-            : a.source !== 'android-share' ? 'already re-saved'
+            : (a.source !== 'android-share' && !flagged) ? 'already re-saved'
             // highlights and reading position are anchored to paragraph indices
             : store.highlightCountForArticle(a.id) > 0 ? 'has highlights'
             // a consent wall or teaser must not replace a copy that was fine
@@ -1200,7 +1208,16 @@ const server = http.createServer(async (req, res) => {
     // URL to the server; only a match leads to a (guarded) POST /api/articles.
     if (req.method === 'GET' && parts[1] === 'resave-candidates' && parts.length === 2) {
       const RESAVE_WINDOW_MS = 90 * 24 * 60 * 60 * 1000;
-      return json(res, 200, { articles: store.resaveCandidates(user.id, Date.now() - RESAVE_WINDOW_MS) });
+      // Recent phone saves (a server-side fetch the browser can improve on),
+      // plus anything flagged as badly saved whatever its age or origin — a
+      // 403 or a consent wall is exactly what opening the page in a logged-in
+      // browser fixes, and it is the only repair this asks the user for.
+      const byId = new Map();
+      for (const a of store.resaveCandidates(user.id, Date.now() - RESAVE_WINDOW_MS)) byId.set(a.id, a);
+      for (const a of store.listProblems(user.id)) {
+        if (/^https?:/i.test(a.url)) byId.set(a.id, { id: a.id, url: a.url });
+      }
+      return json(res, 200, { articles: [...byId.values()] });
     }
 
     // ---- save by URL: create a placeholder immediately and respond fast, then
