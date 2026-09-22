@@ -14,6 +14,7 @@ import android.widget.Toast
 import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
 import androidx.core.content.ContextCompat
+import com.readlater.app.data.PodcastFiles
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -139,7 +140,18 @@ class ShareUploadService : Service() {
             spool = file
             val size = file.length()
             if (size > MAX_AUDIO_BYTES) { tooBig(size); return }
-            val title = app.apiClient.importAudio(uploadName(name, titleHint), size) { file.inputStream() }
+            val hash = withContext(Dispatchers.IO) { PodcastFiles.hashOf(file) }
+            val title = try {
+                app.apiClient.importAudio(uploadName(name, titleHint), size) { file.inputStream() }
+            } finally {
+                // Kept for playing the episode itself, whichever way the upload
+                // went: a "failed" upload has often landed (below), and the file
+                // finds its article by content hash once it syncs. One that
+                // really failed is swept after a few days, or replaced by a re-share.
+                withContext(Dispatchers.IO) {
+                    runCatching { app.podcastFiles.keep(file, hash, audioExt(name)) }
+                }
+            }
             toast("Transcribing: $title")
             runCatching { app.repository.syncNow() } // the stub shows up in the list
         } catch (e: Exception) {
@@ -151,15 +163,19 @@ class ShareUploadService : Service() {
             runCatching { app.repository.syncNow() }
             toast("Couldn't confirm: ${e.message ?: "error"} — check the list, it may have saved anyway")
         } finally {
-            spool?.delete()
+            spool?.delete() // no-op once kept; clears a spool that never got that far
         }
     }
+
+    /** Extension for the stored episode, from the shared filename. */
+    private fun audioExt(filename: String): String =
+        filename.substringAfterLast('.', "").lowercase().takeIf { it.length in 1..5 } ?: "mp3"
 
     private fun tooBig(size: Long) =
         toast("That episode is ${size / 1024 / 1024} MB — too big to send (limit 100 MB)")
 
-    /** Spool the share into our own cache. Deleted as soon as the upload ends,
-     *  either way. */
+    /** Spool the share into our own cache. Once the upload ends it is moved
+     *  into [PodcastFiles] for playing (or deleted, if it never got that far). */
     private fun copyToCache(uri: Uri): File {
         val spool = File.createTempFile("share-upload", ".tmp", cacheDir)
         try {

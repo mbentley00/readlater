@@ -40,6 +40,15 @@ class Settings(context: Context) {
             prefs.edit().putFloat(KEY_SERVER_RATE, value.coerceIn(0.5f, 2.0f)).apply()
         }
 
+    /** Playback speed for episodes shared into the app and played as audio.
+     *  Separate from the voices: a recorded speaker is already at a natural
+     *  pace, so this defaults to 2x. */
+    var podcastSpeed: Float
+        get() = prefs.getFloat(KEY_PODCAST_SPEED, 2.0f)
+        set(value) {
+            prefs.edit().putFloat(KEY_PODCAST_SPEED, value.coerceIn(0.5f, 3.0f)).apply()
+        }
+
     /** Article list sort order (name of a SortMode enum value). */
     var listSort: String
         get() = prefs.getString(KEY_LIST_SORT, "NEWEST").orEmpty()
@@ -102,6 +111,7 @@ class Settings(context: Context) {
         const val KEY_TOKEN = "token"
         const val KEY_TTS_RATE = "tts_speech_rate"
         const val KEY_SERVER_RATE = "server_speech_rate"
+        const val KEY_PODCAST_SPEED = "podcast_speed"
         const val KEY_CACHED_VIEWS = "cached_views_json"
         const val KEY_LIST_SORT = "list_sort"
         const val KEY_LAST_ARTICLE = "last_article_id"

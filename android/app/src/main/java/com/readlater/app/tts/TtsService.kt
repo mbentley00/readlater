@@ -52,7 +52,9 @@ data class TtsPlaybackState(
     /** elapsedRealtime() at which the sleep timer will pause playback; 0 = no timer. */
     val sleepTimerEndsAt: Long = 0L,
     /** Binge mode: archive each article on completion and play the next. */
-    val autoAdvance: Boolean = false
+    val autoAdvance: Boolean = false,
+    /** Playing a shared podcast episode's own audio (not a voice reading its transcript). */
+    val podcast: Boolean = false
 )
 
 /**
@@ -72,6 +74,8 @@ class TtsService : Service() {
         const val ACTION_SET_POSITION = "com.readlater.app.tts.action.SET_POSITION"
         const val ACTION_SET_SLEEP_TIMER = "com.readlater.app.tts.action.SET_SLEEP_TIMER"
         const val ACTION_TOGGLE_AUTO_ADVANCE = "com.readlater.app.tts.action.TOGGLE_AUTO_ADVANCE"
+        /** The podcast speed setting changed: re-apply it from where playback is. */
+        const val ACTION_SET_SPEED = "com.readlater.app.tts.action.SET_SPEED"
         /** Archive the article currently playing and roll on to the next inbox
          *  article, playing it — the UI equivalent of the headset triple-tap, so
          *  archiving during a play-through continues the playlist instead of
@@ -90,6 +94,9 @@ class TtsService : Service() {
 
         private const val CHANNEL_ID = "tts_playback"
         private const val NOTIFICATION_ID = 1001
+
+        /** How far a triple headset tap skips ahead in a podcast episode. */
+        private const val PODCAST_SKIP_MS = 60_000
 
         /** How many upcoming paragraphs to keep synthesized ahead of playback. */
         private const val PREFETCH_AHEAD = 3
@@ -175,6 +182,7 @@ class TtsService : Service() {
     private var articleTitle = ""
     private var articleSite = ""
     private var articleByline = ""
+    private var articleUrl = ""
 
     /** Author · publisher for the lock-screen subtitle. */
     private fun articleSubtitle(): String =
@@ -212,6 +220,7 @@ class TtsService : Service() {
                 // Lock-screen seekbar drag → jump to the matching paragraph.
                 override fun onSeekTo(pos: Long) {
                     if (blocks.isEmpty()) return
+                    if (podcastFile != null) { seekPodcastTo(pos.toInt()); return }
                     var acc = 0L
                     var idx = 0
                     for (i in blockDurationsMs.indices) {
@@ -280,6 +289,7 @@ class TtsService : Service() {
             ACTION_SET_POSITION -> handleSetPosition(intent)
             ACTION_SET_SLEEP_TIMER -> handleSetSleepTimer(intent.getIntExtra(EXTRA_SLEEP_MINUTES, 0))
             ACTION_TOGGLE_AUTO_ADVANCE -> handleToggleAutoAdvance()
+            ACTION_SET_SPEED -> handleSetSpeed()
             ACTION_ARCHIVE_AND_NEXT -> handleArchiveAndNext()
             // System-delivered media buttons (MediaButtonReceiver in the
             // manifest) route into the session callback.
@@ -410,6 +420,7 @@ class TtsService : Service() {
             articleSite = article.siteName?.takeIf { it.isNotBlank() }
                 ?: runCatching { android.net.Uri.parse(article.url).host?.removePrefix("www.") }.getOrNull().orEmpty()
             articleByline = article.byline.orEmpty()
+            articleUrl = article.url
             blocks = HtmlParser.parse(html)
             if (blocks.isEmpty()) {
                 handleStop()
@@ -442,6 +453,11 @@ class TtsService : Service() {
             acquireWakeLock()
             requestAudioFocus()
             speakableBlocks = blocks.indices.filter { speakableText(blocks[it]) != null }
+            // A podcast episode shared into the app plays as itself — the
+            // voices are only for articles with no audio of their own.
+            app.podcastFiles.forUrl(article.url)?.let { episode ->
+                if (startPodcast(episode, article.id)) return@launch
+            }
             // Prefer the server (Kokoro) voice when enabled and available;
             // otherwise (incl. not-yet-generated) fall back to the device voice.
             if (app.settings.useServerVoice && tryStartServerVoice(article.id)) {
@@ -605,7 +621,8 @@ class TtsService : Service() {
      *  Bluetooth earbuds deliver more than once) doesn't toggle twice. On the
      *  Pixel Buds a single tap is play/pause, double tap is NEXT (→ highlight),
      *  and triple tap is PREVIOUS (→ archive and play the next article, which
-     *  takes two triple-taps within five seconds). */
+     *  takes two triple-taps within five seconds — or, in a podcast episode,
+     *  skip ahead a minute). */
     private fun dispatchMediaKey(code: Int) {
         val now = android.os.SystemClock.elapsedRealtime()
         if (now - lastButtonAt < buttonDebounceMs) {
@@ -619,7 +636,8 @@ class TtsService : Service() {
             KeyEvent.KEYCODE_MEDIA_PLAY -> if (!isPlaying) handleResume()
             KeyEvent.KEYCODE_MEDIA_PAUSE -> if (isPlaying) handlePause()
             KeyEvent.KEYCODE_MEDIA_NEXT -> handleHighlightCurrent()
-            KeyEvent.KEYCODE_MEDIA_PREVIOUS -> handleArchiveAndNextConfirmed()
+            KeyEvent.KEYCODE_MEDIA_PREVIOUS ->
+                if (podcastFile != null) handleSkipPodcast(PODCAST_SKIP_MS) else handleArchiveAndNextConfirmed()
         }
     }
 
@@ -715,7 +733,12 @@ class TtsService : Service() {
      *  playback ms for the server voice; falls back to elapsed wall-time since
      *  the paragraph began for the device voice. */
     private fun wordsIntoCurrentParagraph(): Float {
-        val rate = if (serverMode) app.settings.serverSpeechRate else app.settings.ttsSpeechRate
+        // A podcast's ms are the recording's own, spoken at a natural pace.
+        val rate = when {
+            podcastFile != null -> 1.0f
+            serverMode -> app.settings.serverSpeechRate
+            else -> app.settings.ttsSpeechRate
+        }
         val msInto = if (serverMode && serverOffsetsMs.isNotEmpty()) {
             (trackPositionMs() - msForBlock(currentIndex)).coerceAtLeast(0)
         } else if (isPlaying && paragraphStartedAtMs > 0) {
@@ -759,6 +782,12 @@ class TtsService : Service() {
      *  archive it and roll on to the next inbox article; otherwise reset to the
      *  top and stop. This is the single choke point every completion path uses. */
     private fun handleArticleComplete() {
+        if (podcastFile != null) {
+            // Listened to the end: the episode's audio is done with (tens of
+            // MB). The transcript stays; playing it again reads it aloud.
+            logDbg("podcast complete — deleting the episode file")
+            app.podcastFiles.delete(articleUrl)
+        }
         if (autoAdvance) {
             logDbg("auto-advance: article complete → chime & next")
             playChime() // gentle hand-off cue; only on natural completion in queue mode
@@ -1182,6 +1211,129 @@ class TtsService : Service() {
         }.also { it.isDaemon = true }.start()
     }
 
+    // --- Podcast episodes: an episode shared into the app is kept on the phone
+    // (PodcastFiles) and played as itself through the same decode-and-stream
+    // path as the server voice, so earbud buttons, pause/resume mid-sentence
+    // and the paragraph highlight all work unchanged. The server stamps each
+    // transcript paragraph with its start time (data-t), which becomes the
+    // offsets table the server voice gets from its own metadata.
+    private var podcastFile: java.io.File? = null
+    private var podcastDurationMs = 0L
+
+    /** Start playing a stored episode. False if it can't be read, so the
+     *  caller falls back to reading the transcript aloud. */
+    private suspend fun startPodcast(episode: java.io.File, id: String): Boolean {
+        val durationMs = withContext(Dispatchers.IO) { audioDurationMs(episode) }
+        if (id != articleId || !isPlaying) return false // superseded meanwhile
+        if (durationMs <= 0) { logDbg("episode unreadable (${episode.name}) — reading the transcript"); return false }
+        podcastFile = episode
+        podcastDurationMs = durationMs
+        serverOffsetsMs = podcastOffsets(durationMs)
+        serverMode = true
+        val timed = speakableBlocks.count { (blocks[it] as? Block.Paragraph)?.startSec != null }
+        logDbg("podcast: ${episode.length()} bytes, ${durationMs / 1000}s, $timed/${speakableBlocks.size} paragraphs timed, speed ${app.settings.podcastSpeed}")
+        updateMetadata()
+        startServerStream(msForBlock(currentIndex))
+        return true
+    }
+
+    private fun audioDurationMs(file: java.io.File): Long {
+        val r = android.media.MediaMetadataRetriever()
+        return try {
+            r.setDataSource(file.absolutePath)
+            r.extractMetadata(android.media.MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLongOrNull() ?: 0L
+        } catch (e: Exception) {
+            0L
+        } finally {
+            runCatching { r.release() }
+        }
+    }
+
+    /**
+     * Start time (ms) of each speakable block. Transcript paragraphs carry their
+     * own; any without one (a transcript made before timestamps, or the
+     * "Transcribing…" stub) are placed by where their text falls between the
+     * nearest known times, with the start and end of the episode as bounds.
+     */
+    private fun podcastOffsets(durationMs: Long): IntArray {
+        val n = speakableBlocks.size
+        val charAt = LongArray(n + 1)
+        for (i in 0 until n) charAt[i + 1] = charAt[i] + (speakableText(blocks[speakableBlocks[i]])?.length ?: 0)
+        val known = arrayOfNulls<Long>(n + 1)
+        for (i in 0 until n) {
+            known[i] = (blocks[speakableBlocks[i]] as? Block.Paragraph)?.startSec?.let { (it * 1000).toLong() }
+        }
+        if (known[0] == null) known[0] = 0L
+        known[n] = durationMs
+        val out = IntArray(n)
+        var prev = 0 // index of the last known anchor
+        var last = 0L
+        for (i in 0 until n) {
+            val t = known[i] ?: run {
+                val next = (i + 1..n).first { known[it] != null }
+                val t0 = known[prev]!!
+                val t1 = known[next]!!
+                val span = (charAt[next] - charAt[prev]).coerceAtLeast(1)
+                t0 + (t1 - t0) * (charAt[i] - charAt[prev]) / span
+            }
+            if (known[i] != null) prev = i
+            last = maxOf(last, t.coerceIn(0L, durationMs)) // the lookup needs them in order
+            out[i] = last.toInt()
+        }
+        return out
+    }
+
+    /** Where playback is in the episode (ms), playing or paused. */
+    private fun podcastPositionMs(): Int = when {
+        isPlaying -> trackPositionMs()
+        resumePositionMs > 0 -> resumePositionMs
+        else -> msForBlock(currentIndex)
+    }
+
+    /** Jump to [ms] in the episode, keeping play/pause as it is. */
+    private fun seekPodcastTo(ms: Int) {
+        if (podcastFile == null) return
+        val target = ms.coerceIn(0, podcastDurationMs.toInt().coerceAtLeast(0))
+        currentIndex = blockForMs(target)
+        articleId?.let { app.repository.saveTtsPositionLocal(it, currentIndex) }
+        if (isPlaying) {
+            startServerStream(target)
+        } else {
+            discardPlayer()
+            resumePositionMs = target
+            publishState()
+        }
+        updatePlaybackState()
+        updateNotification()
+    }
+
+    /** Triple headset tap in an episode: skip ahead. Past the end is the end. */
+    private fun handleSkipPodcast(deltaMs: Int) {
+        val target = podcastPositionMs() + deltaMs
+        logDbg("podcast skip +${deltaMs / 1000}s → ${target / 1000}s of ${podcastDurationMs / 1000}s")
+        if (podcastDurationMs > 0 && target >= podcastDurationMs) {
+            handleArticleComplete()
+            return
+        }
+        seekPodcastTo(target)
+        Toast.makeText(this, "Skipped ahead ${deltaMs / 1000}s", Toast.LENGTH_SHORT).show()
+    }
+
+    /** The podcast speed changed in the reader: carry on from here at the new speed. */
+    private fun handleSetSpeed() {
+        if (podcastFile == null || !isPlaying) return
+        startServerStream(trackPositionMs())
+        updatePlaybackState()
+    }
+
+    /** Position and length for the lock-screen timeline: real for an episode,
+     *  estimated from the text for a voice. */
+    private fun timelinePositionMs(): Long =
+        if (podcastFile != null) podcastPositionMs().toLong() else positionMs(currentIndex)
+
+    private fun timelineDurationMs(): Long =
+        if (podcastFile != null && podcastDurationMs > 0) podcastDurationMs else totalDurationMs
+
     // --- Server voice (Kokoro): one downloaded WAV for the whole article,
     // played continuously; playback time maps to app paragraphs via the
     // server's per-paragraph offsets so highlight/resume keep working.
@@ -1285,6 +1437,8 @@ class TtsService : Service() {
         synthRetried.clear()
         fallbackRun = 0
         serverMode = false
+        podcastFile = null
+        podcastDurationMs = 0L
         cacheDir.listFiles()?.filter { it.name.startsWith("tts-") }?.forEach { it.delete() }
     }
 
@@ -1420,7 +1574,12 @@ class TtsService : Service() {
     /** Resume: continue the current paragraph from where we paused (we release
      *  the AudioTrack on pause, so we re-stream from the saved byte offset). */
     private fun resumeSpeaking() {
-        if (serverMode) { startServerStream(resumePositionMs); return }
+        if (serverMode) {
+            // A paused next/prev/seek discards the player and zeroes the saved
+            // offset; start from the paragraph it moved to, not the top.
+            startServerStream(if (resumePositionMs > 0) resumePositionMs else msForBlock(currentIndex))
+            return
+        }
         val idx = nextSpeakable(currentIndex) ?: run { handleStop(); return }
         currentIndex = idx
         playParagraph(idx, if (usingSpeakFallback) 0 else resumePositionMs)
@@ -1762,8 +1921,13 @@ class TtsService : Service() {
 
     /** Play the downloaded server audio, decoding Opus when needed. */
     private fun startServerStream(fromMs: Int) {
-        if (serverFormat == "opus") startServerStreamOpus(fromMs) else startServerStreamWav(fromMs)
+        if (podcastFile != null || serverFormat == "opus") startServerStreamOpus(fromMs) else startServerStreamWav(fromMs)
     }
+
+    /** Speed for the whole-file player: the podcast setting for an episode,
+     *  the server voice's otherwise. */
+    private fun fileSpeed(): Float =
+        if (podcastFile != null) app.settings.podcastSpeed else app.settings.serverSpeechRate
 
     /** Stream the whole-article server WAV via AudioTrack from [fromMs], updating
      *  the current paragraph from playback time as it goes. */
@@ -1873,8 +2037,11 @@ class TtsService : Service() {
      *  with a decode step. Seeks by time; tracks the paragraph from playback. */
     private fun startServerStreamOpus(fromMs: Int) {
         releasePlayer()
-        val file = serverAudioFile(articleId ?: return, "opus")
-        if (file.length() < 4) { logDbg("opus file missing — device voice"); serverMode = false; speakCurrent(); return }
+        val file = podcastFile ?: serverAudioFile(articleId ?: return, "opus")
+        if (file.length() < 4) {
+            logDbg("${if (podcastFile != null) "episode" else "opus"} file missing — device voice")
+            serverMode = false; podcastFile = null; speakCurrent(); return
+        }
         trackStartMs = fromMs
         audioStarted = false
         val myGen = ++playThreadGen
@@ -1896,7 +2063,13 @@ class TtsService : Service() {
                 }
                 if (trackIdx < 0 || format == null) throw IllegalStateException("no audio track in opus")
                 extractor.selectTrack(trackIdx)
-                if (fromMs > 0) extractor.seekTo(fromMs * 1000L, android.media.MediaExtractor.SEEK_TO_CLOSEST_SYNC)
+                if (fromMs > 0) {
+                    extractor.seekTo(fromMs * 1000L, android.media.MediaExtractor.SEEK_TO_CLOSEST_SYNC)
+                    // Count from where the seek actually landed (the sync point
+                    // before fromMs), so the highlight doesn't run ahead of the audio.
+                    val landed = extractor.sampleTime
+                    if (landed >= 0) trackStartMs = (landed / 1000L).toInt()
+                }
                 val mime = format.getString(android.media.MediaFormat.KEY_MIME)!!
                 val sampleRate = format.getInteger(android.media.MediaFormat.KEY_SAMPLE_RATE)
                 val channels = format.getInteger(android.media.MediaFormat.KEY_CHANNEL_COUNT)
@@ -1921,7 +2094,7 @@ class TtsService : Service() {
                 trackSampleRate = sampleRate
                 trackChannels = channels
                 val frameBytes = channels * 2
-                val speed = app.settings.serverSpeechRate
+                val speed = fileSpeed()
                 applyTrackSpeed(track, speed)
                 // Publish the track BEFORE playing, so a pause arriving during
                 // opus startup can find and release it (audioTrack is @Volatile).
@@ -2006,8 +2179,8 @@ class TtsService : Service() {
             } catch (e: Exception) {
                 mainHandler.post {
                     if (myGen == playThreadGen) {
-                        logDbg("server opus ERROR: ${e.message} — device voice")
-                        if (isPlaying && serverMode) { serverMode = false; releasePlayer(); speakCurrent() }
+                        logDbg("${if (podcastFile != null) "episode" else "server opus"} ERROR: ${e.message} — device voice")
+                        if (isPlaying && serverMode) { serverMode = false; podcastFile = null; releasePlayer(); speakCurrent() }
                     }
                 }
             } finally {
@@ -2159,7 +2332,10 @@ class TtsService : Service() {
     // ------------------------------------------------------------------ state
 
     private fun publishState() {
-        stateFlow.value = TtsPlaybackState(articleId, currentIndex, isPlaying, isPlaying && !audioStarted, serverMode, sleepTimerEndsAt, autoAdvance)
+        stateFlow.value = TtsPlaybackState(
+            articleId, currentIndex, isPlaying, isPlaying && !audioStarted, serverMode, sleepTimerEndsAt, autoAdvance,
+            podcast = podcastFile != null
+        )
     }
 
     private fun updatePlaybackState() {
@@ -2176,7 +2352,10 @@ class TtsService : Service() {
         mediaSession?.setPlaybackState(
             PlaybackStateCompat.Builder()
                 .setActions(actions)
-                .setState(state, positionMs(currentIndex), if (isPlaying) 1.0f else 0f)
+                .setState(
+                    state, timelinePositionMs(),
+                    if (!isPlaying) 0f else if (podcastFile != null) trackSpeed else 1.0f
+                )
                 .build()
         )
     }
@@ -2186,7 +2365,7 @@ class TtsService : Service() {
             MediaMetadataCompat.Builder()
                 .putString(MediaMetadataCompat.METADATA_KEY_TITLE, articleTitle)
                 .putString(MediaMetadataCompat.METADATA_KEY_ARTIST, articleSubtitle())
-                .putLong(MediaMetadataCompat.METADATA_KEY_DURATION, totalDurationMs)
+                .putLong(MediaMetadataCompat.METADATA_KEY_DURATION, timelineDurationMs())
                 .build()
         )
     }
@@ -2318,7 +2497,7 @@ class TtsService : Service() {
                 android.R.drawable.ic_media_play, "Play", servicePendingIntent(ACTION_RESUME)
             )
         }
-        val pct = if (totalDurationMs > 0) (positionMs(currentIndex) * 100 / totalDurationMs).toInt() else 0
+        val pct = timelineDurationMs().let { if (it > 0) (timelinePositionMs() * 100 / it).toInt() else 0 }
         val progressText = when {
             isPlaying && !audioStarted -> "Preparing voice…"
             blocks.isNotEmpty() -> articleSubtitle().ifBlank { "$pct%" }.let { if (it == "$pct%") it else "$pct% · $it" }

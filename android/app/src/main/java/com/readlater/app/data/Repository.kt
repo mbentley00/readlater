@@ -18,7 +18,8 @@ import java.util.UUID
 class Repository(
     private val db: AppDatabase,
     private val api: ApiClient,
-    private val settings: Settings
+    private val settings: Settings,
+    private val podcasts: PodcastFiles
 ) {
 
     private val articleDao = db.articleDao()
@@ -288,6 +289,9 @@ class Repository(
             }
 
             settings.lastSyncAt = syncStartedAt
+
+            // 6. Let go of stored episodes that were archived elsewhere.
+            podcasts.sweep { articleDao.getByUrl(it) }
         }
     }
 
@@ -336,6 +340,8 @@ class Repository(
             // Stamp when it was archived so the Archive tab can order by it;
             // clear it on unarchive.
             articleDao.setArchived(article.id, nowArchived, if (nowArchived) System.currentTimeMillis() else null)
+            // An archived episode is done with; its audio is tens of MB.
+            if (nowArchived) podcasts.delete(article.url)
             pushMetadata(article.id)
         }
     }
@@ -418,6 +424,7 @@ class Repository(
         bgScope.launch {
             articleDao.deleteById(article.id)
             highlightDao.deleteByArticle(article.id)
+            podcasts.delete(article.url)
             try {
                 api.deleteArticle(article.id)
             } catch (_: Exception) {

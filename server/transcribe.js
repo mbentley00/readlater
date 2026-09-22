@@ -139,10 +139,14 @@ function splitRunOn(text) {
 }
 
 /**
- * Whisper segments → sentences, each carrying the silence before it. Segment
- * boundaries fall mid-sentence as often as not, so a sentence is stitched back
- * together across them, and only a pause that opens a sentence counts — a
- * breath in the middle of one is not a paragraph break.
+ * Whisper segments → sentences, each carrying the silence before it and when
+ * it starts and ends in the audio (seconds; null when the provider gave no
+ * timestamps). Segment boundaries fall mid-sentence as often as not, so a
+ * sentence is stitched back together across them, and only a pause that opens
+ * a sentence counts — a breath in the middle of one is not a paragraph break.
+ * A sentence that starts partway into a segment gets a time interpolated by
+ * character position: Whisper doesn't time sentences, and this is close enough
+ * for a player to land at the right paragraph.
  */
 function segmentsToSentences(segments) {
   const out = [];
@@ -151,50 +155,83 @@ function segmentsToSentences(segments) {
   for (const seg of segments || []) {
     const text = String(seg.text || '').replace(/\s+/g, ' ').trim();
     if (!text) continue;
+    const timed = typeof seg.start === 'number' && typeof seg.end === 'number';
     const gap = lastEnd != null && typeof seg.start === 'number' ? Math.max(0, seg.start - lastEnd) : 0;
     if (typeof seg.end === 'number') lastEnd = seg.end;
+    const at = (chars) => (timed ? seg.start + (seg.end - seg.start) * (chars / text.length) : null);
     const pieces = text.match(/[^.!?…]*[.!?…]+["'”’)\]]*\s*|[^.!?…]+$/g) || [text];
+    let offset = 0;
     pieces.forEach((raw, i) => {
+      const lead = raw.length - raw.trimStart().length;
       const piece = raw.trim();
+      const from = offset + lead;
+      offset += raw.length;
       if (!piece) return;
       if (pending) pending.text += ' ' + piece;
-      else pending = { text: piece, pause: i === 0 ? gap : 0 };
+      else pending = { text: piece, pause: i === 0 ? gap : 0, start: at(from) };
+      pending.end = at(Math.min(text.length, from + piece.length));
       if (endsSentence(pending.text)) { out.push(pending); pending = null; }
     });
   }
   if (pending) out.push(pending);
-  // Run-ons become several pieces; only the first keeps the pause before it.
-  return out.flatMap((s) => splitRunOn(s.text).map((text, i) => ({ text, pause: i === 0 ? s.pause : 0 })));
+  // Run-ons become several pieces; only the first keeps the pause before it,
+  // and the rest are timed by where they fall in the sentence.
+  return out.flatMap((s) => {
+    const pieces = splitRunOn(s.text);
+    let chars = 0;
+    return pieces.map((text, i) => {
+      const start = s.start == null || s.end == null ? s.start
+        : s.start + (s.end - s.start) * (chars / s.text.length);
+      chars += text.length + 1;
+      return { text, pause: i === 0 ? s.pause : 0, start };
+    });
+  });
 }
 
 /**
  * Group sentences into paragraphs the way a transcript editor would: a real
  * silence, an answer after a question, or a speaker turning to a new point
  * starts one, and a paragraph never runs past PARA_MAX. Every break falls
- * between sentences.
+ * between sentences. Each paragraph starts when its first sentence does.
  */
 function sentencesToParagraphs(sentences) {
   const paras = [];
-  let cur = '';
+  let cur = null;
   let prev = '';
   for (const s of sentences) {
     if (cur) {
-      const len = cur.length;
+      const len = cur.text.length;
       const brk = s.pause >= 2
         || (s.pause >= 0.8 && len >= 200)
         || (s.pause >= 0.3 && len >= 250 && /\?["'”’)\]]*$/.test(prev))
         || (len >= 450 && TURN.test(s.text))
         || len + 1 + s.text.length > PARA_MAX;
-      if (brk) { paras.push(cur); cur = ''; }
+      if (brk) { paras.push(cur); cur = null; }
     }
-    cur = cur ? `${cur} ${s.text}` : s.text;
+    if (cur) cur.text += ` ${s.text}`;
+    else cur = { text: s.text, start: s.start ?? null };
     prev = s.text;
   }
   if (cur) paras.push(cur);
   return paras;
 }
 
-const segmentsToParagraphs = (segments) => sentencesToParagraphs(segmentsToSentences(segments));
+/** Paragraphs as { text, start } — start in seconds, null if untimed. */
+const segmentsToTimedParagraphs = (segments) => sentencesToParagraphs(segmentsToSentences(segments));
+
+const segmentsToParagraphs = (segments) => segmentsToTimedParagraphs(segments).map((p) => p.text);
+
+/**
+ * Transcript paragraphs → article HTML. Each timed paragraph carries its start
+ * in the audio as data-t (seconds), which is how the app plays the episode in
+ * step with the text. An attribute rather than a side table: skip rules delete
+ * paragraphs from the stored HTML, and the survivors keep their own times.
+ */
+function paragraphsToHtml(paras) {
+  return paras.map((p) => (p.start == null
+    ? `<p>${escapeText(p.text)}</p>`
+    : `<p data-t="${Math.max(0, p.start).toFixed(2)}">${escapeText(p.text)}</p>`)).join('\n');
+}
 
 /** Fallback when the provider returns plain text without segments: the same
  *  grouping, just without pauses to go on. */
@@ -224,17 +261,17 @@ async function transcribeToArticle(buf, filename) {
   }
   const data = await resp.json();
   const paras = Array.isArray(data.segments) && data.segments.length
-    ? segmentsToParagraphs(data.segments)
-    : textToParagraphs(data.text);
+    ? segmentsToTimedParagraphs(data.segments)
+    : segmentsToTimedParagraphs([{ text: data.text }]);
   if (!paras.length) throw new Error('no speech found in the audio');
   return {
-    html: paras.map((p) => `<p>${escapeText(p)}</p>`).join('\n'),
-    textContent: paras.join(' '),
+    html: paragraphsToHtml(paras),
+    textContent: paras.map((p) => p.text).join(' '),
     durationS: typeof data.duration === 'number' ? data.duration : null,
   };
 }
 
 module.exports = {
   enabled, transcribeToArticle, probeTags, audioMeta, PLACEHOLDER_TITLE,
-  segmentsToParagraphs, textToParagraphs, PARA_MAX,
+  segmentsToParagraphs, segmentsToTimedParagraphs, paragraphsToHtml, textToParagraphs, PARA_MAX,
 };

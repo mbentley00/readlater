@@ -383,13 +383,25 @@ fun ReaderScreen(articleId: String, onBack: () -> Unit, onOpenArticle: (String) 
         }
     }
 
-    // Device and server voices have independent speeds. The bottom-bar control
-    // shows/adjusts whichever is currently in use (server when it's playing or
-    // preferred, device otherwise).
+    // Device and server voices have independent speeds, and a podcast episode
+    // played as itself has a third. The bottom-bar control shows/adjusts
+    // whichever is in use: the episode's when it is playing (or would, since
+    // its audio is on the phone), else server when playing or preferred, else
+    // device.
     var deviceRate by remember { mutableStateOf(settings.ttsSpeechRate) }
     var serverRate by remember { mutableStateOf(settings.serverSpeechRate) }
-    val serverActive = if (isTtsThisArticle) ttsState.serverVoice else settings.useServerVoice
-    val speechRate = if (serverActive) serverRate else deviceRate
+    var podcastRate by remember { mutableStateOf(settings.podcastSpeed) }
+    val hasEpisode = remember(article?.url, ttsState.isPlaying) {
+        article?.url?.let { app.podcastFiles.forUrl(it) } != null
+    }
+    val podcastActive = if (isTtsThisArticle) ttsState.podcast else hasEpisode
+    val serverActive = !podcastActive && (if (isTtsThisArticle) ttsState.serverVoice else settings.useServerVoice)
+    val speechRate = when {
+        podcastActive -> podcastRate
+        serverActive -> serverRate
+        else -> deviceRate
+    }
+    val maxRate = if (podcastActive) 3.0f else 2.0f
     var sheetTarget by remember { mutableStateOf<SheetTarget?>(null) }
     // In-progress word-level selection (double-tap a word to start, tap more to extend).
     var wordSel by remember { mutableStateOf<WordSelection?>(null) }
@@ -414,8 +426,14 @@ fun ReaderScreen(articleId: String, onBack: () -> Unit, onOpenArticle: (String) 
     }
 
     fun setRate(rate: Float) {
-        val newRate = rate.coerceIn(0.5f, 2.0f)
+        val newRate = rate.coerceIn(0.5f, maxRate)
         if (newRate == speechRate) return
+        if (podcastActive) {
+            podcastRate = newRate; settings.podcastSpeed = newRate
+            // Carries on from the same moment in the episode, not the paragraph start.
+            if (isTtsThisArticle && ttsState.isPlaying) sendTtsCommand(context, TtsService.ACTION_SET_SPEED)
+            return
+        }
         if (serverActive) { serverRate = newRate; settings.serverSpeechRate = newRate }
         else { deviceRate = newRate; settings.ttsSpeechRate = newRate }
         // Restart the current paragraph so the new rate takes effect immediately.
@@ -816,7 +834,7 @@ fun ReaderScreen(articleId: String, onBack: () -> Unit, onOpenArticle: (String) 
                     DropdownMenu(expanded = speedMenu, onDismissRequest = { speedMenu = false }) {
                         Column(modifier = Modifier.width(260.dp).padding(horizontal = 16.dp, vertical = 8.dp)) {
                             Text(
-                                text = (if (serverActive) "Server voice" else "Device voice") +
+                                text = (if (podcastActive) "Podcast" else if (serverActive) "Server voice" else "Device voice") +
                                     " · " + formatRate(pendingRate),
                                 style = MaterialTheme.typography.labelLarge
                             )
@@ -824,8 +842,9 @@ fun ReaderScreen(articleId: String, onBack: () -> Unit, onOpenArticle: (String) 
                                 value = pendingRate,
                                 onValueChange = { pendingRate = (it * 20f).roundToInt() / 20f },
                                 onValueChangeFinished = { setRate(pendingRate) },
-                                valueRange = 0.5f..2.0f,
-                                steps = 29
+                                valueRange = 0.5f..maxRate,
+                                // 0.05× stops either way: 29 between 0.5 and 2, 49 up to 3
+                                steps = ((maxRate - 0.5f) * 20f).roundToInt() - 1
                             )
                         }
                     }

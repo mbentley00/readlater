@@ -56,6 +56,9 @@ interface ArticleDao {
     @Query("SELECT * FROM articles")
     suspend fun getAll(): List<ArticleEntity>
 
+    @Query("SELECT * FROM articles WHERE url = :url LIMIT 1")
+    suspend fun getByUrl(url: String): ArticleEntity?
+
     @Query("SELECT * FROM articles WHERE id IN (:ids)")
     suspend fun getByIds(ids: List<String>): List<ArticleEntity>
 

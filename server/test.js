@@ -961,7 +961,8 @@ async function main() {
       await new Promise((res2) => setTimeout(res2, 100));
     }
     assert.ok(transcribed, 'transcript filled in in the background');
-    assert.ok(/<p>They sway/.test(transcribed.html), 'silence gap starts a new paragraph');
+    assert.ok(/<p data-t="[\d.]+">They sway/.test(transcribed.html), 'silence gap starts a new paragraph');
+    assert.ok(/^<p data-t="0\.00">/.test(transcribed.html), 'transcript paragraphs carry their start time');
     // re-uploading the same file returns the finished article, not a redo
     res = await upload('/api/import/file?filename=My_Podcast_Episode.mp3', mp3Buf);
     assert.strictEqual(res.status, 200, 'audio re-import is idempotent');
@@ -2018,6 +2019,23 @@ function testTranscriptShaping() {
   // Unpunctuated run-on text still comes out in readable pieces.
   const runOn = textToParagraphs(Array.from({ length: 300 }, (_, i) => `word${i}`).join(' '));
   assert.ok(runOn.length > 1 && runOn.every((p) => p.length <= 1000), 'run-on text is cut up');
+
+  // Paragraph start times, which the app plays an episode in step with: a
+  // paragraph starts when its first sentence does, even partway into a segment.
+  const { segmentsToTimedParagraphs, paragraphsToHtml } = require('./transcribe');
+  // Two equal-length sentences per 8s segment, so sentence n starts at n * 4s.
+  const timed = segmentsToTimedParagraphs(Array.from({ length: 20 }, (_, k) =>
+    ({ start: k * 8, end: k * 8 + 8, text: ` ${sentence(2 * k + 10)} ${sentence(2 * k + 11)}` })));
+  assert.ok(timed.length > 2, 'several paragraphs');
+  assert.strictEqual(timed[0].start, 0, 'first paragraph starts at 0');
+  assert.ok(timed.some((p) => Number(p.text.match(/number (\d+)/)[1]) % 2 === 1), 'a break lands mid-segment');
+  for (const p of timed) {
+    const n = Number(p.text.match(/number (\d+)/)[1]) - 10;
+    assert.ok(Math.abs(p.start - n * 4) < 0.2, `paragraph opening on sentence ${n} starts at ${p.start}, not ~${n * 4}`);
+  }
+  assert.strictEqual(paragraphsToHtml([{ text: 'A < B', start: 12.345 }, { text: 'untimed', start: null }]),
+    '<p data-t="12.35">A &lt; B</p>\n<p>untimed</p>');
+  assert.ok(segmentsToTimedParagraphs([{ text: 'No times here.' }]).every((p) => p.start == null), 'untimed text stays untimed');
 
   // Titles: embedded tags win; an episode id is no title; a real filename is.
   assert.deepStrictEqual(audioMeta('45e41c9b-f365-4349-b5f6-9ce130ede034.mp3',

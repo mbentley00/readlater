@@ -6,6 +6,7 @@ import androidx.room.migration.Migration
 import androidx.sqlite.db.SupportSQLiteDatabase
 import com.readlater.app.data.ApiClient
 import com.readlater.app.data.AppDatabase
+import com.readlater.app.data.PodcastFiles
 import com.readlater.app.data.Repository
 import com.readlater.app.data.Settings
 
@@ -91,5 +92,8 @@ class ReadLaterApp : Application() {
 
     val apiClient: ApiClient by lazy { ApiClient(settings) }
 
-    val repository: Repository by lazy { Repository(database, apiClient, settings) }
+    /** Episodes shared into the app, kept for playing as audio. */
+    val podcastFiles: PodcastFiles by lazy { PodcastFiles(java.io.File(filesDir, "podcasts")) }
+
+    val repository: Repository by lazy { Repository(database, apiClient, settings, podcastFiles) }
 }

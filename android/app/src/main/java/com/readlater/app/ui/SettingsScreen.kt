@@ -80,6 +80,7 @@ fun SettingsScreen(onBack: () -> Unit) {
     var token by remember { mutableStateOf(settings.token) }
     var rate by remember { mutableStateOf(settings.ttsSpeechRate) }
     var serverRate by remember { mutableStateOf(settings.serverSpeechRate) }
+    var podcastRate by remember { mutableStateOf(settings.podcastSpeed) }
     var busy by remember { mutableStateOf(false) }
     var testResult by remember { mutableStateOf<String?>(null) }
 
@@ -385,6 +386,18 @@ fun SettingsScreen(onBack: () -> Unit) {
                 value = serverRate,
                 onChange = { serverRate = it; settings.serverSpeechRate = it }
             )
+            SpeedRow(
+                label = "Podcast speed",
+                value = podcastRate,
+                max = 3.0f,
+                onChange = { podcastRate = it; settings.podcastSpeed = it }
+            )
+            Text(
+                text = "For episodes shared into the app, which play as themselves. A triple " +
+                    "tap on your earbuds skips ahead a minute in an episode.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
 
             HorizontalDivider()
 
@@ -496,9 +509,9 @@ fun SettingsScreen(onBack: () -> Unit) {
     }
 }
 
-/** A labelled speed slider (0.5x..2.0x in 0.05 steps). */
+/** A labelled speed slider (0.5x..[max] in 0.05 steps). */
 @Composable
-private fun SpeedRow(label: String, value: Float, onChange: (Float) -> Unit) {
+private fun SpeedRow(label: String, value: Float, max: Float = 2.0f, onChange: (Float) -> Unit) {
     Column {
         Row(verticalAlignment = Alignment.CenterVertically) {
             Text(text = label, style = MaterialTheme.typography.bodyLarge, modifier = Modifier.weight(1f))
@@ -507,8 +520,8 @@ private fun SpeedRow(label: String, value: Float, onChange: (Float) -> Unit) {
         Slider(
             value = value,
             onValueChange = { onChange((it * 20f).roundToInt() / 20f) },
-            valueRange = 0.5f..2.0f,
-            steps = 29
+            valueRange = 0.5f..max,
+            steps = ((max - 0.5f) * 20f).roundToInt() - 1
         )
     }
 }

@@ -9,7 +9,9 @@ import org.jsoup.nodes.Element
  * readParagraph, highlight.paragraphIndex and TTS — the parse is deterministic.
  */
 sealed class Block {
-    data class Paragraph(val text: String) : Block()
+    /** [startSec]: where this paragraph starts in the episode audio, for a
+     *  podcast transcript (the server's data-t attribute); null otherwise. */
+    data class Paragraph(val text: String, val startSec: Double? = null) : Block()
     data class Heading(val text: String, val level: Int) : Block()
     data class Quote(val text: String) : Block()
     data class ImageBlock(val src: String, val alt: String?) : Block()
@@ -105,7 +107,10 @@ object HtmlParser {
 
     private fun addText(blocks: MutableList<Block>, el: Element, text: String, inCaption: Boolean) {
         val caption = (inCaption && text.length <= CAPTION_MAX) || isLooseCaption(el, text, blocks.lastOrNull())
-        blocks.add(if (caption) Block.Caption(text) else Block.Paragraph(text))
+        blocks.add(
+            if (caption) Block.Caption(text)
+            else Block.Paragraph(text, el.attr("data-t").toDoubleOrNull()?.takeIf { it >= 0 })
+        )
     }
 
     private fun walk(element: Element, blocks: MutableList<Block>, inCaption: Boolean) {
