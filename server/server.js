@@ -1491,8 +1491,19 @@ const server = http.createServer(async (req, res) => {
         // dedupe on content hash, like the other imports
         const artUrl = 'audio:' + crypto.createHash('sha256').update(buf).digest('hex').slice(0, 24);
         let a = store.articleByUrl(user.id, artUrl);
+        // Already transcribed — don't redo it. Unless the transcript predates
+        // paragraph timestamps: the app plays the episode in step with those,
+        // and without them it can only estimate from where the text falls. The
+        // audio is in hand right now, so re-sharing an old episode is the one
+        // moment when fixing that costs nothing but the transcription itself.
         if (a && (a.textContent || '').trim()) {
-          return json(res, 200, pubArticle(a)); // already transcribed — don't redo it
+          const timed = /<p[^>]+data-t=/.test(a.html || '');
+          // ...and not if anything is anchored to the current paragraphs: a
+          // fresh transcript can word things differently, which would slide
+          // every highlight in it.
+          const anchored = store.highlightCountForArticle(a.id) > 0;
+          if (timed || anchored) return json(res, 200, pubArticle(a));
+          console.log(`re-transcribing ${a.id} "${a.title}" — its transcript has no paragraph times`);
         }
         // Spooled before the article exists so its embedded tags can title it.
         const id = a ? a.id : newId();

@@ -1384,14 +1384,68 @@ class TtsService : Service() {
         if (serverMode) startServerStream(msForBlock(currentIndex)) else speakCurrent()
     }
 
-    /** ms already played on the current AudioTrack, from its playback head. */
+    // What playbackHeadPosition counts, once a playback speed is set, is not
+    // the same on every device: some report the frames RENDERED to the output
+    // (so the head advances in real time, and the source position advances
+    // speed× faster), others the SOURCE frames handed over and consumed (the
+    // head itself advances speed× faster, and already is the source position).
+    //
+    // This code assumed the first. On a device that does the second, a podcast
+    // at 2× ran the transcript through at twice the real pace — the highlight
+    // drifting further ahead the longer you listened. It was invisible for the
+    // voices because they play at about 1×, where the two readings coincide.
+    //
+    // So measure it instead of believing either: compare the head's rate
+    // against the wall clock a second or so into playback, and keep the factor
+    // that turns head frames into source frames.
+    private var trackPlayAt = 0L
+    @Volatile private var headFactor = 0f // 0 = not measured yet
+
+    /** How long playback must run before the head's rate can be told apart. */
+    private val calibrateAfterMs = 1500L
+
+    /** Called right after AudioTrack.play() — the clock the measurement uses. */
+    private fun markTrackStarted() {
+        trackPlayAt = android.os.SystemClock.elapsedRealtime()
+        headFactor = 0f
+    }
+
+    /** ms of SOURCE audio played on the current AudioTrack. */
     private fun trackPositionMs(): Int {
         val t = audioTrack ?: return trackStartMs
         val frames = runCatching { t.playbackHeadPosition.toLong() and 0xFFFFFFFFL }.getOrDefault(0L)
-        // playbackHeadPosition counts rendered (sink) frames = real elapsed time;
-        // at playback speed S the SOURCE position advances S× as fast.
-        val realMs = frames * 1000L / trackSampleRate
-        return trackStartMs + (realMs * trackSpeed).toInt()
+        val elapsed = android.os.SystemClock.elapsedRealtime() - trackPlayAt
+        if (headFactor == 0f) {
+            if (trackPlayAt == 0L || elapsed < calibrateAfterMs || frames < trackSampleRate / 4) {
+                // Not enough to measure yet. Audio moves through the source at
+                // the playback speed, so the wall clock is the better guess for
+                // the first second — and it is only ever this first second.
+                return trackStartMs + (elapsed.coerceAtLeast(0L) * trackSpeed).toInt()
+            }
+            headFactor = measureHeadFactor(frames, elapsed)
+        }
+        return trackStartMs + (frames * 1000.0 / trackSampleRate * headFactor).toInt()
+    }
+
+    /** 1.0 when the head already counts source frames, the playback speed when
+     *  it counts rendered ones. The two candidates are a whole speed factor
+     *  apart, so the boundary sits between them and noise cannot reach it. */
+    private fun measureHeadFactor(frames: Long, elapsedMs: Long): Float {
+        if (trackSpeed <= 1.02f) return 1f // the two readings coincide anyway
+        val framesPerSecond = frames * 1000.0 / elapsedMs
+        val boundary = trackSampleRate * Math.sqrt(trackSpeed.toDouble())
+        val f = if (framesPerSecond > boundary) 1f else trackSpeed
+        logDbg("playback head: ${framesPerSecond.toInt()} frames/s at ${trackSampleRate}Hz," +
+            " speed=$trackSpeed → head counts ${if (f == 1f) "source" else "rendered"} frames")
+        return f
+    }
+
+    /** How far the head must reach for [sourceFrames] of audio to have been
+     *  heard. Depends on what the head counts, so it goes through the same
+     *  measured factor — otherwise the end of an episode is called early. */
+    private fun headFramesToDrain(sourceFrames: Long): Long {
+        val f = if (headFactor > 0f) headFactor else trackSpeed.coerceAtLeast(1f)
+        return (sourceFrames / f).toLong()
     }
 
     /** Apply the user's speech rate to a server AudioTrack (pitch preserved). */
@@ -1733,6 +1787,7 @@ class TtsService : Service() {
             synchronized(deviceBoundaries) { deviceBoundaries.clear() }
             cancelAudioWatchdog()
             track.play()
+            markTrackStarted()
             fallbackRun = 0 // audio is actually coming out of the file path again
             logDbg("playing (stream) idx=$idx sr=${wav0.sampleRate} ch=${wav0.channels} from=${fromMs}ms")
             prefetchAhead(idx)
@@ -1964,6 +2019,7 @@ class TtsService : Service() {
             cancelAudioWatchdog()
             applyTrackSpeed(track, app.settings.serverSpeechRate)
             track.play()
+            markTrackStarted()
             logDbg("playing (server) from=${fromMs}ms speed=$trackSpeed")
             publishState(); updatePlaybackState(); updateNotification()
 
@@ -2006,8 +2062,7 @@ class TtsService : Service() {
                             }
                         }
                     }
-                    // sink frames rendered = source frames / speed
-                    val framesToDrain = ((bytesWritten / frameBytes) / trackSpeed).toLong()
+                    val framesToDrain = headFramesToDrain(bytesWritten / frameBytes)
                     val deadline = System.currentTimeMillis() +
                         (framesToDrain * 1000L / trackSampleRate) + 2000
                     while (myGen == playThreadGen &&
@@ -2101,6 +2156,7 @@ class TtsService : Service() {
                 // The WAV path already does this synchronously; opus must too.
                 audioTrack = track
                 track.play()
+                markTrackStarted()
                 mainHandler.post {
                     if (myGen == playThreadGen && isPlaying && serverMode) {
                         audioStarted = true
@@ -2163,8 +2219,8 @@ class TtsService : Service() {
                         if (info.flags and android.media.MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0) sawOutputEOS = true
                     }
                 }
-                // let the buffered PCM finish playing (sink frames = source/speed)
-                val framesToDrain = ((bytesWritten / frameBytes) / speed).toLong()
+                // let the buffered PCM finish playing
+                val framesToDrain = headFramesToDrain(bytesWritten / frameBytes)
                 val deadline = System.currentTimeMillis() + (framesToDrain * 1000L / trackSampleRate) + 2000
                 while (myGen == playThreadGen &&
                     (track.playbackHeadPosition.toLong() and 0xFFFFFFFFL) < framesToDrain &&

@@ -967,6 +967,23 @@ async function main() {
     res = await upload('/api/import/file?filename=My_Podcast_Episode.mp3', mp3Buf);
     assert.strictEqual(res.status, 200, 'audio re-import is idempotent');
     assert.strictEqual((await res.json()).id, audioArticle.id, 'audio re-import dedupes');
+    // ...unless the stored transcript predates paragraph times, which is what
+    // the app plays an episode in step with. Re-sharing it is the chance to fix
+    // that, since the audio is in hand.
+    r = await api('POST', '/api/articles', {
+      url: audioArticle.url, title: transcribed.title, siteName: 'Podcast',
+      html: '<p>An old transcript with no times on it at all.</p>',
+    });
+    assert.strictEqual(r.body.id, audioArticle.id, 'the untimed transcript replaced the timed one');
+    res = await upload('/api/import/file?filename=My_Podcast_Episode.mp3', mp3Buf);
+    assert.strictEqual(res.status, 202, 'an untimed transcript is re-transcribed on re-share');
+    let retimed = null;
+    for (let i = 0; i < 50; i++) {
+      r = await api('GET', `/api/articles/${audioArticle.id}`);
+      if (/data-t=/.test(r.body.html || '')) { retimed = r.body; break; }
+      await new Promise((res2) => setTimeout(res2, 100));
+    }
+    assert.ok(retimed, 're-sharing an old episode gives its transcript paragraph times');
     // The Android share posts to the explicitly-named endpoint (it knows it is
     // sending audio) rather than letting /import/file sniff it, and URL-encodes
     // the episode's filename into the query.
