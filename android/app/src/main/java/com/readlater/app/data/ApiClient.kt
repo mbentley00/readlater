@@ -39,7 +39,9 @@ data class RemoteArticle(
     /** The server flagged this save as not having worked (server/quality.js). */
     val problem: Boolean = false,
     /** One line saying what went wrong. */
-    val problemDetail: String? = null
+    val problemDetail: String? = null,
+    /** Where to download this episode's audio (feed episodes only). */
+    val audioUrl: String? = null
 )
 
 /** Saved filter view as returned by the server. */
@@ -295,6 +297,26 @@ class ApiClient(private val settings: Settings) {
         }
     }
 
+    /**
+     * Download a podcast episode from wherever the feed says it lives. No auth
+     * header and no base url: this is someone else's CDN, not our server, and
+     * the token has no business being sent to it. Uses the upload client for
+     * its long timeouts — an episode is tens of MB.
+     */
+    suspend fun downloadEpisode(url: String, dest: java.io.File): Boolean = withContext(Dispatchers.IO) {
+        try {
+            val req = okhttp3.Request.Builder().url(url).get().build()
+            uploadClient.newCall(req).execute().use { r ->
+                if (!r.isSuccessful) return@withContext false
+                val body = r.body ?: return@withContext false
+                dest.outputStream().use { out -> body.byteStream().copyTo(out, 64 * 1024) }
+            }
+            dest.length() > 1024
+        } catch (_: Exception) {
+            dest.delete(); false
+        }
+    }
+
     /** POST /api/save-url — server fetches + extracts the page. Returns the
      *  saved article's title, or throws on failure. */
     suspend fun saveUrl(sharedText: String): String {
@@ -447,7 +469,8 @@ class ApiClient(private val settings: Settings) {
         html = o.stringOrNull("html"),
         source = o.stringOrNull("source"),
         problem = o.optBoolean("problem", false),
-        problemDetail = o.stringOrNull("problemDetail")
+        problemDetail = o.stringOrNull("problemDetail"),
+        audioUrl = o.stringOrNull("audioUrl")
     )
 
     private fun parseHighlight(o: JSONObject): RemoteHighlight = RemoteHighlight(

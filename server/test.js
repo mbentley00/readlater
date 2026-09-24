@@ -1227,6 +1227,82 @@ async function main() {
     await api('DELETE', `/api/articles/${badId}`);
     console.log('  Bad saves flagged, hidden, and repaired ✔');
 
+    // ---- podcast subscriptions: new episodes arrive on their own
+    const episodeBytes = Buffer.concat([Buffer.from('ID3'), Buffer.alloc(96)]);
+    let feedItems = `<item><title>An episode from before I subscribed</title>
+      <guid>old-1</guid>
+      <enclosure url="${BASE.replace('/api', '')}/feed-episode.mp3?n=0" type="audio/mpeg"/></item>`;
+    const feedServer = await new Promise((resolve) => {
+      const srv = http.createServer((req2, res2) => {
+        if (req2.url.startsWith('/feed-episode.mp3')) {
+          res2.writeHead(200, { 'Content-Type': 'audio/mpeg', 'Content-Length': episodeBytes.length });
+          return res2.end(episodeBytes);
+        }
+        res2.writeHead(200, { 'Content-Type': 'application/rss+xml' });
+        res2.end(`<?xml version="1.0"?><rss><channel><title>Test Show</title>${feedItems}</channel></rss>`);
+      });
+      srv.listen(PORT + 5, () => resolve(srv));
+    });
+    const feedBase = `http://127.0.0.1:${PORT + 5}`;
+
+    r = await api('POST', '/api/feeds', { url: `${feedBase}/rss` });
+    assert.strictEqual(r.status, 201, 'subscribed to the feed');
+    assert.strictEqual(r.body.title, 'Test Show', 'the feed names itself');
+    assert.strictEqual(r.body.existingEpisodes, 1, 'the episode already in it is counted');
+    const feedId = r.body.id;
+
+    // Nothing is imported by subscribing — that is the whole policy.
+    r = await api('POST', '/api/feeds/check');
+    assert.strictEqual(r.body.episodes, 0, 'the back catalogue is left alone');
+
+    // A new episode is published.
+    const episode2 = Buffer.concat([Buffer.from('ID3'), Buffer.alloc(97)]);
+    feedItems = `<item><title>A brand new episode</title><guid>new-1</guid>
+      <pubDate>${new Date().toUTCString()}</pubDate>
+      <enclosure url="${feedBase}/feed-episode.mp3?n=1" type="audio/mpeg"/></item>` + feedItems;
+    feedServer.removeAllListeners('request');
+    feedServer.on('request', (req2, res2) => {
+      if (req2.url.startsWith('/feed-episode.mp3')) {
+        res2.writeHead(200, { 'Content-Type': 'audio/mpeg', 'Content-Length': episode2.length });
+        return res2.end(episode2);
+      }
+      res2.writeHead(200, { 'Content-Type': 'application/rss+xml' });
+      res2.end(`<?xml version="1.0"?><rss><channel><title>Test Show</title>${feedItems}</channel></rss>`);
+    });
+
+    r = await api('POST', '/api/feeds/check');
+    assert.strictEqual(r.body.episodes, 1, 'the new episode is taken');
+    r = await api('GET', '/api/articles?limit=200');
+    const episodeArticle = r.body.articles.find((a) => a.title === 'A brand new episode');
+    assert.ok(episodeArticle, 'it became an article');
+    assert.strictEqual(episodeArticle.siteName, 'Test Show', 'titled with the show');
+    assert.strictEqual(episodeArticle.source, 'podcast-feed');
+    assert.strictEqual(episodeArticle.audioUrl, `${feedBase}/feed-episode.mp3?n=1`,
+      'carrying the audio url, which is how the phone plays the episode itself');
+
+    // ...transcribed like any other episode, and not taken twice.
+    let feedTranscript = null;
+    for (let i = 0; i < 50; i++) {
+      r = await api('GET', `/api/articles/${episodeArticle.id}`);
+      if ((r.body.textContent || '').includes('timber towers')) { feedTranscript = r.body; break; }
+      await new Promise((res2) => setTimeout(res2, 100));
+    }
+    assert.ok(feedTranscript, 'the episode transcribes in the background');
+    assert.ok(/data-t=/.test(feedTranscript.html), 'with paragraph times for playback');
+    r = await api('POST', '/api/feeds/check');
+    assert.strictEqual(r.body.episodes, 0, 'a second check takes nothing again');
+
+    r = await api('GET', '/api/feeds');
+    assert.strictEqual(r.body.feeds.length, 1, 'the subscription is listed');
+    assert.strictEqual(r.body.feeds[0].episodes, 1, 'with what it has brought in');
+    r = await api('DELETE', `/api/feeds/${feedId}`);
+    assert.strictEqual(r.status, 200, 'unsubscribed');
+    r = await api('GET', '/api/feeds');
+    assert.strictEqual(r.body.feeds.length, 0, 'and it is gone');
+    await api('DELETE', `/api/articles/${episodeArticle.id}`);
+    feedServer.close();
+    console.log('  Podcast subscriptions ✔');
+
     r = await api('POST', '/api/articles/bulk-archive', { olderThanDays: 365 });
     assert.ok(r.body.archived >= 1, 'bulk-archive archived at least the ancient article');
     r = await api('GET', `/api/articles/${ancientId}`);
@@ -2152,6 +2228,55 @@ function testProblemDetection() {
   console.log('  Bad-save detection ✔');
 }
 
+/** Reading a podcast feed (feeds.js). */
+function testFeedParsing() {
+  const { parseFeed, parseDuration } = require('./feeds');
+  const xml = `<?xml version="1.0"?>
+<rss version="2.0" xmlns:itunes="http://www.itunes.com/dtds/podcast-1.0.dtd">
+  <channel>
+    <title>The Build Show</title>
+    <item>
+      <title><![CDATA[Why Wood Towers Sway]]></title>
+      <guid isPermaLink="false">ep-42</guid>
+      <pubDate>Tue, 22 Sep 2026 10:00:00 GMT</pubDate>
+      <itunes:duration>1:02:03</itunes:duration>
+      <enclosure url="https://cdn.example.com/ep42.mp3?token=a&amp;b=2" length="41231234" type="audio/mpeg"/>
+    </item>
+    <item>
+      <title>An older one</title>
+      <pubDate>Tue, 15 Sep 2026 10:00:00 GMT</pubDate>
+      <enclosure url="https://cdn.example.com/ep41.mp3" type="audio/mpeg"/>
+    </item>
+    <item>
+      <title>A blog post with no audio</title>
+      <guid>post-1</guid>
+    </item>
+    <item>
+      <title>A video episode</title>
+      <guid>vid-1</guid>
+      <enclosure url="https://cdn.example.com/ep40.mp4" type="video/mp4"/>
+    </item>
+  </channel>
+</rss>`;
+  const feed = parseFeed(xml);
+  assert.strictEqual(feed.title, 'The Build Show', 'channel title, not the first item title');
+  assert.strictEqual(feed.items.length, 2, 'only items with audio enclosures are episodes');
+  const [first, second] = feed.items;
+  assert.strictEqual(first.title, 'Why Wood Towers Sway', 'CDATA unwrapped');
+  assert.strictEqual(first.guid, 'ep-42');
+  assert.strictEqual(first.url, 'https://cdn.example.com/ep42.mp3?token=a&b=2', 'entities decoded in the url');
+  assert.strictEqual(first.durationS, 3723, 'hh:mm:ss duration');
+  assert.strictEqual(first.publishedAt, Date.parse('Tue, 22 Sep 2026 10:00:00 GMT'));
+  assert.strictEqual(second.guid, second.url, 'an item with no guid is identified by its enclosure');
+
+  assert.strictEqual(parseDuration('90'), 90, 'bare seconds');
+  assert.strictEqual(parseDuration('2:30'), 150, 'mm:ss');
+  assert.strictEqual(parseDuration(''), null);
+  assert.strictEqual(parseFeed('<rss><channel><title>Empty</title></channel></rss>').items.length, 0);
+  console.log('  Podcast feed parsing ✔');
+}
+
+testFeedParsing();
 testProblemDetection();
 testTtsSkipsCaptions();
 testTranscriptShaping();

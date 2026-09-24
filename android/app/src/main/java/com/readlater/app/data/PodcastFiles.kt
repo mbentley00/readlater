@@ -47,13 +47,17 @@ class PodcastFiles(private val dir: File) {
 
     private fun files(): List<File> = dir.listFiles()?.filter { it.isFile } ?: emptyList()
 
-    /** Move a spooled episode into the store under its hash. Replaces an
-     *  earlier copy of the same episode. Returns the stored file. */
-    fun keep(spool: File, hash: String, ext: String): File {
+    /**
+     * Move a spooled episode into the store under [key]: the audio's content
+     * hash for one shared from a player, the article's id for one downloaded
+     * from a feed (see [forArticle]). Replaces an earlier copy of the same
+     * episode. Returns the stored file.
+     */
+    fun keep(spool: File, key: String, ext: String): File {
         dir.mkdirs()
         val safeExt = ext.lowercase().takeIf { it.matches(Regex("[a-z0-9]{1,5}")) } ?: "mp3"
-        delete(URL_PREFIX + hash)
-        val target = File(dir, "$hash.$safeExt")
+        files().filter { it.name.substringBeforeLast('.') == key }.forEach { it.delete() }
+        val target = File(dir, "$key.$safeExt")
         if (!spool.renameTo(target)) {
             spool.copyTo(target, overwrite = true)
             spool.delete()
@@ -61,16 +65,33 @@ class PodcastFiles(private val dir: File) {
         return target
     }
 
-    /** The stored episode for an article url, or null (not an episode, or not on this phone). */
-    fun forUrl(url: String): File? {
-        val hash = hashOfUrl(url) ?: return null
-        return files().firstOrNull { it.name.substringBeforeLast('.') == hash && it.length() > 0 }
+    /**
+     * The stored episode for an article, or null (not an episode, or not on
+     * this phone).
+     *
+     * Two naming schemes, because there are two ways audio arrives. A shared
+     * episode is named by its content hash, which is also what the server built
+     * the article's `audio:` url from, so the file finds its article even when
+     * the upload's reply was lost. One downloaded from a feed is named after
+     * the article instead: podcast hosts stitch ads per request, so the bytes
+     * we fetch need not hash to what the server fetched.
+     */
+    fun forArticle(articleId: String, url: String): File? {
+        val names = listOfNotNull(articleId, hashOfUrl(url))
+        return files().firstOrNull { it.name.substringBeforeLast('.') in names && it.length() > 0 }
     }
 
-    /** Drop the stored episode for an article url, if any. */
-    fun delete(url: String) {
-        val hash = hashOfUrl(url) ?: return
-        files().filter { it.name.substringBeforeLast('.') == hash }.forEach { it.delete() }
+    /** Where a download should be written before [keep] takes it. */
+    fun spoolFile(): File {
+        dir.mkdirs()
+        return File.createTempFile("episode", ".part", dir)
+    }
+
+    /** Drop the stored episode for an article, whichever way it was named. */
+    fun delete(articleId: String?, url: String) {
+        val names = listOfNotNull(articleId, hashOfUrl(url))
+        if (names.isEmpty()) return
+        files().filter { it.name.substringBeforeLast('.') in names }.forEach { it.delete() }
     }
 
     /**
@@ -82,8 +103,12 @@ class PodcastFiles(private val dir: File) {
         if (stored.isEmpty()) return // the usual case: don't ask the database anything
         val now = System.currentTimeMillis()
         for (f in stored) {
-            val url = URL_PREFIX + f.name.substringBeforeLast('.')
-            val state = stateFor(url)
+            val key = f.name.substringBeforeLast('.')
+            if (f.name.endsWith(".part")) { // an abandoned download
+                if (now - f.lastModified() > ORPHAN_MS) f.delete()
+                continue
+            }
+            val state = stateFor(if (key.matches(Regex("[0-9a-f]{24}"))) URL_PREFIX + key else key)
             val gone = if (state == null) now - f.lastModified() > ORPHAN_MS else state.archived
             if (gone) f.delete()
         }

@@ -392,8 +392,12 @@ fun ReaderScreen(articleId: String, onBack: () -> Unit, onOpenArticle: (String) 
     var deviceRate by remember { mutableStateOf(settings.ttsSpeechRate) }
     var serverRate by remember { mutableStateOf(settings.serverSpeechRate) }
     var podcastRate by remember { mutableStateOf(settings.podcastSpeed) }
-    val hasEpisode = remember(article?.url, ttsState.isPlaying) {
-        article?.url?.let { app.podcastFiles.forUrl(it) } != null
+    // An episode either sits on the phone already (shared from a player) or can
+    // be fetched when you press play (subscribed feed). Either way this article
+    // is a podcast, and gets the podcast speed and the skip button.
+    val hasEpisode = remember(article?.id, article?.audioUrl, ttsState.isPlaying) {
+        val a = article
+        a != null && (a.audioUrl != null || app.podcastFiles.forArticle(a.id, a.url) != null)
     }
     val podcastActive = if (isTtsThisArticle) ttsState.podcast else hasEpisode
     val serverActive = !podcastActive && (if (isTtsThisArticle) ttsState.serverVoice else settings.useServerVoice)

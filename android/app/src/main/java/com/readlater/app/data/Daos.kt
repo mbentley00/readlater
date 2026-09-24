@@ -14,7 +14,7 @@ interface ArticleDao {
     @Query(
         "SELECT id, url, title, byline, siteName, excerpt, NULL AS html, savedAt, updatedAt, " +
             "archived, favorite, readParagraph, dirty, wordCount, paragraphCount, ttsParagraph, " +
-            "imageUrl, publishedAt, problem, problemDetail FROM articles " +
+            "imageUrl, publishedAt, problem, problemDetail, audioUrl FROM articles " +
             // Flagged saves are kept out of the INBOX only: once you have archived
             // one it is filed away like anything else, and hiding it there too
             // would leave it in no list at all.
@@ -25,7 +25,7 @@ interface ArticleDao {
     @Query(
         "SELECT id, url, title, byline, siteName, excerpt, NULL AS html, savedAt, updatedAt, " +
             "archived, favorite, readParagraph, dirty, wordCount, paragraphCount, ttsParagraph, " +
-            "imageUrl, publishedAt, problem, problemDetail FROM articles ORDER BY savedAt DESC"
+            "imageUrl, publishedAt, problem, problemDetail, audioUrl FROM articles ORDER BY savedAt DESC"
     )
     fun allArticlesFlow(): Flow<List<ArticleEntity>>
 
@@ -39,7 +39,7 @@ interface ArticleDao {
     @Query(
         "SELECT id, url, title, byline, siteName, excerpt, NULL AS html, savedAt, updatedAt, " +
             "archived, favorite, readParagraph, dirty, wordCount, paragraphCount, ttsParagraph, " +
-            "imageUrl, publishedAt, problem, problemDetail FROM articles"
+            "imageUrl, publishedAt, problem, problemDetail, audioUrl FROM articles"
     )
     suspend fun allArticlesOnce(): List<ArticleEntity>
 
@@ -48,7 +48,7 @@ interface ArticleDao {
     @Query(
         "SELECT id, url, title, byline, siteName, excerpt, NULL AS html, savedAt, updatedAt, " +
             "archived, favorite, readParagraph, dirty, wordCount, paragraphCount, ttsParagraph, " +
-            "imageUrl, publishedAt, problem, problemDetail FROM articles " +
+            "imageUrl, publishedAt, problem, problemDetail, audioUrl FROM articles " +
             "WHERE problem = 1 AND archived = 0 ORDER BY savedAt DESC"
     )
     fun problemArticles(): Flow<List<ArticleEntity>>

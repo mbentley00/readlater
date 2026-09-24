@@ -260,7 +260,8 @@ class Repository(
                         // archivedAt is local-only; keep whatever we recorded on archive.
                         archivedAt = local?.archivedAt,
                         problem = r.problem,
-                        problemDetail = r.problemDetail
+                        problemDetail = r.problemDetail,
+                        audioUrl = r.audioUrl
                     )
                     if (local == null || local.copy(html = null, paragraphCount = 0) !=
                         merged.copy(html = null, paragraphCount = 0)
@@ -347,7 +348,7 @@ class Repository(
             // clear it on unarchive.
             articleDao.setArchived(article.id, nowArchived, if (nowArchived) System.currentTimeMillis() else null)
             // An archived episode is done with; its audio is tens of MB.
-            if (nowArchived) podcasts.delete(article.url)
+            if (nowArchived) podcasts.delete(article.id, article.url)
             pushMetadata(article.id)
         }
     }
@@ -430,7 +431,7 @@ class Repository(
         bgScope.launch {
             articleDao.deleteById(article.id)
             highlightDao.deleteByArticle(article.id)
-            podcasts.delete(article.url)
+            podcasts.delete(article.id, article.url)
             try {
                 api.deleteArticle(article.id)
             } catch (_: Exception) {

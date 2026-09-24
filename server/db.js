@@ -270,6 +270,44 @@ CREATE TABLE IF NOT EXISTS article_problems (
 );
 CREATE INDEX IF NOT EXISTS article_problems_user ON article_problems(userId, detectedAt DESC);
 
+-- Podcast subscriptions (see feeds.js). etag/lastModified are the feed's own
+-- caching headers, handed back on the next check so a quiet feed costs nothing.
+CREATE TABLE IF NOT EXISTS feeds (
+  id TEXT PRIMARY KEY,
+  userId TEXT NOT NULL,
+  url TEXT NOT NULL,
+  title TEXT,
+  etag TEXT,
+  lastModified TEXT,
+  lastError TEXT,
+  lastCheckedAt INTEGER,
+  addedAt INTEGER NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS feeds_user_url ON feeds(userId, url);
+
+-- Which episodes a feed has already offered us. Adding a feed writes every
+-- episode currently in it here WITHOUT importing any, which is what makes a
+-- subscription start from the next one published rather than the back
+-- catalogue. articleId is null when the episode could not be taken.
+CREATE TABLE IF NOT EXISTS feed_items (
+  feedId TEXT NOT NULL REFERENCES feeds(id) ON DELETE CASCADE,
+  guid TEXT NOT NULL,
+  articleId TEXT,
+  seenAt INTEGER NOT NULL,
+  PRIMARY KEY (feedId, guid)
+);
+
+-- Where an episode's audio can be fetched from, for an article that came from a
+-- feed: the app downloads it from the publisher to play it. A side table for
+-- the same reason article_problems is one — an articles column would sit behind
+-- the html blobs, and this is read for every row of a list.
+CREATE TABLE IF NOT EXISTS article_audio (
+  articleId TEXT PRIMARY KEY REFERENCES articles(id) ON DELETE CASCADE,
+  url TEXT NOT NULL,
+  durationS INTEGER,
+  addedAt INTEGER NOT NULL
+);
+
 CREATE VIRTUAL TABLE IF NOT EXISTS articles_fts USING fts5(
   title, byline, siteName, excerpt, textContent,
   content='articles', content_rowid='rowid'
@@ -316,6 +354,7 @@ const rowArticle = (r) => r && {
   // Only the list query asks about the badly-saved flag; leave it absent (not
   // false) on the full-article reads, which say nothing about it either way.
   ...(r.problemDetail === undefined ? {} : { problem: r.problemDetail != null, problemDetail: r.problemDetail || null }),
+  ...(r.audioUrl === undefined ? {} : { audioUrl: r.audioUrl || null }),
 };
 
 // Every article column EXCEPT the (potentially huge) raw sourceHtml, which is
@@ -950,6 +989,7 @@ function open(dataDir) {
     deleteArticle: (id) => {
       prep('adh', 'DELETE FROM highlights WHERE articleId = ?').run(id);
       prep('adp', 'DELETE FROM article_problems WHERE articleId = ?').run(id);
+      prep('ada', 'DELETE FROM article_audio WHERE articleId = ?').run(id);
       return prep('ad', 'DELETE FROM articles WHERE id = ?').run(id);
     },
 
@@ -969,6 +1009,74 @@ function open(dataDir) {
     /** Flag or unflag by hand — the list's "this one is fine" / "this is bad". */
     setArticleProblem: (id, userId, problem) => setProblem(id, userId, problem),
 
+    // ---------------- podcast subscriptions (feeds.js)
+
+    listFeeds: (userId) =>
+      prep('flf', `SELECT f.*, (SELECT COUNT(*) FROM feed_items i WHERE i.feedId = f.id AND i.articleId IS NOT NULL) AS episodes
+        FROM feeds f WHERE f.userId = ? ORDER BY f.addedAt DESC`).all(userId),
+
+    /** Every feed, for the poller — it runs for all users at once. */
+    listAllFeeds: () => prep('flall', 'SELECT * FROM feeds ORDER BY addedAt').all(),
+
+    feedByUrl: (userId, url) =>
+      prep('fbu', 'SELECT * FROM feeds WHERE userId = ? AND url = ?').get(userId, String(url)),
+
+    getFeed: (id, userId) =>
+      prep('fg', 'SELECT * FROM feeds WHERE id = ? AND userId = ?').get(id, userId),
+
+    insertFeed: (f) => prep('fi', `INSERT INTO feeds (id, userId, url, title, addedAt)
+      VALUES (@id, @userId, @url, @title, @addedAt)`).run({ title: null, ...f }),
+
+    deleteFeed: (id, userId) =>
+      prep('fd', 'DELETE FROM feeds WHERE id = ? AND userId = ?').run(id, userId).changes,
+
+    /** Record the outcome of a check. Only the fields given are written. */
+    touchFeed: (id, { checkedAt, title, etag, lastModified, error } = {}) =>
+      prep('ft', `UPDATE feeds SET
+        lastCheckedAt = COALESCE(@checkedAt, lastCheckedAt),
+        title = COALESCE(@title, title),
+        etag = @etag, lastModified = @lastModified, lastError = @error
+        WHERE id = @id`)
+        .run({
+          id,
+          checkedAt: checkedAt ?? null,
+          title: title ?? null,
+          etag: etag ?? null,
+          lastModified: lastModified ?? null,
+          error: error ?? null,
+        }),
+
+    feedItemSeen: (feedId, guid) =>
+      !!prep('fis', 'SELECT 1 FROM feed_items WHERE feedId = ? AND guid = ?').get(feedId, String(guid)),
+
+    markFeedItemSeen: (feedId, guid, articleId) =>
+      prep('fim', `INSERT INTO feed_items (feedId, guid, articleId, seenAt)
+        VALUES (@feedId, @guid, @articleId, @seenAt)
+        ON CONFLICT(feedId, guid) DO UPDATE SET articleId = COALESCE(@articleId, articleId)`)
+        .run({ feedId, guid: String(guid).slice(0, 500), articleId: articleId ?? null, seenAt: Date.now() }),
+
+    /** Mark a whole feed's current contents as already seen — what subscribing
+     *  does, so nothing from the back catalogue is imported. */
+    markFeedItemsSeen: (feedId, guids) => {
+      const ins = prep('fimb', `INSERT INTO feed_items (feedId, guid, articleId, seenAt)
+        VALUES (?, ?, NULL, ?) ON CONFLICT(feedId, guid) DO NOTHING`);
+      const now = Date.now();
+      sqlite.transaction(() => {
+        for (const g of guids) ins.run(feedId, String(g).slice(0, 500), now);
+      })();
+      return guids.length;
+    },
+
+    /** Where an article's episode audio can be downloaded from ('' if nowhere). */
+    articleAudioUrl: (id) =>
+      (prep('aau', 'SELECT url FROM article_audio WHERE articleId = ?').get(id) || {}).url || '',
+
+    setArticleAudioUrl: (id, url, durationS) =>
+      prep('aas', `INSERT INTO article_audio (articleId, url, durationS, addedAt)
+        VALUES (@id, @url, @durationS, @addedAt)
+        ON CONFLICT(articleId) DO UPDATE SET url = @url, durationS = COALESCE(@durationS, durationS)`)
+        .run({ id, url: String(url), durationS: durationS ?? null, addedAt: Date.now() }),
+
     /**
      * Search/filter a user's articles (metadata only — html/textContent never
      * leave the database here). All filters optional; newest first.
@@ -981,7 +1089,8 @@ function open(dataDir) {
       const cols = `a.id, a.userId, a.url, a.domain, a.savedAt, a.archived, a.favorite, a.readParagraph,
           a.ttsParagraph, a.title, a.byline, a.siteName, a.excerpt, a.imageUrl, a.publishedAt, a.wordCount,
           a.shareId, a.source, a.updatedAt,
-          (SELECT p.detail FROM article_problems p WHERE p.articleId = a.id) AS problemDetail`;
+          (SELECT p.detail FROM article_problems p WHERE p.articleId = a.id) AS problemDetail,
+          (SELECT au.url FROM article_audio au WHERE au.articleId = a.id) AS audioUrl`;
       const lim = Number(filters.limit) || 0;
       if (lim <= 0) {
         // Unpaged (exports, sync): nothing to gain from the two-step below.

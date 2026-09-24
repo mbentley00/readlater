@@ -32,6 +32,7 @@ const { extractReadable } = require('./extract');
 const pdf = require('./pdf');
 const epub = require('./epub');
 const transcribe = require('./transcribe');
+const feeds = require('./feeds');
 const tts = require('./tts');
 const inbound = require('./inbound');
 const skip = require('./skip');
@@ -203,6 +204,49 @@ const sttSpoolFile = (articleId) => path.join(DATA_DIR, `stt-upload-${articleId}
 // process, so the files are just disk usage now.
 for (const f of fs.readdirSync(DATA_DIR)) {
   if (f.startsWith('stt-upload-')) { try { fs.unlinkSync(path.join(DATA_DIR, f)); } catch {} }
+}
+
+/**
+ * An episode from a subscribed feed: saved exactly like one shared out of a
+ * player (same content-hash url, same transcription queue), plus the enclosure
+ * url so the app can download the audio and play it.
+ *
+ * Returns the article, or null when this audio is already here.
+ */
+async function saveFeedEpisode({ feed, item, buf }) {
+  const artUrl = 'audio:' + crypto.createHash('sha256').update(buf).digest('hex').slice(0, 24);
+  let a = store.articleByUrl(feed.userId, artUrl);
+  if (a) {
+    // The same audio under a second guid, or a feed re-publishing an item.
+    store.setArticleAudioUrl(a.id, item.url, item.durationS);
+    store.markFeedItemSeen(feed.id, item.guid, a.id);
+    return null;
+  }
+  const id = newId();
+  fs.writeFileSync(sttSpoolFile(id), buf);
+  // The feed names the episode and the show; embedded tags are the fallback,
+  // not the other way round — a publisher's RSS is better curated than its ID3.
+  const tags = transcribe.audioMeta('', await transcribe.probeTags(sttSpoolFile(id)));
+  const now = Date.now();
+  a = {
+    id, userId: feed.userId, url: artUrl,
+    savedAt: item.publishedAt && item.publishedAt < now ? item.publishedAt : now,
+    publishedAt: item.publishedAt || null,
+    archived: false, favorite: false, readParagraph: 0,
+    source: 'podcast-feed',
+    title: item.title || tags.title || transcribe.PLACEHOLDER_TITLE,
+    byline: tags.byline,
+    siteName: feed.title || tags.siteName || 'Podcast',
+    excerpt: 'Transcribing…',
+    html: '<p>Transcribing… A long episode can take a few minutes; the text appears here when it is done.</p>',
+    textContent: '', updatedAt: now,
+  };
+  store.insertArticle(a);
+  store.setArticleAudioUrl(id, item.url, item.durationS);
+  store.markFeedItemSeen(feed.id, item.guid, id);
+  console.log(`article saved [podcast-feed] "${a.title}" from ${a.siteName} (${buf.length} bytes, transcribing)`);
+  enqueueTranscription(id, feed.userId, `${a.title}.mp3`);
+  return a;
 }
 
 /** Queue a transcription whose audio the caller has already spooled to
@@ -1206,6 +1250,57 @@ const server = http.createServer(async (req, res) => {
     // ---- phone saves a browser capture could improve. The extension matches
     // open tabs against this list itself, so ordinary browsing never reports a
     // URL to the server; only a match leads to a (guarded) POST /api/articles.
+    // ---- podcast subscriptions: an RSS feed whose new episodes arrive here
+    // on their own. Adding one imports nothing (see feeds.js).
+    if (parts[1] === 'feeds' && parts.length === 2) {
+      if (req.method === 'GET') {
+        return json(res, 200, {
+          feeds: store.listFeeds(user.id).map(({ userId, etag, lastModified, ...f }) => f),
+          intervalMinutes: feeds.POLL_INTERVAL_MS / 60000,
+        });
+      }
+      if (req.method === 'POST') {
+        const b = parseBody(await readBody(req), req.headers['content-type']);
+        const feedUrl = sanitizeString(b.url, 2000);
+        if (!feedUrl || !/^https?:\/\//i.test(feedUrl)) {
+          return json(res, 400, { error: 'a http(s) feed url is required' });
+        }
+        const already = store.feedByUrl(user.id, feedUrl);
+        if (already) return json(res, 200, { ...already, userId: undefined, alreadySubscribed: true });
+        let parsed;
+        try {
+          const got = await feeds.fetchFeed(feedUrl);
+          parsed = feeds.parseFeed(got.xml || '');
+        } catch (e) {
+          return json(res, 400, { error: `could not read that feed: ${e.message}` });
+        }
+        if (!parsed.items.length) {
+          return json(res, 400, { error: 'that feed has no episodes in it (no <enclosure> audio found)' });
+        }
+        const feed = {
+          id: newId(), userId: user.id, url: feedUrl,
+          title: parsed.title || hostOf(feedUrl), addedAt: Date.now(),
+        };
+        store.insertFeed(feed);
+        // Everything in it right now counts as already seen: a subscription
+        // starts with the next episode published, not the back catalogue.
+        store.markFeedItemsSeen(feed.id, parsed.items.map((i) => i.guid));
+        console.log(`feed added "${feed.title}" (${feedUrl}) — ${parsed.items.length} existing episode(s) marked seen`);
+        return json(res, 201, { ...feed, userId: undefined, existingEpisodes: parsed.items.length });
+      }
+    }
+    // POST /api/feeds/check — check every feed now rather than at the next poll.
+    if (req.method === 'POST' && parts[1] === 'feeds' && parts[2] === 'check' && parts.length === 3) {
+      const taken = await feeds.pollOnce({
+        store, onEpisode: saveFeedEpisode, maxBytes: AUDIO_IMPORT_MAX_BYTES,
+      });
+      return json(res, 200, { ok: true, episodes: taken });
+    }
+    if (req.method === 'DELETE' && parts[1] === 'feeds' && parts.length === 3) {
+      const gone = store.deleteFeed(parts[2], user.id);
+      return json(res, gone ? 200 : 404, gone ? { ok: true } : { error: 'no such feed' });
+    }
+
     if (req.method === 'GET' && parts[1] === 'resave-candidates' && parts.length === 2) {
       const RESAVE_WINDOW_MS = 90 * 24 * 60 * 60 * 1000;
       // Recent phone saves (a server-side fetch the browser can improve on),
@@ -1890,6 +1985,11 @@ server.listen(PORT, '0.0.0.0', () => {
   }
   if (INBOUND_SECRET) {
     console.log(`Email-to-save enabled${INBOUND_DOMAIN ? ` for @${INBOUND_DOMAIN}` : ''} — webhook at /api/inbound-email`);
+  }
+  feeds.start({ store, onEpisode: saveFeedEpisode, maxBytes: AUDIO_IMPORT_MAX_BYTES });
+  const feedCount = store.listAllFeeds().length;
+  if (feedCount) {
+    console.log(`feeds: ${feedCount} podcast subscription(s), checked every ${feeds.POLL_INTERVAL_MS / 60000} min`);
   }
   if (!inbound.start({ saveEmailArticle, findUserByName, crypto })) {
     console.log('IMAP inbox polling disabled (set READLATER_IMAP_HOST, _USER, _PASS ' +

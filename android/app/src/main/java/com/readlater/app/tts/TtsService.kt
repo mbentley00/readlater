@@ -463,11 +463,14 @@ class TtsService : Service() {
             acquireWakeLock()
             requestAudioFocus()
             speakableBlocks = blocks.indices.filter { speakableText(blocks[it]) != null }
-            // A podcast episode shared into the app plays as itself — the
-            // voices are only for articles with no audio of their own.
-            app.podcastFiles.forUrl(article.url)?.let { episode ->
-                if (startPodcast(episode, article.id)) return@launch
-            }
+            // An episode plays as itself — the voices are only for articles
+            // with no audio of their own. One shared into the app is already
+            // here; one from a subscribed feed is fetched the first time you
+            // play it.
+            val episode = withContext(Dispatchers.IO) {
+                app.podcastFiles.forArticle(article.id, article.url)
+            } ?: downloadEpisode(article)
+            if (episode != null && startPodcast(episode, article.id)) return@launch
             // Prefer the server (Kokoro) voice when enabled and available;
             // otherwise (incl. not-yet-generated) fall back to the device voice.
             if (app.settings.useServerVoice && tryStartServerVoice(article.id)) {
@@ -796,7 +799,7 @@ class TtsService : Service() {
             // Listened to the end: the episode's audio is done with (tens of
             // MB). The transcript stays; playing it again reads it aloud.
             logDbg("podcast complete — deleting the episode file")
-            app.podcastFiles.delete(articleUrl)
+            app.podcastFiles.delete(articleId, articleUrl)
         }
         if (autoAdvance) {
             logDbg("auto-advance: article complete → chime & next")
@@ -1245,6 +1248,48 @@ class TtsService : Service() {
         updateMetadata()
         startServerStream(msForBlock(currentIndex))
         return true
+    }
+
+    /**
+     * Fetch a feed episode's audio so it can be played as itself. Null when
+     * there is nothing to fetch, the network is the wrong kind, or it failed —
+     * every one of which falls back to a voice reading the transcript, which is
+     * a worse listen but not a broken one.
+     *
+     * Metered networks are left alone: an episode is tens of megabytes, and
+     * spending someone's data allowance because they pressed play is not a
+     * decision this should make quietly.
+     */
+    private suspend fun downloadEpisode(article: com.readlater.app.data.ArticleEntity): java.io.File? {
+        val url = article.audioUrl?.takeIf { it.isNotBlank() } ?: return null
+        val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as android.net.ConnectivityManager
+        if (cm.isActiveNetworkMetered) {
+            logDbg("episode not downloaded (metered network) — reading the transcript")
+            Toast.makeText(this, "Episode audio waits for Wi-Fi — reading the transcript for now", Toast.LENGTH_LONG).show()
+            return null
+        }
+        Toast.makeText(this, "Downloading the episode…", Toast.LENGTH_SHORT).show()
+        logDbg("downloading episode for ${article.id} from $url")
+        acquireWifiLock()
+        return try {
+            withContext(Dispatchers.IO) {
+                val spool = app.podcastFiles.spoolFile()
+                val ok = runCatching { app.apiClient.downloadEpisode(url, spool) }.getOrDefault(false)
+                if (!ok) {
+                    spool.delete()
+                    logDbg("episode download failed")
+                    null
+                } else {
+                    // Named after the article, not the audio's hash: hosts
+                    // stitch ads per request, so these bytes need not match the
+                    // ones the server transcribed (see PodcastFiles).
+                    val ext = url.substringBefore('?').substringAfterLast('.', "mp3")
+                    app.podcastFiles.keep(spool, article.id, ext)
+                }
+            }
+        } finally {
+            releaseWifiLock()
+        }
     }
 
     private fun audioDurationMs(file: java.io.File): Long {

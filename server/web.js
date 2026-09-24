@@ -1931,6 +1931,9 @@ ${total ? `<div class="meta">${total.toLocaleString('en-US')} article${total ===
 }
 
 function settingsPage(ctx, user, url, req) {
+  const feedList = ctx.store.listFeeds(user.id);
+  const feedIntervalMinutes = Math.round(require('./feeds').POLL_INTERVAL_MS / 60000);
+  const feedMaxPerPoll = require('./feeds').MAX_PER_POLL;
   const msg = url.searchParams.get('msg');
   const rules = ctx.store.listSkipRules(user.id);
   const origin = ctx.originOf(req);
@@ -1959,6 +1962,29 @@ ${msg === 'alias' ? '<div class="notice">Email address regenerated — update yo
   <dt>Android app</dt>
   <dd class="meta"><a href="/app.apk">Download the Android app (APK)</a> — open this page on your phone,
   download, and tap the file to install or update.</dd>` : ''}
+  <dt>Podcast subscriptions</dt>
+  <dd class="meta">An RSS feed whose new episodes arrive here by themselves,
+  transcribed like an episode shared from a player. Subscribing imports nothing:
+  it starts with the next episode published. Feeds are checked every
+  ${feedIntervalMinutes} minutes, and at most ${feedMaxPerPoll} episodes are taken
+  from one feed per check.
+    <form id="feed-add" class="skip-add">
+      <input type="url" id="feed-url" placeholder="https://example.com/podcast/rss" maxlength="2000">
+      <button class="act" type="submit">Subscribe</button>
+    </form>
+    <div id="feed-msg" class="meta"></div>
+    ${feedList.length ? `<ul class="skip-rules">${feedList.map((f) => `
+      <li data-id="${escapeHtml(f.id)}">
+        <span class="phrase">${escapeHtml(f.title || f.url)}<br>
+          <span class="meta">${escapeHtml(f.url)}</span></span>
+        <span class="meta">${f.episodes ? `${f.episodes} episode${f.episodes === 1 ? '' : 's'}` : 'nothing yet'}${
+      f.lastError ? ` · <span class="problem-note">${escapeHtml(f.lastError)}</span>`
+        : f.lastCheckedAt ? ` · checked ${fmtDate(f.lastCheckedAt)}` : ' · not checked yet'}</span>
+        <button class="act del-feed" type="button">Unsubscribe</button>
+      </li>`).join('')}</ul>
+    <form id="feed-check"><button class="act" type="submit">Check now</button></form>`
+      : '<div class="meta">No subscriptions yet.</div>'}
+  </dd>
   <dt>Skipped text</dt>
   <dd class="meta">Phrases dropped from articles as they are saved — newsletter
   sign-ups, import warnings. A paragraph containing one is removed. Existing
@@ -2005,6 +2031,50 @@ document.getElementById('skip-add').addEventListener('submit', async (e) => {
     ? data.existingMatches + ' existing article(s) contain this — they are left as they are. Reloading…'
     : 'Added. Reloading…');
   setTimeout(() => location.reload(), data.existingMatches ? 1800 : 500);
+});
+
+const feedMsg = document.getElementById('feed-msg');
+const feedSay = (t, bad) => { feedMsg.textContent = t; feedMsg.style.color = bad ? '#b3261e' : ''; };
+
+document.getElementById('feed-add').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const input = document.getElementById('feed-url');
+  const url = input.value.trim();
+  if (!url) return;
+  feedSay('Reading that feed…');
+  const res = await fetch('/api/feeds', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ url }),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) return feedSay(data.error || 'could not subscribe to that', true);
+  input.value = '';
+  feedSay(data.alreadySubscribed
+    ? 'Already subscribed to that one. Reloading…'
+    : 'Subscribed to ' + (data.title || url) + ' — its ' + data.existingEpisodes
+      + ' existing episode(s) are left alone; the next one published arrives here. Reloading…');
+  setTimeout(() => location.reload(), 1800);
+});
+
+document.querySelectorAll('.del-feed').forEach((b) => {
+  b.addEventListener('click', async () => {
+    const li = b.closest('li[data-id]');
+    await fetch('/api/feeds/' + li.dataset.id, { method: 'DELETE' });
+    li.remove();
+  });
+});
+
+const feedCheck = document.getElementById('feed-check');
+if (feedCheck) feedCheck.addEventListener('submit', async (e) => {
+  e.preventDefault();
+  feedSay('Checking…');
+  const res = await fetch('/api/feeds/check', { method: 'POST' });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) return feedSay(data.error || 'check failed', true);
+  feedSay(data.episodes
+    ? data.episodes + ' new episode(s) — transcribing now. Reloading…'
+    : 'Nothing new. Reloading…');
+  setTimeout(() => location.reload(), 1500);
 });
 
 document.querySelectorAll('.del-skip').forEach((b) => {

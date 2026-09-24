@@ -46,7 +46,10 @@ data class ArticleEntity(
      *  that never parsed (server/quality.js). Kept out of the main list. */
     @ColumnInfo(defaultValue = "0") val problem: Boolean = false,
     /** One line saying what went wrong, for the Problems list. */
-    val problemDetail: String? = null
+    val problemDetail: String? = null,
+    /** Where this episode's audio can be downloaded from, for an episode that
+     *  arrived from a subscribed feed. Null for everything else. */
+    val audioUrl: String? = null
 )
 
 @Entity(tableName = "highlights")
