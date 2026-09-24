@@ -47,6 +47,7 @@ import androidx.compose.material.icons.filled.Bedtime
 import androidx.compose.material.icons.filled.Block
 import androidx.compose.material.icons.filled.Build
 import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.Forward30
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.MyLocation
 import androidx.compose.material.icons.filled.OpenInBrowser
@@ -764,6 +765,20 @@ fun ReaderScreen(articleId: String, onBack: () -> Unit, onOpenArticle: (String) 
                             else Icons.Filled.PlayArrow,
                             contentDescription = "Play or pause"
                         )
+                    }
+                }
+                // Episodes get a skip-ahead: paragraph-by-paragraph is the wrong
+                // unit for an ad break or a preamble. (An earbud triple-tap
+                // jumps a minute; this is the aimed, on-screen version.)
+                if (podcastActive && isTtsThisArticle) {
+                    IconButton(onClick = {
+                        context.startService(
+                            Intent(context, TtsService::class.java)
+                                .setAction(TtsService.ACTION_SKIP_AHEAD)
+                                .putExtra(TtsService.EXTRA_SKIP_MS, 30_000)
+                        )
+                    }) {
+                        Icon(Icons.Filled.Forward30, contentDescription = "Skip ahead 30 seconds")
                     }
                 }
                 IconButton(onClick = { sendTtsCommand(context, TtsService.ACTION_NEXT) }) {

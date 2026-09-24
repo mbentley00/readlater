@@ -2,9 +2,14 @@ package com.readlater.app.data
 
 import androidx.room.ColumnInfo
 import androidx.room.Entity
+import androidx.room.Index
 import androidx.room.PrimaryKey
 
-@Entity(tableName = "articles")
+// The url index is what keeps a lookup by url off the whole table: rows carry
+// their html inline, so a scan reads the library's bodies off disk to find one
+// row. PodcastFiles.sweep does exactly such a lookup, once per stored episode,
+// at the end of every sync.
+@Entity(tableName = "articles", indices = [Index("url")])
 data class ArticleEntity(
     @PrimaryKey val id: String,
     val url: String,
@@ -56,6 +61,10 @@ data class HighlightEntity(
     val createdAt: Long,
     val synced: Boolean
 )
+
+/** Whether an article is still in the inbox — a projection, so reading it does
+ *  not pull the article's html along too. */
+data class ArticleState(val id: String, val archived: Boolean)
 
 /** Highlight joined with its article's title, for the all-highlights screen. */
 data class HighlightWithArticle(

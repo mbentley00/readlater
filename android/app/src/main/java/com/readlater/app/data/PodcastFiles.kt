@@ -75,14 +75,16 @@ class PodcastFiles(private val dir: File) {
 
     /**
      * Remove episodes nothing needs: their article is archived, or it never
-     * appeared and the file is old. [articleFor] looks an article up by url.
+     * appeared and the file is old. [stateFor] looks an article up by url.
      */
-    suspend fun sweep(articleFor: suspend (String) -> ArticleEntity?) {
+    suspend fun sweep(stateFor: suspend (String) -> ArticleState?) {
+        val stored = files()
+        if (stored.isEmpty()) return // the usual case: don't ask the database anything
         val now = System.currentTimeMillis()
-        for (f in files()) {
+        for (f in stored) {
             val url = URL_PREFIX + f.name.substringBeforeLast('.')
-            val article = articleFor(url)
-            val gone = if (article == null) now - f.lastModified() > ORPHAN_MS else article.archived
+            val state = stateFor(url)
+            val gone = if (state == null) now - f.lastModified() > ORPHAN_MS else state.archived
             if (gone) f.delete()
         }
     }

@@ -297,7 +297,7 @@ class Repository(
             settings.lastSyncAt = syncStartedAt
 
             // 6. Let go of stored episodes that were archived elsewhere.
-            podcasts.sweep { articleDao.getByUrl(it) }
+            podcasts.sweep { articleDao.stateByUrl(it) }
         }
     }
 

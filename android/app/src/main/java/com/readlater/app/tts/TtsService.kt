@@ -76,6 +76,9 @@ class TtsService : Service() {
         const val ACTION_TOGGLE_AUTO_ADVANCE = "com.readlater.app.tts.action.TOGGLE_AUTO_ADVANCE"
         /** The podcast speed setting changed: re-apply it from where playback is. */
         const val ACTION_SET_SPEED = "com.readlater.app.tts.action.SET_SPEED"
+        /** Skip ahead in an episode by EXTRA_SKIP_MS (the reader's button). */
+        const val ACTION_SKIP_AHEAD = "com.readlater.app.tts.action.SKIP_AHEAD"
+        const val EXTRA_SKIP_MS = "skipMs"
         /** Archive the article currently playing and roll on to the next inbox
          *  article, playing it — the UI equivalent of the headset triple-tap, so
          *  archiving during a play-through continues the playlist instead of
@@ -97,6 +100,10 @@ class TtsService : Service() {
 
         /** How far a triple headset tap skips ahead in a podcast episode. */
         private const val PODCAST_SKIP_MS = 60_000
+
+        /** How far the reader's skip button goes — shorter, because it is aimed
+         *  with your eyes on the transcript rather than blind from an earbud. */
+        private const val BUTTON_SKIP_MS = 30_000
 
         /** How many upcoming paragraphs to keep synthesized ahead of playback. */
         private const val PREFETCH_AHEAD = 3
@@ -290,6 +297,9 @@ class TtsService : Service() {
             ACTION_SET_SLEEP_TIMER -> handleSetSleepTimer(intent.getIntExtra(EXTRA_SLEEP_MINUTES, 0))
             ACTION_TOGGLE_AUTO_ADVANCE -> handleToggleAutoAdvance()
             ACTION_SET_SPEED -> handleSetSpeed()
+            ACTION_SKIP_AHEAD -> handleSkipPodcast(
+                intent.getIntExtra(EXTRA_SKIP_MS, BUTTON_SKIP_MS), announce = false
+            )
             ACTION_ARCHIVE_AND_NEXT -> handleArchiveAndNext()
             // System-delivered media buttons (MediaButtonReceiver in the
             // manifest) route into the session callback.
@@ -1307,8 +1317,9 @@ class TtsService : Service() {
         updateNotification()
     }
 
-    /** Triple headset tap in an episode: skip ahead. Past the end is the end. */
-    private fun handleSkipPodcast(deltaMs: Int) {
+    /** Skip ahead in an episode. Past the end is the end. [announce] is for the
+     *  blind gesture: with the reader open you can see the transcript move. */
+    private fun handleSkipPodcast(deltaMs: Int, announce: Boolean = true) {
         val target = podcastPositionMs() + deltaMs
         logDbg("podcast skip +${deltaMs / 1000}s → ${target / 1000}s of ${podcastDurationMs / 1000}s")
         if (podcastDurationMs > 0 && target >= podcastDurationMs) {
@@ -1316,7 +1327,7 @@ class TtsService : Service() {
             return
         }
         seekPodcastTo(target)
-        Toast.makeText(this, "Skipped ahead ${deltaMs / 1000}s", Toast.LENGTH_SHORT).show()
+        if (announce) Toast.makeText(this, "Skipped ahead ${deltaMs / 1000}s", Toast.LENGTH_SHORT).show()
     }
 
     /** The podcast speed changed in the reader: carry on from here at the new speed. */
@@ -1448,13 +1459,34 @@ class TtsService : Service() {
         return (sourceFrames / f).toLong()
     }
 
-    /** Apply the user's speech rate to a server AudioTrack (pitch preserved). */
+    /**
+     * Run a started AudioTrack at [speed], pitch preserved, and record the speed
+     * that actually took.
+     *
+     * Two traps, both of which bit. The track must ALREADY BE PLAYING: setting
+     * playbackParams on a track that hasn't started throws IllegalStateException
+     * on plenty of devices, and that throw used to be swallowed whole — so an
+     * episode played at 1× while trackSpeed said 2×, and since the highlight,
+     * the resume position and the end-of-audio wait are all derived from
+     * trackSpeed, the transcript ran through at twice the pace of the audio.
+     * And the device may clamp or refuse a rate anyway. So the asked-for speed
+     * is never assumed: [trackSpeed] is read back from the track, and if the
+     * two differ the log says so.
+     */
     private fun applyTrackSpeed(track: android.media.AudioTrack, speed: Float) {
-        trackSpeed = speed
-        runCatching {
-            track.playbackParams = android.media.PlaybackParams()
-                .setSpeed(speed)
-                .setPitch(1.0f)
+        trackSpeed = 1.0f
+        val wanted = speed.coerceIn(0.25f, 4.0f)
+        try {
+            // Mutate the track's own params rather than a fresh PlaybackParams:
+            // a blank one carries "unset" fields that some devices reject.
+            track.playbackParams = track.playbackParams.setSpeed(wanted).setPitch(1.0f)
+        } catch (e: Exception) {
+            logDbg("playback speed ${wanted}× refused: ${e.message}")
+        }
+        val effective = runCatching { track.playbackParams.speed }.getOrDefault(0f)
+        trackSpeed = if (effective > 0.05f) effective else 1.0f
+        if (kotlin.math.abs(trackSpeed - wanted) > 0.01f) {
+            logDbg("playback speed asked ${wanted}×, running at ${trackSpeed}×")
         }
     }
 
@@ -2017,9 +2049,9 @@ class TtsService : Service() {
             trackStartMs = fromMs
             audioStarted = true
             cancelAudioWatchdog()
-            applyTrackSpeed(track, app.settings.serverSpeechRate)
             track.play()
             markTrackStarted()
+            applyTrackSpeed(track, app.settings.serverSpeechRate) // after play(): see applyTrackSpeed
             logDbg("playing (server) from=${fromMs}ms speed=$trackSpeed")
             publishState(); updatePlaybackState(); updateNotification()
 
@@ -2149,14 +2181,14 @@ class TtsService : Service() {
                 trackSampleRate = sampleRate
                 trackChannels = channels
                 val frameBytes = channels * 2
-                val speed = fileSpeed()
-                applyTrackSpeed(track, speed)
                 // Publish the track BEFORE playing, so a pause arriving during
                 // opus startup can find and release it (audioTrack is @Volatile).
                 // The WAV path already does this synchronously; opus must too.
                 audioTrack = track
                 track.play()
                 markTrackStarted()
+                applyTrackSpeed(track, fileSpeed()) // after play(): see applyTrackSpeed
+                val speed = trackSpeed
                 mainHandler.post {
                     if (myGen == playThreadGen && isPlaying && serverMode) {
                         audioStarted = true

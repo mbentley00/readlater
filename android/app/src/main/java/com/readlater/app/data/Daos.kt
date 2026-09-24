@@ -70,8 +70,10 @@ interface ArticleDao {
     @Query("SELECT * FROM articles")
     suspend fun getAll(): List<ArticleEntity>
 
-    @Query("SELECT * FROM articles WHERE url = :url LIMIT 1")
-    suspend fun getByUrl(url: String): ArticleEntity?
+    /** Just enough to decide whether a stored episode is still wanted. A whole
+     *  ArticleEntity here would drag the article's html along with it. */
+    @Query("SELECT id, archived FROM articles WHERE url = :url LIMIT 1")
+    suspend fun stateByUrl(url: String): ArticleState?
 
     @Query("SELECT * FROM articles WHERE id IN (:ids)")
     suspend fun getByIds(ids: List<String>): List<ArticleEntity>
