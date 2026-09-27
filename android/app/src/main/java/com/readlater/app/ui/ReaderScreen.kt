@@ -268,11 +268,17 @@ fun ReaderScreen(articleId: String, onBack: () -> Unit, onOpenArticle: (String) 
 
     // If a headphone triple-tap archived THIS article and moved playback to the
     // next one while the app was away, follow it — otherwise you come back to
-    // the stale, now-archived article with playback happening elsewhere.
+    // the stale, now-archived article with playback happening elsewhere. The
+    // next one may be queued up paused (archived while paused), so "the service
+    // was on this article" counts as much as "something is playing".
+    var wasTtsArticle by remember(articleId) { mutableStateOf(false) }
+    if (ttsState.articleId == articleId) wasTtsArticle = true
     LaunchedEffect(article?.archived, ttsState.articleId, ttsState.isPlaying) {
         val a = article
         val playing = ttsState.articleId
-        if (a != null && a.archived && ttsState.isPlaying && playing != null && playing != articleId) {
+        if (a != null && a.archived && (ttsState.isPlaying || wasTtsArticle) &&
+            playing != null && playing != articleId
+        ) {
             onOpenArticle(playing)
         }
     }

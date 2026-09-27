@@ -67,6 +67,20 @@ data class RemoteHighlight(
     val createdAt: Long
 )
 
+/** A podcast subscription as returned by GET /api/feeds. */
+data class RemoteFeed(
+    val id: String,
+    val url: String,
+    val title: String,
+    /** Episodes imported so far (the back catalogue is never imported). */
+    val episodes: Int,
+    val lastCheckedAt: Long?,
+    val lastError: String?
+)
+
+/** What POST /api/feeds said about a new subscription. */
+data class FeedAdded(val title: String, val existingEpisodes: Int, val alreadySubscribed: Boolean)
+
 /**
  * Thin OkHttp wrapper around the ReadLater server API.
  * All methods are suspend and throw [IOException] with a readable message on failure.
@@ -376,6 +390,55 @@ class ApiClient(private val settings: Settings) {
                 .build()
         )
         return JSONObject(body).optInt("existingMatches", 0)
+    }
+
+    /** GET /api/feeds — the user's podcast subscriptions. */
+    suspend fun listFeeds(): List<RemoteFeed> {
+        val arr = JSONObject(execute(builder("/api/feeds").get().build())).getJSONArray("feeds")
+        return (0 until arr.length()).map { i ->
+            val o = arr.getJSONObject(i)
+            RemoteFeed(
+                id = o.getString("id"),
+                url = o.optString("url"),
+                title = o.stringOrNull("title") ?: o.optString("url"),
+                episodes = o.optInt("episodes", 0),
+                lastCheckedAt = o.optLong("lastCheckedAt", 0L).takeIf { it > 0 },
+                lastError = o.stringOrNull("lastError")
+            )
+        }
+    }
+
+    /**
+     * POST /api/feeds — subscribe. The server reads the feed first and refuses
+     * one with no audio episodes; that refusal is rethrown as its own sentence
+     * rather than "Server error 400: {json}".
+     */
+    suspend fun addFeed(url: String): FeedAdded {
+        val json = JSONObject().put("url", url)
+        val body = try {
+            execute(builder("/api/feeds").post(json.toString().toRequestBody(jsonMediaType)).build())
+        } catch (e: IOException) {
+            val reason = e.message?.substringAfter(": ", "")
+                ?.let { runCatching { JSONObject(it).stringOrNull("error") }.getOrNull() }
+            throw if (reason != null) IOException(reason, e) else e
+        }
+        val o = JSONObject(body)
+        return FeedAdded(
+            title = o.stringOrNull("title") ?: url,
+            existingEpisodes = o.optInt("existingEpisodes", 0),
+            alreadySubscribed = o.optBoolean("alreadySubscribed", false)
+        )
+    }
+
+    /** DELETE /api/feeds/{id} */
+    suspend fun deleteFeed(id: String) {
+        execute(builder("/api/feeds/$id").delete().build())
+    }
+
+    /** POST /api/feeds/check — poll every feed now. Returns new episodes taken. */
+    suspend fun checkFeeds(): Int {
+        val body = execute(builder("/api/feeds/check").post(ByteArray(0).toRequestBody(null)).build())
+        return JSONObject(body).optInt("episodes", 0)
     }
 
     /** GET /api/articles/{id}/highlights */

@@ -95,6 +95,10 @@ class TtsService : Service() {
          *  clear the mode it is running under. */
         const val EXTRA_AUTO_ADVANCE = "autoAdvance"
 
+        /** On ACTION_PLAY: load the article but leave it paused (internal —
+         *  archiving mid-queue while paused queues the next one up, silent). */
+        private const val EXTRA_START_PAUSED = "startPaused"
+
         private const val CHANNEL_ID = "tts_playback"
         private const val NOTIFICATION_ID = 1001
 
@@ -115,6 +119,10 @@ class TtsService : Service() {
         /** A saved position inside this fraction of an article doesn't count as
          *  progress worth resuming — playback starts at the top instead. */
         private const val RESUME_FLOOR_FRACTION = 0.05f
+        /** A headset that drops and comes back within this long resumes on its own. */
+        private const val NOISY_RECONNECT_WINDOW_MS = 20_000L
+        /** Paused this long, the service gives up and clears its notification. */
+        private const val PAUSED_IDLE_STOP_MS = 60 * 60_000L
 
         /** Deliberate pause between paragraphs for the neural (Kaldi/sherpa)
          *  voice — its delivery runs paragraphs together, so a beat helps. */
@@ -215,6 +223,7 @@ class TtsService : Service() {
 
     override fun onCreate() {
         super.onCreate()
+        logDbg("service created")
         createChannel()
         mediaSession = MediaSessionCompat(this, "ReadLaterTts").apply {
             setCallback(object : MediaSessionCompat.Callback() {
@@ -367,11 +376,13 @@ class TtsService : Service() {
      * without warning from here, so bank the position now.
      */
     override fun onTaskRemoved(rootIntent: Intent?) {
+        logDbg("task removed (swiped from Recents) playing=$isPlaying")
         articleId?.let { app.repository.saveTtsPosition(it, currentIndex) }
         super.onTaskRemoved(rootIntent)
     }
 
     override fun onDestroy() {
+        logDbg("service destroyed (playing=$isPlaying idx=$currentIndex)")
         // Best-effort: persist the listening position as we're torn down (the
         // repository scope is app-lived, so this survives us). Not gated on
         // isPlaying — a paused service can still be holding a position the user
@@ -379,6 +390,7 @@ class TtsService : Service() {
         // most likely to reclaim.
         articleId?.let { app.repository.saveTtsPosition(it, currentIndex) }
         stateFlow.value = TtsPlaybackState()
+        cancelPausedTimers()
         releaseWakeLock()
         abandonAudioFocus()
         clearSynthCache()
@@ -394,16 +406,24 @@ class TtsService : Service() {
 
     // ------------------------------------------------------------------ actions
 
+    /** An article loaded paused (see EXTRA_START_PAUSED) that has never been
+     *  started: resuming it must run the full play path — podcast, server
+     *  voice or device voice — not just continue a player that doesn't exist. */
+    private var pendingStart = false
+
     private fun handlePlay(intent: Intent) {
         val requestedId = intent.getStringExtra(EXTRA_ARTICLE_ID) ?: articleId
         val startParagraph = intent.getIntExtra(EXTRA_START_PARAGRAPH, -1)
-        logDbg("PLAY requested article=$requestedId start=$startParagraph")
+        val startPaused = intent.getBooleanExtra(EXTRA_START_PAUSED, false)
+        pendingStart = false
+        logDbg("PLAY requested article=$requestedId start=$startParagraph${if (startPaused) " (paused)" else ""}")
         if (requestedId == null) {
             stopSelf()
             return
         }
         // Go foreground immediately: startForegroundService() requires it quickly.
         startInForeground()
+        cancelPausedTimers()
         scope.launch {
             val article = withContext(Dispatchers.IO) {
                 app.database.articleDao().getById(requestedId)
@@ -453,13 +473,22 @@ class TtsService : Service() {
                     " — tts=${article.ttsParagraph} read=${article.readParagraph} -> start at $currentIndex" +
                     " — ${article.title.take(40)}"
             )
-            isPlaying = true
+            isPlaying = !startPaused
             audioStarted = false
             clearSynthCache() // article or rate may have changed; drop stale audio
             publishState() // show "preparing" immediately while we set up audio
             updateNotification()
             recomputeDurations()
             updateMetadata()
+            if (startPaused) {
+                // Queued up, not playing: the article, title and position are
+                // all in place; play (from anywhere) starts it for real.
+                pendingStart = true
+                updatePlaybackState()
+                mainHandler.removeCallbacks(idleStopRunnable)
+                mainHandler.postDelayed(idleStopRunnable, PAUSED_IDLE_STOP_MS)
+                return@launch
+            }
             acquireWakeLock()
             requestAudioFocus()
             speakableBlocks = blocks.indices.filter { speakableText(blocks[it]) != null }
@@ -522,6 +551,9 @@ class TtsService : Service() {
             tts?.stop() // fallback speak(): position is lost, resume re-speaks
         }
         releaseWakeLock()
+        // The notification is pinned while paused, so don't leave it up forever.
+        mainHandler.removeCallbacks(idleStopRunnable)
+        mainHandler.postDelayed(idleStopRunnable, PAUSED_IDLE_STOP_MS)
         // Pushing save: sync the paused position to the server right away.
         articleId?.let { app.repository.saveTtsPosition(it, currentIndex) }
         publishState()
@@ -535,7 +567,19 @@ class TtsService : Service() {
             return
         }
         if (isPlaying) return
+        if (pendingStart) {
+            logDbg("RESUME of a queued-up article → starting it (idx=$currentIndex)")
+            handlePlay(
+                Intent(this, TtsService::class.java)
+                    .setAction(ACTION_PLAY)
+                    .putExtra(EXTRA_ARTICLE_ID, articleId)
+                    // explicit, so next/prev taken while it sat paused is kept
+                    .putExtra(EXTRA_START_PARAGRAPH, currentIndex)
+            )
+            return
+        }
         logDbg("RESUME (idx=$currentIndex)")
+        cancelPausedTimers()
         isPlaying = true
         acquireWakeLock()
         requestAudioFocus()
@@ -768,6 +812,9 @@ class TtsService : Service() {
      *  play-through completion / archive-and-next). */
     private fun handleArchiveAndNext() {
         val id = articleId ?: return
+        // Archiving while paused queues the next article up paused; only a
+        // live session (or a natural completion) rolls straight into it.
+        val keepPlaying = isPlaying
         scope.launch {
             val current = withContext(Dispatchers.IO) { app.database.articleDao().getById(id) } ?: return@launch
             val next = app.repository.nextAfterInView(current)
@@ -784,6 +831,7 @@ class TtsService : Service() {
                         // explicit "start at the top" and outranks the saved
                         // position, which is what used to restart these.
                         .putExtra(EXTRA_START_PARAGRAPH, -1)
+                        .putExtra(EXTRA_START_PAUSED, !keepPlaying)
                 )
             } else {
                 handleStop()
@@ -929,6 +977,9 @@ class TtsService : Service() {
     }
 
     private fun handleStop() {
+        logDbg("STOP (idx=$currentIndex)")
+        pendingStart = false
+        cancelPausedTimers()
         isPlaying = false
         disarmArchive()
         autoAdvance = false // Stop is the "user intervenes" that ends a binge
@@ -2543,6 +2594,7 @@ class TtsService : Service() {
                 if (intent?.action == AudioManager.ACTION_AUDIO_BECOMING_NOISY && isPlaying) {
                     logDbg("audio becoming noisy (headset unplugged) → pause")
                     handlePause()
+                    watchForHeadsetReturn()
                 }
             }
         }
@@ -2553,6 +2605,69 @@ class TtsService : Service() {
     private fun unregisterNoisyReceiver() {
         noisyReceiver?.let { runCatching { unregisterReceiver(it) } }
         noisyReceiver = null
+    }
+
+    // ---- brief headset dropouts ----------------------------------------------
+    //
+    // Bluetooth links blip: the headset vanishes for a second, NOISY fires, and
+    // we pause — even though the earbuds are back almost at once. So after a
+    // noisy pause, watch for a headset output to reappear and, if it does within
+    // NOISY_RECONNECT_WINDOW_MS, carry on. A longer absence stays paused.
+    private var reconnectCallback: android.media.AudioDeviceCallback? = null
+    private val reconnectTimeout = Runnable {
+        logDbg("headset not back within ${NOISY_RECONNECT_WINDOW_MS / 1000}s — staying paused")
+        stopWatchingForHeadset()
+    }
+
+    private fun isHeadset(d: android.media.AudioDeviceInfo): Boolean = d.isSink && when (d.type) {
+        android.media.AudioDeviceInfo.TYPE_BLUETOOTH_A2DP,
+        android.media.AudioDeviceInfo.TYPE_WIRED_HEADSET,
+        android.media.AudioDeviceInfo.TYPE_WIRED_HEADPHONES,
+        android.media.AudioDeviceInfo.TYPE_USB_HEADSET -> true
+        else -> Build.VERSION.SDK_INT >= Build.VERSION_CODES.S &&
+            d.type == android.media.AudioDeviceInfo.TYPE_BLE_HEADSET
+    }
+
+    private fun watchForHeadsetReturn() {
+        stopWatchingForHeadset()
+        val am = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+        val cb = object : android.media.AudioDeviceCallback() {
+            // Registering replays every device already connected — including,
+            // possibly, the headset that is mid-disconnect. Skip that first call.
+            private var sawInitial = false
+            override fun onAudioDevicesAdded(added: Array<out android.media.AudioDeviceInfo>) {
+                if (!sawInitial) { sawInitial = true; return }
+                val back = added.firstOrNull(::isHeadset) ?: return
+                logDbg("headset back (type=${back.type}) → resume")
+                stopWatchingForHeadset()
+                if (!isPlaying && articleId != null) handleResume()
+            }
+        }
+        am.registerAudioDeviceCallback(cb, mainHandler)
+        reconnectCallback = cb
+        mainHandler.postDelayed(reconnectTimeout, NOISY_RECONNECT_WINDOW_MS)
+    }
+
+    private fun stopWatchingForHeadset() {
+        mainHandler.removeCallbacks(reconnectTimeout)
+        reconnectCallback?.let {
+            val am = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+            runCatching { am.unregisterAudioDeviceCallback(it) }
+        }
+        reconnectCallback = null
+    }
+
+    private val idleStopRunnable = Runnable {
+        if (!isPlaying && articleId != null) {
+            logDbg("paused ${PAUSED_IDLE_STOP_MS / 60_000} min → stopping")
+            handleStop()
+        }
+    }
+
+    /** Anything that starts, resumes, or ends playback voids the paused-state timers. */
+    private fun cancelPausedTimers() {
+        mainHandler.removeCallbacks(idleStopRunnable)
+        stopWatchingForHeadset()
     }
 
     /**
@@ -2642,7 +2757,10 @@ class TtsService : Service() {
             .setContentText(progressText)
             .setContentIntent(contentIntent)
             .setOnlyAlertOnce(true)
-            .setOngoing(isPlaying)
+            // Pinned while paused too: a swipe (or the lock screen tidying up)
+            // used to lose the player after every pause. Stop dismisses it, and
+            // idleStopRunnable clears it after an hour paused.
+            .setOngoing(true)
             .addAction(
                 NotificationCompat.Action(
                     android.R.drawable.ic_media_previous, "Previous", servicePendingIntent(ACTION_PREV)

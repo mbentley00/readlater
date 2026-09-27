@@ -401,6 +401,10 @@ fun SettingsScreen(onBack: () -> Unit) {
 
             HorizontalDivider()
 
+            PodcastFeedsSection(app, snackbarHostState)
+
+            HorizontalDivider()
+
             Text("Background playback", style = MaterialTheme.typography.titleMedium)
             val powerManager = context.getSystemService(android.content.Context.POWER_SERVICE) as android.os.PowerManager
             // recomputed whenever the screen recomposes (e.g. returning from the
@@ -505,6 +509,149 @@ fun SettingsScreen(onBack: () -> Unit) {
                     )
                 }
             }
+        }
+    }
+}
+
+/**
+ * Podcast subscriptions, the same list as Settings on the web: add a feed URL,
+ * see what each has brought in, unsubscribe, or check them all now.
+ */
+@Composable
+private fun PodcastFeedsSection(app: ReadLaterApp, snackbarHostState: SnackbarHostState) {
+    val scope = rememberCoroutineScope()
+    var feeds by remember { mutableStateOf<List<com.readlater.app.data.RemoteFeed>?>(null) }
+    var loadError by remember { mutableStateOf<String?>(null) }
+    var feedUrl by remember { mutableStateOf("") }
+    var busy by remember { mutableStateOf(false) }
+    var message by remember { mutableStateOf<Pair<String, Boolean>?>(null) } // text, isError
+
+    suspend fun reload() {
+        try {
+            feeds = app.apiClient.listFeeds()
+            loadError = null
+        } catch (e: Exception) {
+            loadError = "Couldn't load subscriptions: ${e.message ?: "unknown error"}"
+        }
+    }
+    LaunchedEffect(Unit) { reload() }
+
+    Text("Podcast subscriptions", style = MaterialTheme.typography.titleMedium)
+    Text(
+        "Paste a podcast's RSS feed. New episodes arrive by themselves, transcribed " +
+            "and playing as themselves. Subscribing imports nothing: it starts with " +
+            "the next episode published.",
+        style = MaterialTheme.typography.bodySmall,
+        color = MaterialTheme.colorScheme.onSurfaceVariant
+    )
+    OutlinedTextField(
+        value = feedUrl,
+        onValueChange = { feedUrl = it },
+        label = { Text("Feed URL") },
+        placeholder = { Text("https://example.com/podcast/rss") },
+        singleLine = true,
+        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri),
+        modifier = Modifier.fillMaxWidth()
+    )
+    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        Button(
+            enabled = !busy && feedUrl.isNotBlank(),
+            onClick = {
+                scope.launch {
+                    busy = true
+                    message = "Reading that feed…" to false
+                    message = try {
+                        val added = app.apiClient.addFeed(feedUrl.trim())
+                        feedUrl = ""
+                        reload()
+                        if (added.alreadySubscribed) "Already subscribed to that one." to false
+                        else "Subscribed to ${added.title}. Its ${added.existingEpisodes} existing " +
+                            "episode(s) are left alone; the next one published arrives here." to false
+                    } catch (e: Exception) {
+                        (e.message ?: "Couldn't subscribe to that.") to true
+                    }
+                    busy = false
+                }
+            }
+        ) {
+            if (busy) CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
+            else Text("Subscribe")
+        }
+        if (!feeds.isNullOrEmpty()) {
+            OutlinedButton(
+                enabled = !busy,
+                onClick = {
+                    scope.launch {
+                        busy = true
+                        message = "Checking…" to false
+                        message = try {
+                            val n = app.apiClient.checkFeeds()
+                            reload()
+                            (if (n > 0) "$n new episode(s) — transcribing now; they'll sync in shortly."
+                            else "Nothing new.") to false
+                        } catch (e: Exception) {
+                            "Check failed: ${e.message ?: "unknown error"}" to true
+                        }
+                        busy = false
+                    }
+                }
+            ) { Text("Check now") }
+        }
+    }
+    message?.let { (text, isError) ->
+        Text(
+            text,
+            style = MaterialTheme.typography.bodyMedium,
+            color = if (isError) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary
+        )
+    }
+    loadError?.let {
+        Text(it, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error)
+    }
+    val list = feeds
+    if (list != null && list.isEmpty()) {
+        Text(
+            "No subscriptions yet.",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+    }
+    list?.forEach { feed ->
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Column(modifier = Modifier.weight(1f)) {
+                Text(feed.title, style = MaterialTheme.typography.bodyLarge)
+                val status = buildString {
+                    append(if (feed.episodes > 0) "${feed.episodes} episode${if (feed.episodes == 1) "" else "s"}" else "nothing yet")
+                    append(" · ")
+                    append(
+                        when {
+                            feed.lastError != null -> feed.lastError
+                            feed.lastCheckedAt != null -> "checked " + android.text.format.DateUtils
+                                .getRelativeTimeSpanString(feed.lastCheckedAt)
+                            else -> "not checked yet"
+                        }
+                    )
+                }
+                Text(
+                    status,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = if (feed.lastError != null) MaterialTheme.colorScheme.error
+                    else MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+            TextButton(
+                enabled = !busy,
+                onClick = {
+                    scope.launch {
+                        try {
+                            app.apiClient.deleteFeed(feed.id)
+                            feeds = feeds?.filterNot { it.id == feed.id }
+                        } catch (e: Exception) {
+                            snackbarHostState.showSnackbar("Couldn't unsubscribe: ${e.message}")
+                        }
+                    }
+                }
+            ) { Text("Unsubscribe") }
         }
     }
 }
