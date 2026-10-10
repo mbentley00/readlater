@@ -198,6 +198,10 @@ article.reader img { max-width:100%; height:auto; }
 body.reading main { max-width: var(--read-width, 46rem); }
 article.reader .content { overflow-wrap:break-word; font-family:var(--read-family, Georgia, 'Times New Roman', serif); font-size:var(--read-size, 16px); line-height:var(--read-lead, 1.6); }
 article.reader h1 { font-family:var(--read-family, Georgia, 'Times New Roman', serif); }
+/* A podcast's ad breaks (transcribe.js marks them): kept, since the words are
+   the transcript, but set apart so the eye can skip them as the app's player does. */
+article.reader .content p[data-ad-end] { opacity:.5; font-size:.9em; border-left:3px solid var(--line); padding-left:.7rem; }
+article.reader .content p[data-ad-end]::before { content:'AD'; font:600 .65rem system-ui,sans-serif; letter-spacing:.06em; color:var(--muted); margin-right:.5rem; }
 article.reader .content pre { overflow-x:auto; background:var(--card); padding:.8rem; border-radius:8px; font-size:.85rem; }
 article.reader .content blockquote { border-left:3px solid var(--line); margin-left:0; padding-left:1rem; color:var(--muted); }
 mark[data-hl], mark[data-hl-id] { background:var(--mark); color:inherit; padding:0 .1em; margin:0 -.1em; border-radius:2px; }

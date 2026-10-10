@@ -15,6 +15,7 @@ import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.TextLayoutResult
 import androidx.compose.foundation.interaction.DragInteraction
 import androidx.compose.foundation.layout.Arrangement
@@ -104,6 +105,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
@@ -697,6 +699,7 @@ fun ReaderScreen(articleId: String, onBack: () -> Unit, onOpenArticle: (String) 
                                         }
                                     }
                                 )
+                                ShareMenuItems(a, repo, scope, snackbarHostState) { menuOpen = false }
                                 DropdownMenuItem(
                                     text = { Text("Report bad parse") },
                                     leadingIcon = {
@@ -1360,17 +1363,21 @@ private fun BlockItem(
             onTap = onTap
         )
 
-        is Block.Paragraph -> HighlightableText(
-            text = block.text,
-            isQuote = false,
-            paraHighlights = paraHighlights,
-            searchQuery = searchQuery,
-            isSpoken = isSpoken,
-            selRange = selRange,
-            onDoubleTap = onDoubleTap,
-            onWordSelect = onWordSelect,
-            onTap = onTap
-        )
+        // An episode's ad break stays in the transcript, faded so the eye can
+        // pass over it as the player does.
+        is Block.Paragraph -> Box(Modifier.alpha(if (block.adEndSec != null) 0.45f else 1f)) {
+            HighlightableText(
+                text = block.text,
+                isQuote = false,
+                paraHighlights = paraHighlights,
+                searchQuery = searchQuery,
+                isSpoken = isSpoken,
+                selRange = selRange,
+                onDoubleTap = onDoubleTap,
+                onWordSelect = onWordSelect,
+                onTap = onTap
+            )
+        }
 
         is Block.Quote -> HighlightableText(
             text = block.text,

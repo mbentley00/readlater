@@ -1292,6 +1292,22 @@ async function main() {
     r = await api('POST', '/api/feeds/check');
     assert.strictEqual(r.body.episodes, 0, 'a second check takes nothing again');
 
+    // The server keeps the very bytes it transcribed, for the phone to play:
+    // a host stitches different ads into each download, so a copy of its own
+    // would not match the transcript's times.
+    const epUrl = `${BASE}/api/articles/${episodeArticle.id}/episode`;
+    const auth = { Authorization: `Bearer ${TOKEN}` };
+    let epResp = await fetch(epUrl, { headers: auth });
+    assert.strictEqual(epResp.status, 200, 'the transcribed episode is served');
+    assert.strictEqual(epResp.headers.get('content-type'), 'audio/mpeg');
+    assert.ok(Buffer.from(await epResp.arrayBuffer()).equals(episode2), 'byte for byte what was transcribed');
+    epResp = await fetch(epUrl, { headers: { ...auth, Range: 'bytes=3-9' } });
+    assert.strictEqual(epResp.status, 206, 'with ranges');
+    assert.ok(Buffer.from(await epResp.arrayBuffer()).equals(episode2.subarray(3, 10)));
+    r = await api('PATCH', `/api/articles/${episodeArticle.id}`, { archived: true });
+    epResp = await fetch(epUrl, { headers: auth });
+    assert.strictEqual(epResp.status, 404, 'archiving the episode lets its audio go');
+
     r = await api('GET', '/api/feeds');
     assert.strictEqual(r.body.feeds.length, 1, 'the subscription is listed');
     assert.strictEqual(r.body.feeds[0].episodes, 1, 'with what it has brought in');
@@ -2171,6 +2187,36 @@ function testTranscriptShaping() {
   assert.strictEqual(paragraphsToHtml([{ text: 'A < B', start: 12.345 }, { text: 'untimed', start: null }]),
     '<p data-t="12.35">A &lt; B</p>\n<p>untimed</p>');
   assert.ok(segmentsToTimedParagraphs([{ text: 'No times here.' }]).every((p) => p.start == null), 'untimed text stays untimed');
+
+  // Chosen breaks (the model's): honoured, and PARA_MAX still caps a paragraph.
+  const { sentencesToParagraphsAt, adSpans, sentencesFromTranscriptHtml, PARA_MAX: CAP } = require('./transcribe');
+  const sents = Array.from({ length: 40 }, (_, i) => ({ text: sentence(i), start: i * 10 }));
+  const at = sentencesToParagraphsAt(sents, new Set([0, 3, 4]));
+  assert.deepStrictEqual(at.slice(0, 2).map((p) => p.first), [0, 3], 'breaks fall where chosen');
+  assert.strictEqual(at[1].text, sents[3].text, 'a one-sentence turn is its own paragraph');
+  assert.ok(at.length > 3 && at.every((p) => p.text.length <= CAP), 'no chosen break past 4 still caps length');
+
+  // Ads: start to the start of what follows; touching spots joined; under 30 s dropped.
+  let spans = adSpans(sents, [{ first: 5, last: 7, what: 'A' }, { first: 8, last: 9, what: 'B' }], 400);
+  assert.deepStrictEqual(spans.map((s) => [s.first, s.last, s.startS, s.endS]), [[5, 9, 50, 100]], 'adjacent ads are one break');
+  assert.strictEqual(adSpans(sents, [{ first: 5, last: 6 }], 400).length, 0, 'a 20 s "ad" is not skipped');
+  assert.strictEqual(adSpans(sents, [{ first: 5, last: 7 }], 400).length, 1, 'a 30 s ad is');
+  spans = adSpans(sents, [{ first: 0, last: 2 }, { first: 37, last: 39 }], 425);
+  assert.deepStrictEqual(spans.map((s) => [s.startS, s.endS]), [[0, 30], [370, 425]], 'pre-roll from 0, post-roll to the end');
+  assert.strictEqual(adSpans(sents.map((s) => ({ ...s, start: null })), [{ first: 5, last: 9 }], null).length, 0,
+    'untimed transcripts mark no ads');
+
+  // Ad paragraphs carry where their break ends, and the audio length.
+  assert.strictEqual(paragraphsToHtml([{ text: 'Buy socks.', start: 50, adEnd: 100 }], 400),
+    '<p data-t="50.00" data-ad-end="100.00" data-dur="400.00">Buy socks.</p>');
+
+  // An old transcript back into timed sentences, words untouched.
+  const back = sentencesFromTranscriptHtml('<p data-t="0.00">One here. Two &amp; three.</p>\n<p data-t="20.00">Four.</p>', 30);
+  assert.deepStrictEqual(back.sentences.map((s) => s.text), ['One here.', 'Two & three.', 'Four.']);
+  assert.strictEqual(back.sentences[0].start, 0);
+  assert.ok(back.sentences[1].start > 5 && back.sentences[1].start < 15, 'second sentence timed by its place in the paragraph');
+  assert.strictEqual(back.sentences[2].start, 20);
+  assert.strictEqual(sentencesFromTranscriptHtml('<p data-t="0">x.</p><p>untimed.</p>'), null, 'needs every paragraph timed');
 
   // Titles: embedded tags win; an episode id is no title; a real filename is.
   assert.deepStrictEqual(audioMeta('45e41c9b-f365-4349-b5f6-9ce130ede034.mp3',

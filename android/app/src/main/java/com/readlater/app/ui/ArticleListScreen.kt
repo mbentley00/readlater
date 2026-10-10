@@ -115,6 +115,11 @@ enum class SortMode(val label: String) {
 fun readingMinutes(wordCount: Int): Int =
     if (wordCount <= 0) 0 else max(1, (wordCount / 225.0).roundToInt())
 
+/** A podcast episode: from a subscribed feed (it has audio to fetch), or
+ *  shared out of a player (the server names those by the audio's hash). */
+private fun ArticleEntity.isPodcast(): Boolean =
+    audioUrl != null || url.startsWith(com.readlater.app.data.PodcastFiles.URL_PREFIX)
+
 /** Local evaluation of a server-defined saved view. `q` matches title/excerpt only. */
 private fun matchesView(a: ArticleEntity, v: RemoteView, highlightCount: Int): Boolean {
     if (!v.includeArchived && a.archived) return false
@@ -155,6 +160,11 @@ fun ArticleListScreen(
     // The Problems tab: saves the server flagged as not having worked. They are
     // absent from Inbox and Archive, so this is the only place they show up.
     var showProblems by rememberSaveable { mutableStateOf(false) }
+    // The Podcasts tab: unarchived episodes, kept out of the Inbox so an hour
+    // of audio doesn't sit among the articles. A setting puts them back.
+    var showPodcasts by rememberSaveable { mutableStateOf(false) }
+    val podcastsTab = remember { app.settings.podcastsTab }
+    val onPodcasts = podcastsTab && showPodcasts
     var selectedViewId by rememberSaveable { mutableStateOf<String?>(null) }
     var views by remember { mutableStateOf(repo.cachedViews()) }
     val selectedView = remember(views, selectedViewId) { views.firstOrNull { it.id == selectedViewId } }
@@ -167,6 +177,7 @@ fun ArticleListScreen(
         when {
             selectedView != null || searchActive -> repo.allArticles()
             showProblems -> repo.problemArticles()
+            // Inbox and Podcasts share these rows; `articles` splits them.
             else -> repo.articles(showArchived)
         }
     }.collectAsState(initial = emptyList())
@@ -204,11 +215,13 @@ fun ArticleListScreen(
     var inboxCount by remember { mutableStateOf<Int?>(null) }
     var archiveCount by remember { mutableStateOf<Int?>(null) }
     var problemCount by remember { mutableStateOf<Int?>(null) }
+    var podcastCount by remember { mutableStateOf<Int?>(null) }
     var viewCounts by remember { mutableStateOf<Map<String, Int>>(emptyMap()) }
     LaunchedEffect(views, syncing) {
         if (syncing) return@LaunchedEffect // recount once it settles, not mid-write
         runCatching { repo.articlesForCounting() }.onSuccess { (all, hl) ->
-            inboxCount = all.count { !it.archived && !it.problem }
+            inboxCount = all.count { !it.archived && !it.problem && !(podcastsTab && it.isPodcast()) }
+            podcastCount = all.count { !it.archived && !it.problem && it.isPodcast() }
             archiveCount = all.count { it.archived }
             problemCount = all.count { it.problem && !it.archived }
             viewCounts = views.associate { v ->
@@ -225,12 +238,14 @@ fun ArticleListScreen(
         }.groupingBy { it }.eachCount().entries.sortedByDescending { it.value }.take(15).map { it.key }
     }
 
-    val articles = remember(unsorted, sortMode, selectedView, hlCounts, searchQuery, searchActive, shuffleSeed, showArchived) {
+    val articles = remember(unsorted, sortMode, selectedView, hlCounts, searchQuery, searchActive, shuffleSeed, showArchived, onPodcasts) {
         val counts = hlCounts.associate { it.articleId to it.n }
         val view = selectedView
-        var filtered = if (view != null) {
-            unsorted.filter { matchesView(it, view, counts[it.id] ?: 0) }
-        } else unsorted
+        var filtered = when {
+            view != null -> unsorted.filter { matchesView(it, view, counts[it.id] ?: 0) }
+            searchActive || showArchived || showProblems || !podcastsTab -> unsorted
+            else -> unsorted.filter { it.isPodcast() == onPodcasts }
+        }
         val q = searchQuery.trim()
         if (searchActive && q.length < 2) {
             filtered = emptyList() // waiting for a query
@@ -497,13 +512,20 @@ fun ArticleListScreen(
                 horizontalArrangement = Arrangement.spacedBy(8.dp)
             ) {
                 FilterChip(
-                    selected = !showArchived && !showProblems && selectedView == null,
-                    onClick = { showArchived = false; showProblems = false; selectedViewId = null },
+                    selected = !showArchived && !showProblems && !onPodcasts && selectedView == null,
+                    onClick = { showArchived = false; showProblems = false; showPodcasts = false; selectedViewId = null },
                     label = { Text(chipLabel("Inbox", inboxCount), maxLines = 1) }
                 )
+                if (podcastsTab) {
+                    FilterChip(
+                        selected = onPodcasts && selectedView == null,
+                        onClick = { showPodcasts = true; showArchived = false; showProblems = false; selectedViewId = null },
+                        label = { Text(chipLabel("Podcasts", podcastCount), maxLines = 1) }
+                    )
+                }
                 FilterChip(
                     selected = showArchived && selectedView == null,
-                    onClick = { showArchived = true; showProblems = false; selectedViewId = null },
+                    onClick = { showArchived = true; showProblems = false; showPodcasts = false; selectedViewId = null },
                     label = { Text(chipLabel("Archive", archiveCount), maxLines = 1) }
                 )
                 // Hidden until there is something in it — an empty Problems tab
@@ -511,7 +533,7 @@ fun ArticleListScreen(
                 if ((problemCount ?: 0) > 0 || showProblems) {
                     FilterChip(
                         selected = showProblems && selectedView == null,
-                        onClick = { showProblems = true; showArchived = false; selectedViewId = null },
+                        onClick = { showProblems = true; showArchived = false; showPodcasts = false; selectedViewId = null },
                         label = { Text(chipLabel("Problems", problemCount), maxLines = 1) }
                     )
                 }
@@ -567,12 +589,19 @@ fun ArticleListScreen(
                 ) {
                     Column(horizontalAlignment = Alignment.CenterHorizontally) {
                         Text(
-                            text = if (showArchived) "No archived articles" else "Your inbox is empty",
+                            text = when {
+                                showArchived -> "No archived articles"
+                                onPodcasts -> "No podcast episodes"
+                                else -> "Your inbox is empty"
+                            },
                             style = MaterialTheme.typography.titleMedium
                         )
                         Spacer(modifier = Modifier.size(8.dp))
                         Text(
-                            text = "Save articles with the ReadLater Firefox extension, " +
+                            text = if (onPodcasts)
+                                "Share an episode here from your podcast player, or subscribe " +
+                                    "to a feed in Settings."
+                            else "Save articles with the ReadLater Firefox extension, " +
                                 "then tap refresh to sync them here.",
                             style = MaterialTheme.typography.bodyMedium,
                             textAlign = TextAlign.Center,
@@ -589,7 +618,8 @@ fun ArticleListScreen(
                             onOpen = { openArticle(article.id) },
                             onToggleArchive = { repo.toggleArchive(article) },
                             onToggleFavorite = { repo.toggleFavorite(article) },
-                            onDelete = { repo.deleteArticle(article) }
+                            onDelete = { repo.deleteArticle(article) },
+                            shareItems = { close -> ShareMenuItems(article, repo, scope, snackbarHostState, close) }
                         )
                     }
                 }
@@ -641,7 +671,8 @@ private fun ArticleCard(
     onOpen: () -> Unit,
     onToggleArchive: () -> Unit,
     onToggleFavorite: () -> Unit,
-    onDelete: () -> Unit
+    onDelete: () -> Unit,
+    shareItems: @Composable (closeMenu: () -> Unit) -> Unit
 ) {
     var menuOpen by remember { mutableStateOf(false) }
     val unread = article.readParagraph == 0 && article.ttsParagraph == 0
@@ -688,6 +719,7 @@ private fun ArticleCard(
                         leadingIcon = { Icon(if (article.favorite) Icons.Filled.Star else Icons.Filled.StarBorder, null) },
                         onClick = { menuOpen = false; onToggleFavorite() }
                     )
+                    shareItems { menuOpen = false }
                     DropdownMenuItem(
                         text = { Text("Delete") },
                         leadingIcon = { Icon(Icons.Filled.Delete, null) },

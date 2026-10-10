@@ -49,6 +49,22 @@ class Settings(context: Context) {
             prefs.edit().putFloat(KEY_PODCAST_SPEED, value.coerceIn(0.5f, 3.0f)).apply()
         }
 
+    /** Jump over the ad breaks the server marked in an episode's transcript,
+     *  and leave them out when a voice reads the transcript instead. */
+    var skipPodcastAds: Boolean
+        get() = prefs.getBoolean(KEY_SKIP_PODCAST_ADS, true)
+        set(value) {
+            prefs.edit().putBoolean(KEY_SKIP_PODCAST_ADS, value).apply()
+        }
+
+    /** List podcast episodes under their own Podcasts tab instead of in the
+     *  Inbox. Archive, search and saved views still show everything. */
+    var podcastsTab: Boolean
+        get() = prefs.getBoolean(KEY_PODCASTS_TAB, true)
+        set(value) {
+            prefs.edit().putBoolean(KEY_PODCASTS_TAB, value).apply()
+        }
+
     /** Article list sort order (name of a SortMode enum value). */
     var listSort: String
         get() = prefs.getString(KEY_LIST_SORT, "NEWEST").orEmpty()
@@ -112,6 +128,8 @@ class Settings(context: Context) {
         const val KEY_TTS_RATE = "tts_speech_rate"
         const val KEY_SERVER_RATE = "server_speech_rate"
         const val KEY_PODCAST_SPEED = "podcast_speed"
+        const val KEY_SKIP_PODCAST_ADS = "skip_podcast_ads"
+        const val KEY_PODCASTS_TAB = "podcasts_tab"
         const val KEY_CACHED_VIEWS = "cached_views_json"
         const val KEY_LIST_SORT = "list_sort"
         const val KEY_LAST_ARTICLE = "last_article_id"

@@ -10,8 +10,17 @@ import org.jsoup.nodes.Element
  */
 sealed class Block {
     /** [startSec]: where this paragraph starts in the episode audio, for a
-     *  podcast transcript (the server's data-t attribute); null otherwise. */
-    data class Paragraph(val text: String, val startSec: Double? = null) : Block()
+     *  podcast transcript (the server's data-t attribute); null otherwise.
+     *  [adEndSec]: set when the paragraph is part of an ad break — where the
+     *  whole break ends (data-ad-end). [audioSec]: how long the audio those
+     *  times were taken from runs (data-dur), so a player holding a different
+     *  cut of the episode can tell the times are not its own. */
+    data class Paragraph(
+        val text: String,
+        val startSec: Double? = null,
+        val adEndSec: Double? = null,
+        val audioSec: Double? = null,
+    ) : Block()
     data class Heading(val text: String, val level: Int) : Block()
     data class Quote(val text: String) : Block()
     data class ImageBlock(val src: String, val alt: String?) : Block()
@@ -109,7 +118,12 @@ object HtmlParser {
         val caption = (inCaption && text.length <= CAPTION_MAX) || isLooseCaption(el, text, blocks.lastOrNull())
         blocks.add(
             if (caption) Block.Caption(text)
-            else Block.Paragraph(text, el.attr("data-t").toDoubleOrNull()?.takeIf { it >= 0 })
+            else Block.Paragraph(
+                text,
+                el.attr("data-t").toDoubleOrNull()?.takeIf { it >= 0 },
+                el.attr("data-ad-end").toDoubleOrNull()?.takeIf { it >= 0 },
+                el.attr("data-dur").toDoubleOrNull()?.takeIf { it > 0 },
+            )
         )
     }
 

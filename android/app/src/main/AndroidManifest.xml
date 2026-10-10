@@ -10,6 +10,10 @@
     </queries>
 
     <uses-permission android:name="android.permission.INTERNET" />
+    <!-- isActiveNetworkMetered (an episode waits for unmetered Wi-Fi before
+         it downloads) throws without this, which crashed play on any feed
+         episode not yet on the phone. -->
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <!-- Ask to be exempt from battery optimization so playback isn't killed. -->
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />

@@ -398,6 +398,38 @@ fun SettingsScreen(onBack: () -> Unit) {
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
+            var skipAds by remember { mutableStateOf(settings.skipPodcastAds) }
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Column(modifier = Modifier.weight(1f)) {
+                    Text("Skip ad breaks", style = MaterialTheme.typography.bodyLarge)
+                    Text(
+                        "Jumps over the sponsor reads and ad breaks found in an episode's " +
+                            "transcript (30 seconds or longer). Takes effect the next time an episode starts.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+                Switch(checked = skipAds, onCheckedChange = {
+                    skipAds = it
+                    settings.skipPodcastAds = it
+                })
+            }
+            var podcastsTab by remember { mutableStateOf(settings.podcastsTab) }
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Column(modifier = Modifier.weight(1f)) {
+                    Text("Podcasts tab", style = MaterialTheme.typography.bodyLarge)
+                    Text(
+                        "Lists episodes under their own tab instead of in the Inbox. " +
+                            "Archive and search still include them.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+                Switch(checked = podcastsTab, onCheckedChange = {
+                    podcastsTab = it
+                    settings.podcastsTab = it
+                })
+            }
 
             HorizontalDivider()
 

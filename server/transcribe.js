@@ -222,15 +222,169 @@ const segmentsToTimedParagraphs = (segments) => sentencesToParagraphs(segmentsTo
 const segmentsToParagraphs = (segments) => segmentsToTimedParagraphs(segments).map((p) => p.text);
 
 /**
+ * Group sentences into paragraphs at chosen breaks: [starts] holds the indices
+ * of sentences that open one. PARA_MAX still holds, so a break the chooser
+ * missed can't leave a wall of text. Each paragraph remembers its first
+ * sentence, which is how ad spans find their paragraphs.
+ */
+function sentencesToParagraphsAt(sentences, starts) {
+  const paras = [];
+  let cur = null;
+  sentences.forEach((s, i) => {
+    // Whisper's leftovers around music (".", "...") are no paragraph of their own.
+    const bare = !/[\p{L}\p{N}]/u.test(s.text);
+    if (cur && !bare && (starts.has(i) || cur.text.length + 1 + s.text.length > PARA_MAX)) {
+      paras.push(cur);
+      cur = null;
+    }
+    if (cur) cur.text += ` ${s.text}`;
+    else cur = { text: s.text, start: s.start ?? null, first: i };
+  });
+  if (cur) paras.push(cur);
+  return paras;
+}
+
+/** No podcast runs an ad shorter than this; anything shorter that was flagged
+ *  is the model mistaking a mention for a pitch, and skipping it would cut
+ *  the show itself. */
+const MIN_AD_S = 30;
+/** Two ads with less than this between them are one break (the "and now a
+ *  word from…" between two sponsors), so they are judged as one length. */
+const AD_JOIN_GAP_S = 5;
+
+/**
+ * Ad spans as sentence ranges plus where they sit in the audio. An ad runs
+ * from its first sentence's start to the start of whatever follows it — the
+ * jingle or silence after the last word is part of the break — or to the end
+ * of the episode. One at the very top starts at 0, taking the intro sting with
+ * it. Spans that touch are joined before the length rule is applied, so a
+ * break made of two short spots is kept whole. Untimed transcripts get none:
+ * there is nothing to skip by.
+ */
+function adSpans(sentences, ads, durationS) {
+  const startOf = (i) => (i === 0 ? 0 : sentences[i].start);
+  const endOf = (last) => (last + 1 < sentences.length ? sentences[last + 1].start : durationS);
+  const merged = [];
+  for (const a of [...ads].sort((x, y) => x.first - y.first)) {
+    const prev = merged[merged.length - 1];
+    const gap = prev && startOf(a.first) != null && endOf(prev.last) != null
+      ? startOf(a.first) - endOf(prev.last) : Infinity;
+    if (prev && (a.first <= prev.last + 1 || gap < AD_JOIN_GAP_S)) {
+      prev.last = Math.max(prev.last, a.last);
+      if (a.what && !prev.what.includes(a.what)) prev.what += `; ${a.what}`;
+    } else {
+      merged.push({ first: a.first, last: a.last, what: a.what || '' });
+    }
+  }
+  return merged
+    .map((a) => ({ ...a, startS: startOf(a.first), endS: endOf(a.last) }))
+    .filter((a) => typeof a.startS === 'number' && typeof a.endS === 'number'
+      && a.endS - a.startS >= MIN_AD_S);
+}
+
+/**
+ * Sentences → paragraphs, plus the ads among them. The model chooses the
+ * breaks (speaker changes, new points) and finds the ads; without it, breaks
+ * fall on pauses as before and nothing is marked. Every ad begins and ends on
+ * a paragraph boundary, so a paragraph is all ad or none, and each ad
+ * paragraph carries adEnd: where the break is over, which is where the app
+ * jumps to.
+ */
+async function structureSentences(sentences, durationS) {
+  const s = await require('./llm').structureTranscript(sentences);
+  if (!s) return { paras: sentencesToParagraphs(sentences), ads: [] };
+  const ads = adSpans(sentences, s.ads, durationS);
+  for (const a of ads) {
+    s.starts.add(a.first);
+    if (a.last + 1 < sentences.length) s.starts.add(a.last + 1);
+  }
+  const paras = sentencesToParagraphsAt(sentences, s.starts);
+  for (const p of paras) {
+    const ad = ads.find((a) => p.first >= a.first && p.first <= a.last);
+    if (ad) p.adEnd = ad.endS;
+  }
+  return { paras, ads };
+}
+
+/**
  * Transcript paragraphs → article HTML. Each timed paragraph carries its start
  * in the audio as data-t (seconds), which is how the app plays the episode in
  * step with the text. An attribute rather than a side table: skip rules delete
  * paragraphs from the stored HTML, and the survivors keep their own times.
+ *
+ * Ad paragraphs also carry data-ad-end, the end of their whole break, for the
+ * same reason — any one survivor is enough to skip the break by — and
+ * data-dur, the length of the audio the times were taken from, so a player
+ * holding a different cut of the episode (hosts stitch ads per download) can
+ * tell that the times are not its own.
  */
-function paragraphsToHtml(paras) {
-  return paras.map((p) => (p.start == null
-    ? `<p>${escapeText(p.text)}</p>`
-    : `<p data-t="${Math.max(0, p.start).toFixed(2)}">${escapeText(p.text)}</p>`)).join('\n');
+function paragraphsToHtml(paras, durationS) {
+  const dur = typeof durationS === 'number' ? ` data-dur="${durationS.toFixed(2)}"` : '';
+  return paras.map((p) => {
+    if (p.start == null) return `<p>${escapeText(p.text)}</p>`;
+    const ad = typeof p.adEnd === 'number' ? ` data-ad-end="${p.adEnd.toFixed(2)}"${dur}` : '';
+    return `<p data-t="${Math.max(0, p.start).toFixed(2)}"${ad}>${escapeText(p.text)}</p>`;
+  }).join('\n');
+}
+
+const unescapeText = (s) => String(s).replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&');
+
+/**
+ * Sentences back out of a stored transcript, for re-structuring one whose
+ * audio is long gone. Only paragraph starts survive, so each sentence is timed
+ * by where its text falls between its paragraph's start and the next one's —
+ * within a few seconds, which is close enough for a paragraph break and for
+ * an ad that runs half a minute or more. The last paragraph's end comes from
+ * [durationS], or failing that from the transcript's own pace. Null unless
+ * every paragraph is timed.
+ */
+function sentencesFromTranscriptHtml(html, durationS) {
+  const paras = [...String(html || '').matchAll(/<p\b([^>]*)>([\s\S]*?)<\/p>/g)].map((m) => ({
+    start: parseFloat((m[1].match(/data-t="([\d.]+)"/) || [])[1]),
+    text: unescapeText(m[2].replace(/<[^>]+>/g, '')).replace(/\s+/g, ' ').trim(),
+  })).filter((p) => p.text);
+  if (!paras.length || paras.some((p) => Number.isNaN(p.start))) return null;
+  const last = paras[paras.length - 1];
+  const before = paras.slice(0, -1).reduce((n, p) => n + p.text.length, 0);
+  const span = last.start - paras[0].start;
+  const pace = before > 0 && span > 0 ? before / span : 15; // chars per second
+  const end = typeof durationS === 'number' && durationS > last.start
+    ? durationS : last.start + last.text.length / pace;
+  const out = [];
+  paras.forEach((p, i) => {
+    const next = i + 1 < paras.length ? paras[i + 1].start : end;
+    const pieces = p.text.match(/[^.!?…]*[.!?…]+["'”’)\]]*\s*|[^.!?…]+$/g) || [p.text];
+    let chars = 0;
+    let pending = null; // pieces stitched back across "L. L. Bean" / "Dr."
+    for (const raw of pieces) {
+      const text = raw.trim();
+      if (text) {
+        if (pending) pending.text += ` ${text}`;
+        else pending = { text, pause: 0, start: p.start + (next - p.start) * (chars / p.text.length) };
+        if (endsSentence(pending.text)) { out.push(pending); pending = null; }
+      }
+      chars += raw.length;
+    }
+    if (pending) out.push(pending);
+  });
+  return { sentences: out, durationS: end };
+}
+
+/**
+ * Re-paragraph a stored transcript and find its ads ("Fix parsing" on an
+ * episode). The words are left exactly as they are — only where paragraphs
+ * break, and which are ads, changes — so highlights still find their text.
+ * Null when the transcript has no times to work from or the model is off.
+ */
+async function restructureTranscriptHtml(html, durationS) {
+  const parsed = sentencesFromTranscriptHtml(html, durationS);
+  if (!parsed || !require('./llm').enabled()) return null;
+  const { paras, ads } = await structureSentences(parsed.sentences, parsed.durationS);
+  return {
+    html: paragraphsToHtml(paras, typeof durationS === 'number' ? durationS : null),
+    textContent: paras.map((p) => p.text).join(' '),
+    ads,
+  };
 }
 
 /** Fallback when the provider returns plain text without segments: the same
@@ -260,18 +414,21 @@ async function transcribeToArticle(buf, filename) {
     throw new Error(`transcription api ${resp.status}: ${(await resp.text()).slice(0, 200)}`);
   }
   const data = await resp.json();
-  const paras = Array.isArray(data.segments) && data.segments.length
-    ? segmentsToTimedParagraphs(data.segments)
-    : segmentsToTimedParagraphs([{ text: data.text }]);
-  if (!paras.length) throw new Error('no speech found in the audio');
+  const durationS = typeof data.duration === 'number' ? data.duration : null;
+  const sentences = segmentsToSentences(Array.isArray(data.segments) && data.segments.length
+    ? data.segments : [{ text: data.text }]);
+  if (!sentences.length) throw new Error('no speech found in the audio');
+  const { paras, ads } = await structureSentences(sentences, durationS);
   return {
-    html: paragraphsToHtml(paras),
+    html: paragraphsToHtml(paras, durationS),
     textContent: paras.map((p) => p.text).join(' '),
-    durationS: typeof data.duration === 'number' ? data.duration : null,
+    durationS,
+    ads,
   };
 }
 
 module.exports = {
   enabled, transcribeToArticle, probeTags, audioMeta, PLACEHOLDER_TITLE,
   segmentsToParagraphs, segmentsToTimedParagraphs, paragraphsToHtml, textToParagraphs, PARA_MAX,
+  sentencesToParagraphsAt, adSpans, sentencesFromTranscriptHtml, restructureTranscriptHtml, MIN_AD_S,
 };

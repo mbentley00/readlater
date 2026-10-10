@@ -552,12 +552,20 @@ function ftsMatch(q) {
   const terms = parseQueryTerms(q);
   if (!terms.length) return null;
   const args = {};
+  // One rowid set per term, the highlight matches converted to article rowids
+  // inside it. This used to be `rowid IN (…) OR id IN (…)`, and the OR made
+  // SQLite test every one of the user's articles — reading each one's table
+  // row to get its id, because id isn't in the userId indexes. With everything
+  // as a rowid set the indexes answer it alone (rowid rides along in every
+  // index entry), so a search no longer reads the whole articles table off the
+  // disk: on the 512 MB machine, where it can't stay cached, that took tens of
+  // seconds and stalled every other request behind it.
   const clause = terms.map((t, i) => {
     const k = `match${i}`;
     args[k] = ftsExpr(t);
-    return `(a.rowid IN (SELECT rowid FROM articles_fts WHERE articles_fts MATCH @${k})
-      OR a.id IN (SELECT hq.articleId FROM highlights hq
-                  WHERE hq.rowid IN (SELECT rowid FROM highlights_fts WHERE highlights_fts MATCH @${k})))`;
+    return `a.rowid IN (SELECT rowid FROM articles_fts WHERE articles_fts MATCH @${k}
+      UNION SELECT a2.rowid FROM highlights hq JOIN articles a2 ON a2.id = hq.articleId
+            WHERE hq.rowid IN (SELECT rowid FROM highlights_fts WHERE highlights_fts MATCH @${k}))`;
   }).join(' AND ');
   return { clause, args };
 }
@@ -893,6 +901,9 @@ function open(dataDir) {
 
     // ---------------- articles
     articleCount: (userId) => prep('ac', 'SELECT COUNT(*) c FROM articles WHERE userId = ?').get(userId).c,
+    /** Owner and archived flag by id alone, for sweeping files kept per
+     *  article. Both sit ahead of the content blobs. Undefined if gone. */
+    articleState: (id) => prep('ast', 'SELECT userId, archived FROM articles WHERE id = ?').get(id),
     getArticle: (id, userId) =>
       rowArticle(prep('ag', `SELECT ${ARTICLE_COLS} FROM articles WHERE id = ? AND userId = ?`).get(id, userId)),
     /** Raw captured source for reparse / "view original". Returns '' when none. */
@@ -1110,11 +1121,14 @@ function open(dataDir) {
       // inner query touches only id plus the sort key (savedAt and the FTS
       // rowids are early/indexed), so the overflow reads drop from "every match"
       // to "the fifty rows actually shown".
+      // The page is picked by rowid, not id: rowid is in every index entry and
+      // id is not, so when the filters and sort are indexed the inner query
+      // never opens a table row at all.
       return sqlite.prepare(`WITH page AS (
-          SELECT a.id AS id FROM articles a
+          SELECT a.rowid AS rid FROM articles a
           WHERE ${where.join(' AND ')} ORDER BY ${order} LIMIT @limit OFFSET @offset
         )
-        SELECT ${cols} FROM articles a JOIN page ON page.id = a.id ORDER BY ${order}`)
+        SELECT ${cols} FROM articles a JOIN page ON page.rid = a.rowid ORDER BY ${order}`)
         .all(args).map(rowArticle);
     },
 

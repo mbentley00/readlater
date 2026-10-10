@@ -244,9 +244,114 @@ async function saveFeedEpisode({ feed, item, buf }) {
   store.insertArticle(a);
   store.setArticleAudioUrl(id, item.url, item.durationS);
   store.markFeedItemSeen(feed.id, item.guid, id);
+  keepEpisode(id, item.url, buf);
   console.log(`article saved [podcast-feed] "${a.title}" from ${a.siteName} (${buf.length} bytes, transcribing)`);
   enqueueTranscription(id, feed.userId, `${a.title}.mp3`);
   return a;
+}
+
+/** Stream a file, honouring a single Range request (for seeking). */
+function sendFileRange(req, res, file, mime) {
+  const size = fs.statSync(file).size;
+  const range = req.headers.range;
+  if (range) {
+    const m = /bytes=(\d+)-(\d*)/.exec(range);
+    const start = m ? parseInt(m[1], 10) : 0;
+    const end = m && m[2] ? parseInt(m[2], 10) : size - 1;
+    res.writeHead(206, {
+      'Content-Type': mime,
+      'Content-Range': `bytes ${start}-${end}/${size}`,
+      'Accept-Ranges': 'bytes',
+      'Content-Length': end - start + 1,
+    });
+    return fs.createReadStream(file, { start, end }).pipe(res);
+  }
+  res.writeHead(200, { 'Content-Type': mime, 'Content-Length': size, 'Accept-Ranges': 'bytes' });
+  return fs.createReadStream(file).pipe(res);
+}
+
+// ------------------------------------------------------- kept feed episodes
+// The exact audio a feed episode was transcribed from, kept so the phone plays
+// THIS copy. Hosts stitch different ads into every download, so a copy the
+// phone fetched for itself had its ad breaks in other places and other
+// lengths: the transcript's times (and the ad skips) drifted further off at
+// each break. A copy named by the article's `audio:` hash is the same bytes.
+//
+// Episodes are tens of MB on a shared volume, so they are held only while
+// wanted: until the article is archived or deleted, for EPISODE_KEEP_MS at
+// most, within EPISODE_DIR_MAX_BYTES (oldest dropped first), and not at all
+// when the disk is getting full. A phone that finds none falls back to the
+// host's copy.
+const EPISODE_DIR = path.join(DATA_DIR, 'episodes');
+fs.mkdirSync(EPISODE_DIR, { recursive: true });
+const EPISODE_KEEP_MS = 30 * 24 * 60 * 60 * 1000;
+const EPISODE_DIR_MAX_BYTES = 1024 * 1024 * 1024;
+const EPISODE_MIN_FREE_BYTES = 1024 * 1024 * 1024;
+const EPISODE_TYPES = { mp3: 'audio/mpeg', m4a: 'audio/mp4', aac: 'audio/aac', ogg: 'audio/ogg', opus: 'audio/ogg', wav: 'audio/wav' };
+
+const episodeFiles = () => fs.readdirSync(EPISODE_DIR)
+  .filter((f) => /^[\w-]+\.\w+$/.test(f))
+  .map((f) => {
+    const st = fs.statSync(path.join(EPISODE_DIR, f));
+    return { name: f, id: f.slice(0, f.lastIndexOf('.')), size: st.size, mtime: st.mtimeMs };
+  });
+const episodeFile = (id) => {
+  const f = episodeFiles().find((e) => e.id === id);
+  return f ? path.join(EPISODE_DIR, f.name) : '';
+};
+
+function keepEpisode(id, enclosureUrl, buf) {
+  try {
+    sweepEpisodes();
+    let free = Infinity;
+    try { const s = fs.statfsSync(EPISODE_DIR); free = s.bavail * s.bsize; } catch {}
+    if (free - buf.length < EPISODE_MIN_FREE_BYTES) {
+      console.log(`episode ${id} not kept: ${Math.round(free / 1024 / 1024)}MB free`);
+      return;
+    }
+    let ext = 'mp3';
+    try { ext = (new URL(enclosureUrl).pathname.match(/\.(\w{2,4})$/) || [])[1]?.toLowerCase() || 'mp3'; } catch {}
+    if (!EPISODE_TYPES[ext]) ext = 'mp3';
+    fs.writeFileSync(path.join(EPISODE_DIR, `${id}.${ext}`), buf);
+    sweepEpisodes(); // may drop the oldest to stay under the cap
+  } catch (e) {
+    console.error(`episode ${id} not kept: ${e.message}`);
+  }
+}
+
+/** Done with an episode here (archived or deleted): its audio goes now
+ *  rather than at the next sweep. */
+function dropEpisode(id) {
+  const f = episodeFile(id);
+  if (f) { try { fs.unlinkSync(f); } catch {} }
+}
+
+/** Drop episodes nobody will play: archived, deleted, too old, or past the cap. */
+function sweepEpisodes() {
+  let files;
+  try { files = episodeFiles(); } catch { return; }
+  const now = Date.now();
+  const kept = [];
+  for (const f of files) {
+    const st = store.articleState(f.id);
+    if (!st || st.archived || now - f.mtime > EPISODE_KEEP_MS) {
+      try { fs.unlinkSync(path.join(EPISODE_DIR, f.name)); } catch {}
+    } else kept.push(f);
+  }
+  kept.sort((a, b) => b.mtime - a.mtime); // newest first
+  let total = 0;
+  for (const f of kept) {
+    total += f.size;
+    if (total > EPISODE_DIR_MAX_BYTES) { try { fs.unlinkSync(path.join(EPISODE_DIR, f.name)); } catch {} }
+  }
+}
+
+/** ", 2 ads (1:30 Squarespace; 22:10 BetterHelp)" for the log, or "". */
+function describeAds(ads) {
+  if (!ads || !ads.length) return '';
+  const at = (s) => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, '0')}`;
+  return `, ${ads.length} ad${ads.length === 1 ? '' : 's'} (`
+    + ads.map((a) => `${at(a.startS)}–${at(a.endS)} ${a.what}`.trim()).join('; ') + ')';
 }
 
 /** Queue a transcription whose audio the caller has already spooled to
@@ -282,7 +387,7 @@ async function pumpStt() {
           updatedAt: Date.now(),
         }));
         console.log(`article transcribed [audio] ${job.filename}: ${r.textContent.length} chars`
-          + (r.durationS ? ` from ${Math.round(r.durationS / 60)} min` : ''));
+          + (r.durationS ? ` from ${Math.round(r.durationS / 60)} min` : '') + describeAds(r.ads));
       }
     } catch (e) {
       console.error(`transcription failed for ${job.articleId}: ${e.message}`);
@@ -1373,12 +1478,26 @@ const server = http.createServer(async (req, res) => {
           ttsParagraph: b.ttsParagraph,
           updatedAt: Date.now(),
         });
+        if (b.archived === true) dropEpisode(a.id);
         return json(res, 200, pubArticleMeta(store.getArticle(a.id, user.id)));
       }
       if (req.method === 'DELETE') {
         store.deleteArticle(a.id);
+        dropEpisode(a.id);
         return json(res, 200, { ok: true });
       }
+    }
+
+    // ---- GET /api/articles/:id/episode — the feed episode's audio exactly as
+    // transcribed (see keepEpisode). 404 when not kept: the phone then fetches
+    // the host's copy.
+    if (req.method === 'GET' && parts.length === 4 && parts[1] === 'articles' && parts[3] === 'episode') {
+      const a = store.getArticle(parts[2], user.id);
+      if (!a) return json(res, 404, { error: 'article not found' });
+      const file = episodeFile(a.id);
+      if (!file) return json(res, 404, { error: 'episode not kept' });
+      const ext = path.extname(file).slice(1);
+      return sendFileRange(req, res, file, EPISODE_TYPES[ext] || 'application/octet-stream');
     }
 
     // ---- server-synthesized audio for an article
@@ -1404,23 +1523,7 @@ const server = http.createServer(async (req, res) => {
         const ext = parts[3].slice('audio.'.length);
         const file = audioFile(a.id, ext);
         if (!fs.existsSync(file)) return json(res, 404, { error: 'audio not ready' });
-        const mime = ext === 'opus' ? 'audio/ogg' : 'audio/wav';
-        const size = fs.statSync(file).size;
-        const range = req.headers.range;
-        if (range) {
-          const m = /bytes=(\d+)-(\d*)/.exec(range);
-          const start = m ? parseInt(m[1], 10) : 0;
-          const end = m && m[2] ? parseInt(m[2], 10) : size - 1;
-          res.writeHead(206, {
-            'Content-Type': mime,
-            'Content-Range': `bytes ${start}-${end}/${size}`,
-            'Accept-Ranges': 'bytes',
-            'Content-Length': end - start + 1,
-          });
-          return fs.createReadStream(file, { start, end }).pipe(res);
-        }
-        res.writeHead(200, { 'Content-Type': mime, 'Content-Length': size, 'Accept-Ranges': 'bytes' });
-        return fs.createReadStream(file).pipe(res);
+        return sendFileRange(req, res, file, ext === 'opus' ? 'audio/ogg' : 'audio/wav');
       }
 
       // POST .../audio → force (re)generation
@@ -1440,6 +1543,20 @@ const server = http.createServer(async (req, res) => {
       if (!a) return json(res, 404, { error: 'article not found' });
       const b = parseBody(await readBody(req), req.headers['content-type']);
       const hint = ['too-short', 'too-long', 'other'].includes(b.hint) ? b.hint : 'other';
+      // A podcast transcript has no page to re-extract. What goes wrong with
+      // one is where its paragraphs break, so redo those (and find its ads)
+      // from the stored text, keeping every word as it is.
+      if (a.url.startsWith('audio:') && /<p[^>]+data-t=/.test(a.html || '')) {
+        const r = await transcribe.restructureTranscriptHtml(a.html);
+        if (!r) return json(res, 200, { ok: false, reason: 'transcript restructuring is not available' });
+        store.updateArticleContent(a.id, withSkipRules(user.id, {
+          title: a.title, byline: a.byline, siteName: a.siteName, excerpt: a.excerpt,
+          html: r.html, textContent: r.textContent, updatedAt: Date.now(),
+        }, a.url));
+        store.patchArticle(a.id, { readParagraph: 0, ttsParagraph: 0, updatedAt: Date.now() });
+        console.log(`transcript restructured ${a.id} "${a.title}"${describeAds(r.ads)}`);
+        return json(res, 200, { ok: true, method: 'transcript', article: pubArticle(store.getArticle(a.id, user.id)) });
+      }
       const result = await reparse({
         url: a.url,
         title: a.title,
@@ -1987,6 +2104,9 @@ server.listen(PORT, '0.0.0.0', () => {
     console.log(`Email-to-save enabled${INBOUND_DOMAIN ? ` for @${INBOUND_DOMAIN}` : ''} — webhook at /api/inbound-email`);
   }
   feeds.start({ store, onEpisode: saveFeedEpisode, maxBytes: AUDIO_IMPORT_MAX_BYTES });
+  // Archiving happens on every client; catching up hourly is soon enough.
+  sweepEpisodes();
+  setInterval(sweepEpisodes, 60 * 60 * 1000).unref();
   const feedCount = store.listAllFeeds().length;
   if (feedCount) {
     console.log(`feeds: ${feedCount} podcast subscription(s), checked every ${feeds.POLL_INTERVAL_MS / 60000} min`);

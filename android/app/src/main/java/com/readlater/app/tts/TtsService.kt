@@ -491,6 +491,7 @@ class TtsService : Service() {
             }
             acquireWakeLock()
             requestAudioFocus()
+            skipAds = app.settings.skipPodcastAds
             speakableBlocks = blocks.indices.filter { speakableText(blocks[it]) != null }
             // An episode plays as itself — the voices are only for articles
             // with no audio of their own. One shared into the app is already
@@ -498,7 +499,7 @@ class TtsService : Service() {
             // play it.
             val episode = withContext(Dispatchers.IO) {
                 app.podcastFiles.forArticle(article.id, article.url)
-            } ?: downloadEpisode(article)
+            }?.let { replaceHostCopy(article, it) } ?: downloadEpisode(article)
             if (episode != null && startPodcast(episode, article.id)) return@launch
             // Prefer the server (Kokoro) voice when enabled and available;
             // otherwise (incl. not-yet-generated) fall back to the device voice.
@@ -539,6 +540,9 @@ class TtsService : Service() {
                 } else {
                     resumePositionMs = trackPositionMs()
                 }
+            } else if (warmPendingFromMs >= 0) {
+                // Paused during the output warm-up: nothing has played yet.
+                resumePositionMs = warmPendingFromMs
             } else {
                 resumePositionMs = msForBlock(currentIndex)
             }
@@ -586,6 +590,10 @@ class TtsService : Service() {
         publishState()
         updatePlaybackState()
         updateNotification()
+        // An episode or the server voice plays a file: waiting on the device
+        // engine here held every podcast resume up by its load time — the
+        // neural voice takes a couple of seconds, and an episode never starts it.
+        if (serverMode) { resumeSpeaking(); return }
         // Continue from the current sentence (initTts re-checks the engine).
         initTts()
         if (ttsReady) resumeSpeaking()
@@ -918,6 +926,7 @@ class TtsService : Service() {
                 .build()
             track.write(pcm, 0, pcm.size)
             track.play()
+            outputActiveAt = android.os.SystemClock.elapsedRealtime() + durationMs
             // static tracks don't self-release; tear down once it's finished
             mainHandler.postDelayed({ runCatching { track.stop(); track.release() } }, (durationMs + 250).toLong())
         }.onFailure { logDbg("chime failed: ${it.message}") }
@@ -1283,29 +1292,100 @@ class TtsService : Service() {
     // offsets table the server voice gets from its own metadata.
     private var podcastFile: java.io.File? = null
     private var podcastDurationMs = 0L
+    /** Settings.skipPodcastAds, as of when the article was loaded: it decides
+     *  which paragraphs are speakable, so it must not change underneath them. */
+    private var skipAds = true
+    /** The episode's ad breaks to jump over, as [start, end) in ms. Empty when
+     *  skipping is off or the transcript's times are not this file's. */
+    @Volatile private var podcastAds: List<Pair<Int, Int>> = emptyList()
+    /** Exact frame positions when the episode is an MP3 (see Mp3Index); null
+     *  for other formats, which MediaExtractor seeks exactly by itself. */
+    @Volatile private var podcastIndex: Mp3Index? = null
 
     /** Start playing a stored episode. False if it can't be read, so the
      *  caller falls back to reading the transcript aloud. */
     private suspend fun startPodcast(episode: java.io.File, id: String): Boolean {
-        val durationMs = withContext(Dispatchers.IO) { audioDurationMs(episode) }
+        val index = withContext(Dispatchers.IO) { Mp3Index.build(episode) }
+        // The retriever estimates an MP3's length from its bitrate, which is
+        // wrong for one stitched from pieces; counting frames is not.
+        val durationMs = index?.durationMs?.takeIf { it > 0 }
+            ?: withContext(Dispatchers.IO) { audioDurationMs(episode) }
         if (id != articleId || !isPlaying) return false // superseded meanwhile
         if (durationMs <= 0) { logDbg("episode unreadable (${episode.name}) — reading the transcript"); return false }
         podcastFile = episode
+        podcastIndex = index
         podcastDurationMs = durationMs
         serverOffsetsMs = podcastOffsets(durationMs)
+        // adBreaks hashes the whole file; a read failure there means no skipping, not a crash.
+        podcastAds = if (skipAds) withContext(Dispatchers.IO) {
+            runCatching { adBreaks(episode, durationMs) }.getOrDefault(emptyList())
+        } else emptyList()
+        if (id != articleId || !isPlaying) return false
         serverMode = true
         val timed = speakableBlocks.count { (blocks[it] as? Block.Paragraph)?.startSec != null }
-        logDbg("podcast: ${episode.length()} bytes, ${durationMs / 1000}s, $timed/${speakableBlocks.size} paragraphs timed, speed ${app.settings.podcastSpeed}")
+        logDbg("podcast: ${episode.length()} bytes, ${durationMs / 1000}s, $timed/${speakableBlocks.size} paragraphs timed, speed ${app.settings.podcastSpeed}, ${podcastAds.size} ad breaks, ${if (index != null) "frame-exact seeks" else "extractor seeks"}")
         updateMetadata()
         startServerStream(msForBlock(currentIndex))
         return true
     }
 
     /**
-     * Fetch a feed episode's audio so it can be played as itself. Null when
-     * there is nothing to fetch, the network is the wrong kind, or it failed —
-     * every one of which falls back to a voice reading the transcript, which is
-     * a worse listen but not a broken one.
+     * The ad breaks marked in the transcript, if its times fit this file. A
+     * shared episode is the very file the server transcribed. One fetched from
+     * a feed may not be — hosts stitch different ads into each download — and
+     * jumping by someone else's times would cut the show instead of the ads.
+     * Same bytes (the article's url is their hash) or the same length to within
+     * a couple of seconds counts as the same cut; anything else skips nothing.
+     */
+    private fun adBreaks(episode: java.io.File, durationMs: Long): List<Pair<Int, Int>> {
+        val ads = blocks.mapNotNull { b ->
+            val p = b as? Block.Paragraph ?: return@mapNotNull null
+            val start = p.startSec ?: return@mapNotNull null
+            val end = p.adEndSec ?: return@mapNotNull null
+            p to ((start * 1000).toInt() to (end * 1000).toInt())
+        }
+        if (ads.isEmpty()) return emptyList()
+        val sameBytes = articleUrl == com.readlater.app.data.PodcastFiles.URL_PREFIX +
+            com.readlater.app.data.PodcastFiles.hashOf(episode)
+        val transcribedMs = ads.firstNotNullOfOrNull { it.first.audioSec }?.let { (it * 1000).toLong() }
+        val sameLength = transcribedMs != null && kotlin.math.abs(transcribedMs - durationMs) <= 2000
+        if (!sameBytes && !sameLength) {
+            logDbg("ads not skipped: this download is ${durationMs / 1000}s, the transcript's was " +
+                "${transcribedMs?.div(1000) ?: "?"}s — a different cut")
+            return emptyList()
+        }
+        // Every paragraph of a break carries the same end; a break is the
+        // earliest start among them.
+        return ads.map { it.second }.groupBy { it.second }
+            .map { (end, spans) -> spans.minOf { it.first } to end }
+            .sortedBy { it.first }
+    }
+
+    /** The ad break playback at [ms] is inside, if any. Not within its last
+     *  second: landing there is what jumping out of it looks like. */
+    private fun adAt(ms: Int): Pair<Int, Int>? =
+        if (podcastFile == null) null // the server voice reading a transcript has no ads to jump
+        else podcastAds.firstOrNull { (start, end) -> ms >= start && ms < end - 1000 }
+
+    /** Jump over an ad break; one that runs to the end ends the episode. */
+    private fun skipAd(ad: Pair<Int, Int>) {
+        val secs = (ad.second - maxOf(ad.first, trackPositionMs())) / 1000
+        logDbg("ad break ${ad.first / 1000}s–${ad.second / 1000}s: skipping ${secs}s")
+        if (podcastDurationMs > 0 && ad.second >= podcastDurationMs - 1000) {
+            handleArticleComplete()
+            return
+        }
+        seekPodcastTo(ad.second)
+        Toast.makeText(this, "Skipped ad break (${secs}s)", Toast.LENGTH_SHORT).show()
+    }
+
+    /**
+     * Fetch a feed episode's audio so it can be played as itself: the server's
+     * copy (the bytes it transcribed, so the transcript's times and ad breaks
+     * are this file's), else the host's. Null when there is nothing to fetch,
+     * the network is the wrong kind, or it failed — every one of which falls
+     * back to a voice reading the transcript, which is a worse listen but not
+     * a broken one.
      *
      * Metered networks are left alone: an episode is tens of megabytes, and
      * spending someone's data allowance because they pressed play is not a
@@ -1313,29 +1393,88 @@ class TtsService : Service() {
      */
     private suspend fun downloadEpisode(article: com.readlater.app.data.ArticleEntity): java.io.File? {
         val url = article.audioUrl?.takeIf { it.isNotBlank() } ?: return null
-        val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as android.net.ConnectivityManager
-        if (cm.isActiveNetworkMetered) {
+        if (isMetered()) {
             logDbg("episode not downloaded (metered network) — reading the transcript")
             Toast.makeText(this, "Episode audio waits for Wi-Fi — reading the transcript for now", Toast.LENGTH_LONG).show()
             return null
         }
         Toast.makeText(this, "Downloading the episode…", Toast.LENGTH_SHORT).show()
-        logDbg("downloading episode for ${article.id} from $url")
+        return fetchEpisode(article, url, serverOnly = false)
+    }
+
+    /**
+     * An episode downloaded before the server kept its copy came from the
+     * host, ads stitched in its own way, and drifts from the transcript at
+     * every break. Swap it for the server's copy when there is one and the
+     * network allows; otherwise play what is here. The check is a hash of
+     * the file, which ad skipping takes anyway.
+     */
+    private suspend fun replaceHostCopy(
+        article: com.readlater.app.data.ArticleEntity,
+        file: java.io.File,
+    ): java.io.File {
+        val url = article.audioUrl?.takeIf { it.isNotBlank() } ?: return file // shared: the very file
+        if (!article.url.startsWith(com.readlater.app.data.PodcastFiles.URL_PREFIX)) return file
+        if (article.id in noServerCopy) return file
+        val same = withContext(Dispatchers.IO) {
+            runCatching {
+                article.url == com.readlater.app.data.PodcastFiles.URL_PREFIX +
+                    com.readlater.app.data.PodcastFiles.hashOf(file)
+            }.getOrDefault(true)
+        }
+        if (same || isMetered()) return file
+        logDbg("stored episode is the host's cut — fetching the server's copy")
+        return fetchEpisode(article, url, serverOnly = true) ?: file
+    }
+
+    /** Episodes the server had no copy of (from before it kept them), so a
+     *  host copy of one isn't re-hashed and re-asked about on every play. */
+    private val noServerCopy = java.util.Collections.synchronizedSet(mutableSetOf<String>())
+
+    /** Unknown counts as metered: better to read the transcript than to
+     *  spend a data allowance on a guess. */
+    private fun isMetered(): Boolean {
+        val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as android.net.ConnectivityManager
+        return runCatching { cm.isActiveNetworkMetered }.getOrDefault(true)
+    }
+
+    private suspend fun fetchEpisode(
+        article: com.readlater.app.data.ArticleEntity,
+        url: String,
+        serverOnly: Boolean,
+    ): java.io.File? {
         acquireWifiLock()
         return try {
             withContext(Dispatchers.IO) {
-                val spool = app.podcastFiles.spoolFile()
-                val ok = runCatching { app.apiClient.downloadEpisode(url, spool) }.getOrDefault(false)
-                if (!ok) {
-                    spool.delete()
-                    logDbg("episode download failed")
+                // This runs on the service's main scope, where anything thrown
+                // takes the whole app down — so a full disk or a failed move
+                // is a failed download, not a crash.
+                var spool: java.io.File? = null
+                try {
+                    spool = app.podcastFiles.spoolFile()
+                    val api = app.apiClient
+                    val fromServer = article.id !in noServerCopy &&
+                        runCatching { api.downloadServerEpisode(article.id, spool) }.getOrDefault(false)
+                    if (!fromServer) noServerCopy.add(article.id)
+                    val from = when {
+                        fromServer -> "server"
+                        !serverOnly && runCatching { api.downloadEpisode(url, spool) }.getOrDefault(false) -> "host"
+                        else -> null
+                    }
+                    logDbg("episode for ${article.id}: ${from?.let { "downloaded from the $it" } ?: "download failed"}")
+                    if (from == null) {
+                        spool.delete()
+                        null
+                    } else {
+                        // Named after the article either way (see PodcastFiles);
+                        // the server names its copy by the same extension.
+                        val ext = url.substringBefore('?').substringAfterLast('.', "mp3")
+                        app.podcastFiles.keep(spool, article.id, ext)
+                    }
+                } catch (e: java.io.IOException) {
+                    spool?.delete()
+                    logDbg("episode download failed: ${e.message}")
                     null
-                } else {
-                    // Named after the article, not the audio's hash: hosts
-                    // stitch ads per request, so these bytes need not match the
-                    // ones the server transcribed (see PodcastFiles).
-                    val ext = url.substringBefore('?').substringAfterLast('.', "mp3")
-                    app.podcastFiles.keep(spool, article.id, ext)
                 }
             }
         } finally {
@@ -1511,6 +1650,59 @@ class TtsService : Service() {
     /** How long playback must run before the head's rate can be told apart. */
     private val calibrateAfterMs = 1500L
 
+    // ---- output warm-up ----------------------------------------------------
+    //
+    // Bluetooth earbuds (and some audio outputs) fade in when audio starts after
+    // the link has been idle: the first second of speech came out ramping up
+    // from silence, and the opening words were hard to hear. So when nothing of
+    // ours has played for a moment, play a short stretch of silence first and
+    // start the real track once it has finished — the ramp happens over
+    // nothing. Back-to-back starts (skips, next article) find the output still
+    // awake and start at once. Silence goes on its own one-shot track, so none
+    // of the position bookkeeping on the real track moves.
+    private var outputActiveAt = 0L
+    private var warmGen = 0
+    /** Where the start waiting on a warm-up will play from (-1 = none waiting). */
+    private var warmPendingFromMs = -1
+    private val warmIdleMs = 1500L
+    private val warmUpMs = 700
+
+    /** True (and a warm-up is under way) when [start] will be called later. */
+    private fun warmOutputFirst(fromMs: Int, start: () -> Unit): Boolean {
+        val now = android.os.SystemClock.elapsedRealtime()
+        if (audioTrack != null || now - outputActiveAt < warmIdleMs) return false
+        outputActiveAt = now
+        val myWarm = ++warmGen
+        warmPendingFromMs = fromMs
+        val sr = 48_000
+        val silence = ShortArray(sr * warmUpMs / 1000)
+        val t = runCatching {
+            android.media.AudioTrack.Builder()
+                .setAudioAttributes(playbackAudioAttributes)
+                .setAudioFormat(
+                    android.media.AudioFormat.Builder()
+                        .setEncoding(android.media.AudioFormat.ENCODING_PCM_16BIT)
+                        .setSampleRate(sr)
+                        .setChannelMask(android.media.AudioFormat.CHANNEL_OUT_MONO)
+                        .build()
+                )
+                .setTransferMode(android.media.AudioTrack.MODE_STATIC)
+                .setBufferSizeInBytes(silence.size * 2)
+                .build()
+                .also { it.write(silence, 0, silence.size); it.play() }
+        }.getOrElse { logDbg("warm-up failed: ${it.message}"); return false }
+        mainHandler.postDelayed({
+            runCatching { t.stop(); t.release() }
+            // Superseded (pause, stop, another start) → that path owns the player now.
+            if (myWarm == warmGen) warmPendingFromMs = -1
+            if (myWarm == warmGen && isPlaying) {
+                outputActiveAt = android.os.SystemClock.elapsedRealtime()
+                start()
+            }
+        }, warmUpMs.toLong())
+        return true
+    }
+
     /** Called right after AudioTrack.play() — the clock the measurement uses. */
     private fun markTrackStarted() {
         trackPlayAt = android.os.SystemClock.elapsedRealtime()
@@ -1577,7 +1769,7 @@ class TtsService : Service() {
             // a blank one carries "unset" fields that some devices reject.
             track.playbackParams = track.playbackParams.setSpeed(wanted).setPitch(1.0f)
         } catch (e: Exception) {
-            logDbg("playback speed ${wanted}× refused: ${e.message}")
+            logDbg("playback speed ${wanted}× refused (buffer ${track.bufferSizeInFrames} frames): ${e.message}")
         }
         val effective = runCatching { track.playbackParams.speed }.getOrDefault(0f)
         trackSpeed = if (effective > 0.05f) effective else 1.0f
@@ -1588,8 +1780,11 @@ class TtsService : Service() {
 
     private fun releasePlayer() {
         playThreadGen++            // signal any streaming thread to stop
+        warmGen++                  // and any start still waiting on a warm-up
+        warmPendingFromMs = -1
         deviceStreamMode = false
         val t = audioTrack
+        if (t != null) outputActiveAt = android.os.SystemClock.elapsedRealtime()
         audioTrack = null
         playThread = null
         preparedIdx = -1
@@ -1621,6 +1816,8 @@ class TtsService : Service() {
         serverMode = false
         podcastFile = null
         podcastDurationMs = 0L
+        podcastAds = emptyList()
+        podcastIndex = null
         cacheDir.listFiles()?.filter { it.name.startsWith("tts-") }?.forEach { it.delete() }
     }
 
@@ -1882,6 +2079,7 @@ class TtsService : Service() {
      * (the caller guarantees this); later ones are awaited from the prefetch.
      */
     private fun startFilePlayback(idx: Int, fromMs: Int) {
+        if (warmOutputFirst(fromMs) { startFilePlayback(idx, fromMs) }) return
         releasePlayer()
         val file0 = synthFile(idx)
         val wav0 = parseWav(file0) ?: run { logDbg("bad WAV idx=$idx"); beginSpeakFallback("unparseable wav"); return }
@@ -2112,9 +2310,27 @@ class TtsService : Service() {
     private fun fileSpeed(): Float =
         if (podcastFile != null) app.settings.podcastSpeed else app.settings.serverSpeechRate
 
+    /**
+     * Buffer for a whole-file track that will run at [speed]. AudioTrack only
+     * accepts a speed above 1× if the buffer holds the output's latency's worth
+     * of audio AT that speed, and refuses it outright otherwise — which is why
+     * episodes played at 1× whatever the setting said. A flat 64 KB was 1.4 s of
+     * the mono 24 kHz server voice but only 0.37 s of a stereo 44.1 kHz episode,
+     * short of what 2× needs on a Bluetooth output's long latency. So: a second
+     * of playback at the speed, never less than the old floor.
+     */
+    private fun fileTrackBufferBytes(sampleRate: Int, channelMask: Int, frameBytes: Int, speed: Float): Int {
+        val s = speed.coerceIn(1f, 4f)
+        val minBuf = android.media.AudioTrack.getMinBufferSize(
+            sampleRate, channelMask, android.media.AudioFormat.ENCODING_PCM_16BIT
+        )
+        return maxOf(64 * 1024, (minBuf * s * 2).toInt(), (sampleRate.toLong() * frameBytes * s).toInt())
+    }
+
     /** Stream the whole-article server WAV via AudioTrack from [fromMs], updating
      *  the current paragraph from playback time as it goes. */
     private fun startServerStreamWav(fromMs: Int) {
+        if (warmOutputFirst(fromMs) { startServerStreamWav(fromMs) }) return
         releasePlayer()
         val file = serverAudioFile(articleId ?: return, "wav")
         val wav = parseWav(file) ?: run {
@@ -2124,9 +2340,7 @@ class TtsService : Service() {
         try {
             val channelMask = if (wav.channels >= 2) android.media.AudioFormat.CHANNEL_OUT_STEREO
                 else android.media.AudioFormat.CHANNEL_OUT_MONO
-            val minBuf = android.media.AudioTrack.getMinBufferSize(
-                wav.sampleRate, channelMask, android.media.AudioFormat.ENCODING_PCM_16BIT
-            ).coerceAtLeast(64 * 1024)
+            val minBuf = fileTrackBufferBytes(wav.sampleRate, channelMask, wav.channels * 2, app.settings.serverSpeechRate)
             val track = android.media.AudioTrack.Builder()
                 .setAudioAttributes(playbackAudioAttributes)
                 .setAudioFormat(
@@ -2219,6 +2433,7 @@ class TtsService : Service() {
      *  through our AudioTrack — same in-process playback as the WAV path, just
      *  with a decode step. Seeks by time; tracks the paragraph from playback. */
     private fun startServerStreamOpus(fromMs: Int) {
+        if (warmOutputFirst(fromMs) { startServerStreamOpus(fromMs) }) return
         releasePlayer()
         val file = podcastFile ?: serverAudioFile(articleId ?: return, "opus")
         if (file.length() < 4) {
@@ -2227,6 +2442,9 @@ class TtsService : Service() {
         }
         trackStartMs = fromMs
         audioStarted = false
+        // An MP3 episode starts at a frame boundary from its index rather than
+        // through seekTo, whose landing spot it can't be trusted to report.
+        val startAt = if (fromMs > 0 && podcastFile != null) podcastIndex?.frameAt(fromMs) else null
         val myGen = ++playThreadGen
         playThread = Thread {
             var extractor: android.media.MediaExtractor? = null
@@ -2235,7 +2453,19 @@ class TtsService : Service() {
             var fis: java.io.FileInputStream? = null
             try {
                 fis = java.io.FileInputStream(file)
-                extractor = android.media.MediaExtractor().apply { setDataSource(fis!!.fd) }
+                var exact = false
+                if (startAt != null) {
+                    extractor = runCatching {
+                        android.media.MediaExtractor().apply {
+                            setDataSource(fis!!.fd, startAt.first, file.length() - startAt.first)
+                        }
+                    }.onFailure { logDbg("frame-exact start failed (${it.message}) — seeking instead") }
+                        .getOrNull()
+                    exact = extractor != null
+                }
+                if (extractor == null) {
+                    extractor = android.media.MediaExtractor().apply { setDataSource(fis!!.fd) }
+                }
                 var trackIdx = -1
                 var format: android.media.MediaFormat? = null
                 for (i in 0 until extractor.trackCount) {
@@ -2246,7 +2476,9 @@ class TtsService : Service() {
                 }
                 if (trackIdx < 0 || format == null) throw IllegalStateException("no audio track in opus")
                 extractor.selectTrack(trackIdx)
-                if (fromMs > 0) {
+                if (exact) {
+                    trackStartMs = startAt!!.second
+                } else if (fromMs > 0) {
                     extractor.seekTo(fromMs * 1000L, android.media.MediaExtractor.SEEK_TO_CLOSEST_SYNC)
                     // Count from where the seek actually landed (the sync point
                     // before fromMs), so the highlight doesn't run ahead of the audio.
@@ -2259,9 +2491,7 @@ class TtsService : Service() {
                 codec = android.media.MediaCodec.createDecoderByType(mime).apply { configure(format, null, null, 0); start() }
                 val channelMask = if (channels >= 2) android.media.AudioFormat.CHANNEL_OUT_STEREO
                     else android.media.AudioFormat.CHANNEL_OUT_MONO
-                val minBuf = android.media.AudioTrack.getMinBufferSize(
-                    sampleRate, channelMask, android.media.AudioFormat.ENCODING_PCM_16BIT
-                ).coerceAtLeast(64 * 1024)
+                val minBuf = fileTrackBufferBytes(sampleRate, channelMask, channels * 2, fileSpeed())
                 track = android.media.AudioTrack.Builder()
                     .setAudioAttributes(playbackAudioAttributes)
                     .setAudioFormat(
@@ -2298,6 +2528,7 @@ class TtsService : Service() {
                 var sawOutputEOS = false
                 var bytesWritten = 0L
                 var lastBlock = -1
+                var adPosted = false
                 while (myGen == playThreadGen && !sawOutputEOS) {
                     if (!sawInputEOS) {
                         val inIdx = codec.dequeueInputBuffer(10000)
@@ -2331,7 +2562,14 @@ class TtsService : Service() {
                             // Track the ACTUAL playback head (trackPositionMs), not the
                             // decoder's presentation time — the decoder writes ~0.5-1s
                             // ahead of playback, which made the highlight skip ahead early.
-                            val blk = blockForMs(trackPositionMs())
+                            val pos = trackPositionMs()
+                            val ad = if (adPosted) null else adAt(pos)
+                            if (ad != null) {
+                                // Once per stream: the jump restarts it, ending this thread.
+                                adPosted = true
+                                mainHandler.post { if (myGen == playThreadGen && isPlaying) skipAd(ad) }
+                            }
+                            val blk = blockForMs(pos)
                             if (blk != lastBlock) {
                                 lastBlock = blk
                                 mainHandler.post {
@@ -2454,7 +2692,9 @@ class TtsService : Service() {
     private var engineBlockedThisSession: String? = null
 
     private fun speakableText(block: Block): String? = when (block) {
-        is Block.Paragraph -> block.text
+        // An ad break in a transcript: not read aloud, and never the paragraph
+        // the highlight sits on while the episode jumps over it.
+        is Block.Paragraph -> block.text.takeUnless { skipAds && block.adEndSec != null }
         is Block.Heading -> block.text
         is Block.Quote -> block.text
         is Block.ImageBlock -> null

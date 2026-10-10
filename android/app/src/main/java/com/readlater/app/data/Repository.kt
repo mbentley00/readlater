@@ -341,6 +341,9 @@ class Repository(
     /** Raw captured/fetched original source for "view original". */
     suspend fun articleSource(id: String): ApiClient.ArticleSource = api.articleSource(id)
 
+    /** Public Earmark link to the parsed article; makes it public if it wasn't. */
+    suspend fun shareLink(id: String): String = api.shareLink(id)
+
     fun toggleArchive(article: ArticleEntity) {
         bgScope.launch {
             val nowArchived = !article.archived

@@ -317,9 +317,20 @@ class ApiClient(private val settings: Settings) {
      * the token has no business being sent to it. Uses the upload client for
      * its long timeouts — an episode is tens of MB.
      */
-    suspend fun downloadEpisode(url: String, dest: java.io.File): Boolean = withContext(Dispatchers.IO) {
+    suspend fun downloadEpisode(url: String, dest: java.io.File): Boolean =
+        download(okhttp3.Request.Builder().url(url).get().build(), dest)
+
+    /**
+     * GET /api/articles/:id/episode — the very file the server transcribed a
+     * feed episode from. Preferred over the host's copy, which has its ads
+     * stitched in at other places and lengths, so the transcript's times and
+     * ad breaks would not be its own. False when the server didn't keep it.
+     */
+    suspend fun downloadServerEpisode(articleId: String, dest: java.io.File): Boolean =
+        download(builder("/api/articles/$articleId/episode").get().build(), dest)
+
+    private suspend fun download(req: Request, dest: java.io.File): Boolean = withContext(Dispatchers.IO) {
         try {
-            val req = okhttp3.Request.Builder().url(url).get().build()
             uploadClient.newCall(req).execute().use { r ->
                 if (!r.isSuccessful) return@withContext false
                 val body = r.body ?: return@withContext false
@@ -511,6 +522,13 @@ class ApiClient(private val settings: Settings) {
     suspend fun articleSource(articleId: String): ArticleSource {
         val o = JSONObject(execute(builder("/api/articles/$articleId/source").get().build()))
         return ArticleSource(o.optString("url", ""), o.optString("kind", "none"), o.stringOrNull("source"))
+    }
+
+    /** POST /api/articles/{id}/share — the public /p/… link to the parsed
+     *  article, minted on first use and the same one every time after. */
+    suspend fun shareLink(articleId: String): String {
+        val body = execute(builder("/api/articles/$articleId/share").post(ByteArray(0).toRequestBody()).build())
+        return JSONObject(body).getString("url")
     }
 
     private fun parseArticle(o: JSONObject): RemoteArticle = RemoteArticle(
