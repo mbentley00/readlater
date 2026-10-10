@@ -12,6 +12,7 @@
 
 const crypto = require('crypto');
 const fs = require('fs');
+const zlib = require('zlib');
 const skip = require('./skip'); // MIN_PHRASE_CHARS, so the UI and server agree
 
 function escapeHtml(s) {
@@ -84,6 +85,76 @@ const TYPE_SCRIPT = `
 `;
 
 const FAVICON = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Ctext y='13' font-size='13'%3E%F0%9F%93%9A%3C/text%3E%3C/svg%3E";
+
+/**
+ * Home-screen icon, drawn as a PNG at startup: iOS ignores SVG touch icons and
+ * falls back to a screenshot of the page. A rounded accent square with a white
+ * bookmark ribbon; zlib is all a PNG needs, so no image library.
+ */
+function iconPng(size) {
+  const bg = [0x3d, 0x6b, 0x52], fg = [0xff, 0xff, 0xff];
+  const r = size * 0.2; // corner radius
+  const bx0 = size * 0.32, bx1 = size * 0.68, by0 = size * 0.2, by1 = size * 0.8;
+  const notch = size * 0.14; // depth of the ribbon's V cut
+  const cx = size / 2;
+  const raw = Buffer.alloc((size * 4 + 1) * size);
+  for (let y = 0; y < size; y++) {
+    const row = y * (size * 4 + 1);
+    raw[row] = 0; // filter: none
+    for (let x = 0; x < size; x++) {
+      const px = x + 0.5, py = y + 0.5;
+      // Outside the rounded corners: transparent.
+      const dx = Math.max(r - px, px - (size - r), 0), dy = Math.max(r - py, py - (size - r), 0);
+      const inside = dx * dx + dy * dy <= r * r;
+      const ribbon = px >= bx0 && px <= bx1 && py >= by0
+        && py <= by1 - notch + notch * (Math.abs(px - cx) / (cx - bx0));
+      const c = ribbon ? fg : bg;
+      const o = row + 1 + x * 4;
+      raw[o] = c[0]; raw[o + 1] = c[1]; raw[o + 2] = c[2]; raw[o + 3] = inside ? 255 : 0;
+    }
+  }
+  const crcTable = Array.from({ length: 256 }, (_, n) => {
+    let c = n;
+    for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+    return c >>> 0;
+  });
+  const crc = (buf) => { let c = 0xffffffff; for (const b of buf) c = crcTable[(c ^ b) & 0xff] ^ (c >>> 8); return (c ^ 0xffffffff) >>> 0; };
+  const chunk = (type, data) => {
+    const len = Buffer.alloc(4); len.writeUInt32BE(data.length);
+    const td = Buffer.concat([Buffer.from(type, 'ascii'), data]);
+    const c = Buffer.alloc(4); c.writeUInt32BE(crc(td));
+    return Buffer.concat([len, td, c]);
+  };
+  const ihdr = Buffer.alloc(13);
+  ihdr.writeUInt32BE(size, 0); ihdr.writeUInt32BE(size, 4);
+  ihdr[8] = 8; ihdr[9] = 6; // 8-bit RGBA
+  return Buffer.concat([
+    Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+    chunk('IHDR', ihdr), chunk('IDAT', zlib.deflateSync(raw)), chunk('IEND', Buffer.alloc(0)),
+  ]);
+}
+const ICONS = { 180: iconPng(180), 192: iconPng(192), 512: iconPng(512) };
+
+/**
+ * Web app manifest. Firefox on iPad can't hide its own toolbars — the
+ * Fullscreen API there is a no-op — but "Add to Home Screen" launches the site
+ * as a standalone app with no browser chrome at all. iOS treats "fullscreen"
+ * as "standalone"; Android Chrome honours it and drops the status bar too.
+ */
+const MANIFEST = JSON.stringify({
+  name: 'Earmark',
+  short_name: 'Earmark',
+  start_url: '/',
+  scope: '/',
+  display: 'fullscreen',
+  display_override: ['fullscreen', 'standalone'],
+  background_color: '#faf9f7',
+  theme_color: '#3d6b52',
+  icons: [
+    { src: '/icon-192.png', sizes: '192x192', type: 'image/png' },
+    { src: '/icon-512.png', sizes: '512x512', type: 'image/png' },
+  ],
+});
 
 const CSS = `
 :root { --bg:#faf9f7; --fg:#1a1a18; --muted:#77726a; --card:#ffffff; --line:#e6e2db; --accent:#3d6b52; --accent-fg:#ffffff; --mark:#f4e9c8;
@@ -384,6 +455,12 @@ function page({ title, body, user, active = '', nonce = '', script = '', article
 <meta name="referrer" content="no-referrer">
 ${noindex ? '<meta name="robots" content="noindex, nofollow">\n' : ''}<title>${escapeHtml(title)} — Earmark</title>
 <link rel="icon" href="${FAVICON}">
+<link rel="manifest" href="/manifest.webmanifest">
+<link rel="apple-touch-icon" href="/icon-180.png">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="Earmark">
+<meta name="theme-color" content="#3d6b52">
 <style>${CSS}</style>
 ${headScript ? `<script nonce="${nonce}">${headScript}</script>\n` : ''}</head>
 <body${bodyClass ? ` class="${bodyClass}"` : ''}>
@@ -405,7 +482,7 @@ function send(res, status, html, { nonce = '', headers = {} } = {}) {
     'Cache-Control': 'no-store',
     'Content-Security-Policy':
       `default-src 'none'; img-src * data:; media-src *; style-src 'unsafe-inline'; ` +
-      `script-src 'nonce-${nonce}'; connect-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'`,
+      `script-src 'nonce-${nonce}'; connect-src 'self'; manifest-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'`,
     'X-Content-Type-Options': 'nosniff',
     ...headers,
   });
@@ -2123,6 +2200,18 @@ async function handle(ctx, req, res, url) {
     const body = JSON.stringify({ addons: { 'readlater@selfhosted.local': { updates } } });
     res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Content-Length': Buffer.byteLength(body) });
     return res.end(body);
+  }
+
+  // ---- home-screen app (PUBLIC — iOS fetches the icon without the session
+  // cookie, and the manifest is useless behind a login redirect).
+  if (route === 'GET /manifest.webmanifest') {
+    res.writeHead(200, { 'Content-Type': 'application/manifest+json; charset=utf-8', 'Cache-Control': 'public, max-age=86400' });
+    return res.end(MANIFEST);
+  }
+  const icon = /^GET \/icon-(\d+)\.png$/.exec(route);
+  if (icon && ICONS[icon[1]]) {
+    res.writeHead(200, { 'Content-Type': 'image/png', 'Content-Length': ICONS[icon[1]].length, 'Cache-Control': 'public, max-age=604800' });
+    return res.end(ICONS[icon[1]]);
   }
 
   // ---- shared article (PUBLIC — holding the link is the whole authorization).

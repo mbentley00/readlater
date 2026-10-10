@@ -62,6 +62,7 @@ import androidx.compose.material.icons.filled.Stop
 import androidx.compose.material.icons.filled.Star
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.KeyboardArrowUp
 import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.StarBorder
@@ -108,6 +109,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.compose.ui.window.Dialog
@@ -202,6 +204,7 @@ fun ReaderScreen(articleId: String, onBack: () -> Unit, onOpenArticle: (String) 
     val repo = app.repository
     val settings = app.settings
     val scope = rememberCoroutineScope()
+    val clipboard = LocalClipboardManager.current
     val snackbarHostState = remember { SnackbarHostState() }
 
     val article by repo.article(articleId).collectAsState(initial = null)
@@ -993,6 +996,16 @@ fun ReaderScreen(articleId: String, onBack: () -> Unit, onOpenArticle: (String) 
                                 modifier = Modifier.weight(1f)
                             )
                             TextButton(onClick = { wordSel = null }) { Text("Cancel") }
+                            // The reader draws its own selection, so there's no
+                            // system Copy callout; without this, copying meant
+                            // highlighting or sharing first.
+                            IconButton(onClick = {
+                                clipboard.setText(AnnotatedString(sel.text))
+                                wordSel = null
+                                scope.launch { snackbarHostState.showSnackbar("Copied") }
+                            }) {
+                                Icon(Icons.Filled.ContentCopy, contentDescription = "Copy")
+                            }
                             TextButton(onClick = {
                                 sheetTarget = SheetTarget.Create(sel.block, sel.text)
                                 wordSel = null

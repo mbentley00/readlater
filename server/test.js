@@ -659,6 +659,17 @@ async function main() {
     assert.ok(html.includes('id="float-bar"') && html.includes('id="fs-btn"'),
       'reader has the scroll-up floating bar and a full-screen toggle');
     assert.ok(html.includes('end-actions'), 'reader has an end-of-article action bar');
+
+    // Add to Home Screen is the only way to lose the toolbars in iPad Firefox.
+    assert.ok(html.includes('rel="manifest"') && html.includes('apple-mobile-web-app-capable'),
+      'pages link the web app manifest and opt into standalone launch');
+    assert.ok(/manifest-src 'self'/.test(res.headers.get('content-security-policy')), 'CSP allows the manifest');
+    res = await fetch(BASE + '/manifest.webmanifest'); // no cookie: iOS fetches it signed out
+    assert.strictEqual(res.status, 200);
+    assert.strictEqual((await res.json()).display, 'fullscreen');
+    res = await fetch(BASE + '/icon-180.png');
+    assert.strictEqual(res.headers.get('content-type'), 'image/png');
+    assert.ok(Buffer.from(await res.arrayBuffer()).subarray(1, 4).toString() === 'PNG', 'touch icon is a real PNG');
     // the button's data-act is a verb; the PATCH body must use the API's field
     assert.ok(!/JSON\.stringify\(\{ \[act\]: (on|val) \}\)/.test(html),
       'archive buttons send `archived`, not the raw data-act verb');
