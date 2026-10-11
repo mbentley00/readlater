@@ -1238,6 +1238,7 @@ const ARTICLE = ${jsonForScript(article.id)};
 const ORIGINAL_URL = ${jsonForScript(article.url || '')};
 const HAS_ORIGINAL = ${jsonForScript(hasOriginal)};
 const BACK_TO = ${jsonForScript(backTo)};
+const READ_AT = ${Number(article.readParagraph) || 0};
 
 // Keyboard shortcuts: o = open the original, e = archive and go back.
 document.addEventListener('keydown', (e) => {
@@ -1265,6 +1266,30 @@ document.addEventListener('keydown', (e) => {
 // map the offsets back to the DOM, and wrap the range even across text nodes.
 const HLS = ${jsonForScript(hls.map((h) => ({ id: h.id, text: h.text })))};
 const root = document.getElementById('content');
+
+// The article's blocks in the app's paragraph numbering — a port of
+// android HtmlParser.walk, keep the two in step. readParagraph is an index
+// into this list, and the phone resumes reading AND listening from it, so the
+// count has to match exactly. Taken before highlights are painted in: a <mark>
+// landing directly inside a container would otherwise count as a block.
+const BLOCKS = (() => {
+  const CONTAINERS = new Set(['div', 'section', 'article', 'main', 'aside', 'header', 'footer', 'nav', 'ul', 'ol', 'figure', 'details']);
+  const SKIPPED = new Set(['script', 'style', 'noscript', 'template', 'iframe']);
+  const hasText = (el) => el.textContent.trim() !== '';
+  const out = [];
+  (function walk(el) {
+    for (const c of el.children) {
+      const tag = c.tagName.toLowerCase();
+      if (/^h[1-6]$/.test(tag) || tag === 'blockquote') { if (hasText(c)) out.push(c); }
+      else if (tag === 'img') { if ((c.getAttribute('src') || '').trim()) out.push(c); }
+      else if (tag === 'p' || tag === 'li' || tag === 'pre') { if (hasText(c)) out.push(c); else walk(c); } // e.g. a <p> wrapping only an <img>
+      else if (CONTAINERS.has(tag)) walk(c);
+      else if (SKIPPED.has(tag)) {}
+      else if (hasText(c)) out.push(c);
+    }
+  })(root);
+  return out;
+})();
 function isWs(c) { const n = c.charCodeAt(0); return n === 32 || n === 9 || n === 10 || n === 13 || n === 160; }
 function canonChar(c) {
   const n = c.charCodeAt(0);
@@ -1615,6 +1640,53 @@ window.addEventListener('scroll', () => {
   if (Math.abs(dy) > 6) { scrolledUp = dy < 0; lastScrollY = y; }
   updateBar();
 }, { passive: true });
+
+// ---- reading position: the first block still on screen, as the app counts
+// it. Restored on open; saved only once you've moved, so opening an article
+// here and leaving it at the top never wipes progress made on the phone.
+const headerBottom = () => {
+  const h = document.querySelector('header.site');
+  return h && h.offsetParent !== null ? Math.max(0, h.getBoundingClientRect().bottom) : 0;
+};
+function currentBlock() {
+  const top = headerBottom() + 1;
+  for (let i = 0; i < BLOCKS.length; i++) {
+    if (BLOCKS[i].getBoundingClientRect().bottom > top) return i;
+  }
+  return Math.max(0, BLOCKS.length - 1);
+}
+let userMoved = false, savedBlock = READ_AT, saveTimer = 0;
+function restorePosition() {
+  if (userMoved || READ_AT <= 0 || READ_AT >= BLOCKS.length) return;
+  const el = BLOCKS[READ_AT];
+  window.scrollTo(0, window.scrollY + el.getBoundingClientRect().top - headerBottom() - 8);
+}
+restorePosition();
+// Images above the spot load in later and push it down; land on it again.
+window.addEventListener('load', restorePosition);
+for (const evt of ['wheel', 'touchstart', 'keydown', 'mousedown']) {
+  window.addEventListener(evt, () => { userMoved = true; }, { passive: true, capture: true });
+}
+function saveReadPosition() {
+  clearTimeout(saveTimer);
+  if (!userMoved) return;
+  const block = currentBlock();
+  if (block === savedBlock) return;
+  savedBlock = block;
+  // keepalive: this also runs as the page is being left.
+  fetch('/api/articles/' + ARTICLE, {
+    method: 'PATCH', keepalive: true,
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ readParagraph: block }),
+  }).catch(() => {});
+}
+window.addEventListener('scroll', () => {
+  if (!userMoved) return;
+  clearTimeout(saveTimer);
+  saveTimer = setTimeout(saveReadPosition, 1500);
+}, { passive: true });
+document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'hidden') saveReadPosition(); });
+window.addEventListener('pagehide', saveReadPosition);
 
 // ---- full screen: hide everything but the text. Uses the real Fullscreen API
 // where there is one (desktop, iPadOS Safari); elsewhere the CSS-only version

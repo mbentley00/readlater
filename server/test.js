@@ -659,6 +659,14 @@ async function main() {
     assert.ok(html.includes('id="float-bar"') && html.includes('id="fs-btn"'),
       'reader has the scroll-up floating bar and a full-screen toggle');
     assert.ok(html.includes('end-actions'), 'reader has an end-of-article action bar');
+    // Reading on the web has to move the phone's resume point (TtsService
+    // falls back to readParagraph), so the reader counts blocks as the app does
+    // and PATCHes the position — but only after the reader has moved.
+    assert.ok(/const READ_AT = \d+;/.test(html), 'reader knows the saved reading position');
+    assert.ok(html.includes('const BLOCKS =') && html.includes('readParagraph: block'),
+      'reader saves its position in app block numbering');
+    assert.ok(html.indexOf('const BLOCKS =') < html.indexOf('for (const h of HLS) anchorHighlight(h)'),
+      'blocks are counted before highlight marks are inserted');
 
     // Add to Home Screen is the only way to lose the toolbars in iPad Firefox.
     assert.ok(html.includes('rel="manifest"') && html.includes('apple-mobile-web-app-capable'),
