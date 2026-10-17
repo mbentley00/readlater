@@ -78,6 +78,31 @@ function probeTags(file) {
   });
 }
 
+/** The cover art embedded in an audio file (an ID3 APIC frame, an MP4 covr
+ *  atom), as a JPEG no wider than 600px — or null when it has none or ffmpeg
+ *  is missing. Read from a file for the same reason as probeTags. */
+function extractCover(file) {
+  return new Promise((resolve) => {
+    const out = [];
+    const ff = spawn('ffmpeg', [
+      '-hide_banner', '-loglevel', 'error', '-i', file,
+      '-map', '0:v:0', '-an', '-frames:v', '1',
+      '-vf', "scale='min(600,iw)':-2", '-c:v', 'mjpeg', '-q:v', '4', '-f', 'image2', 'pipe:1',
+    ]);
+    const timer = setTimeout(() => ff.kill('SIGKILL'), 15000);
+    ff.stdout.on('data', (c) => out.push(c));
+    ff.stderr.resume();
+    ff.on('error', () => { clearTimeout(timer); resolve(null); });
+    ff.on('close', (code) => {
+      clearTimeout(timer);
+      const jpg = Buffer.concat(out);
+      // An error exit is the usual "no picture stream"; the size check
+      // drops a stray few bytes.
+      resolve(code === 0 && jpg.length > 200 ? jpg : null);
+    });
+  });
+}
+
 /** A filename that names nothing: a player's episode id, a hash, "audio", "track 3". */
 const OPAQUE_NAME = /^([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|[0-9a-f]{16,}|(audio|episode|download|file|track|recording|media|podcast episode)?[\s_-]*\d*)$/i;
 
@@ -428,7 +453,7 @@ async function transcribeToArticle(buf, filename) {
 }
 
 module.exports = {
-  enabled, transcribeToArticle, probeTags, audioMeta, PLACEHOLDER_TITLE,
+  enabled, transcribeToArticle, probeTags, extractCover, audioMeta, PLACEHOLDER_TITLE,
   segmentsToParagraphs, segmentsToTimedParagraphs, paragraphsToHtml, textToParagraphs, PARA_MAX,
   sentencesToParagraphsAt, adSpans, sentencesFromTranscriptHtml, restructureTranscriptHtml, MIN_AD_S,
 };

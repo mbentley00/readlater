@@ -72,15 +72,29 @@ const audioEnclosure = (item) => {
   return url;
 };
 
+/** An http(s) image url, or '' — artwork is shown straight from the host. */
+const httpUrl = (u) => (/^https?:\/\//i.test(u || '') ? u.slice(0, 2000) : '');
+
+/** Show artwork: <itunes:image href>, else RSS's own <image><url>. */
+function channelImage(head) {
+  const itunes = httpUrl(tagAttr(head, 'itunes:image', 'href'));
+  if (itunes) return itunes;
+  const block = /<image(?:\s[^>]*)?>([\s\S]*?)<\/image>/i.exec(head);
+  return block ? httpUrl(tagText(block[1], 'url')) : '';
+}
+
 /**
- * Parse a podcast feed. Returns { title, items: [{guid, title, url, publishedAt,
- * durationS}] }, newest first as the feed gave them.
+ * Parse a podcast feed. Returns { title, imageUrl, items: [{guid, title, url,
+ * publishedAt, durationS, imageUrl}] }, newest first as the feed gave them.
+ * An item's imageUrl is its own episode art, '' when it has none (the show's
+ * artwork is the fallback, left to the caller).
  */
 function parseFeed(xml) {
   const body = String(xml || '');
   // The channel's own title, not an item's: cut at the first <item>.
   const head = body.split(/<item[\s>]/i)[0];
   const title = tagText(head, 'title') || '';
+  const imageUrl = channelImage(head);
   const items = [];
   const re = /<item(?:\s[^>]*)?>([\s\S]*?)<\/item>/gi;
   let m;
@@ -98,9 +112,10 @@ function parseFeed(xml) {
       url,
       publishedAt: Number.isFinite(when) ? when : null,
       durationS: parseDuration(tagText(item, 'itunes:duration')),
+      imageUrl: httpUrl(tagAttr(item, 'itunes:image', 'href')),
     });
   }
-  return { title, items };
+  return { title, imageUrl, items };
 }
 
 /** iTunes durations come as seconds, or mm:ss, or hh:mm:ss. */
@@ -174,15 +189,26 @@ async function pollOnce(deps) {
   let taken = 0;
   for (const feed of store.listAllFeeds()) {
     try {
-      const got = await fetchFeed(feed.url, { etag: feed.etag, lastModified: feed.lastModified });
+      // imageUrl is null until a check has read the show's artwork ('' when it
+      // has none). Until then, skip the caching headers: a quiet feed would
+      // answer 304 forever and its episodes would never get their art.
+      const artKnown = feed.imageUrl != null;
+      const got = await fetchFeed(feed.url, artKnown ? { etag: feed.etag, lastModified: feed.lastModified } : {});
       if (got.unchanged) { store.touchFeed(feed.id, { checkedAt: Date.now() }); continue; }
       const parsed = parseFeed(got.xml);
+      if (!artKnown) {
+        // Episodes taken before artwork was tracked: give them theirs, once.
+        const n = store.backfillFeedArt(feed.id,
+          parsed.items.map((i) => ({ guid: i.guid, imageUrl: i.imageUrl || parsed.imageUrl })));
+        if (n) log(`feed: added artwork to ${n} episode(s) from ${feed.title || parsed.title || feed.url}`);
+      }
+      const show = { ...feed, imageUrl: feed.imageUrl || parsed.imageUrl };
       // Oldest first, so a batch arrives in the order it was published.
       const fresh = parsed.items.filter((i) => !store.feedItemSeen(feed.id, i.guid)).reverse();
       for (const item of fresh.slice(0, MAX_PER_POLL)) {
         try {
           const buf = await fetchEpisode(item.url, maxBytes);
-          await onEpisode({ feed, item, buf });
+          await onEpisode({ feed: show, item, buf });
           taken++;
         } catch (e) {
           // Mark it seen anyway: a broken enclosure would otherwise be retried
@@ -194,6 +220,7 @@ async function pollOnce(deps) {
       store.touchFeed(feed.id, {
         checkedAt: Date.now(),
         title: feed.title || parsed.title || null,
+        imageUrl: parsed.imageUrl,
         etag: got.etag,
         lastModified: got.lastModified,
         error: null,

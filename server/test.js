@@ -2300,8 +2300,10 @@ function testFeedParsing() {
 <rss version="2.0" xmlns:itunes="http://www.itunes.com/dtds/podcast-1.0.dtd">
   <channel>
     <title>The Build Show</title>
+    <itunes:image href="https://cdn.example.com/show.jpg"/>
     <item>
       <title><![CDATA[Why Wood Towers Sway]]></title>
+      <itunes:image href="https://cdn.example.com/ep42.jpg?w=1&amp;h=1"/>
       <guid isPermaLink="false">ep-42</guid>
       <pubDate>Tue, 22 Sep 2026 10:00:00 GMT</pubDate>
       <itunes:duration>1:02:03</itunes:duration>
@@ -2333,6 +2335,15 @@ function testFeedParsing() {
   assert.strictEqual(first.durationS, 3723, 'hh:mm:ss duration');
   assert.strictEqual(first.publishedAt, Date.parse('Tue, 22 Sep 2026 10:00:00 GMT'));
   assert.strictEqual(second.guid, second.url, 'an item with no guid is identified by its enclosure');
+  assert.strictEqual(feed.imageUrl, 'https://cdn.example.com/show.jpg', 'show artwork from itunes:image');
+  assert.strictEqual(first.imageUrl, 'https://cdn.example.com/ep42.jpg?w=1&h=1', 'episode art, entities decoded');
+  assert.strictEqual(second.imageUrl, '', 'no episode art: the caller falls back to the show');
+  assert.strictEqual(parseFeed(`<rss><channel><title>T</title>
+    <image><url>https://cdn.example.com/rss.png</url><title>T</title></image>
+    <item><enclosure url="https://cdn.example.com/a.mp3" type="audio/mpeg"/></item></channel></rss>`).imageUrl,
+    'https://cdn.example.com/rss.png', 'plain RSS <image><url> when there is no itunes:image');
+  assert.strictEqual(parseFeed(`<rss><channel><title>T</title><itunes:image href="javascript:alert(1)"/>
+    </channel></rss>`).imageUrl, '', 'only http(s) artwork');
 
   assert.strictEqual(parseDuration('90'), 90, 'bare seconds');
   assert.strictEqual(parseDuration('2:30'), 150, 'mm:ss');
@@ -2341,7 +2352,43 @@ function testFeedParsing() {
   console.log('  Podcast feed parsing ✔');
 }
 
+/** Feed artwork onto episodes already taken, and by show name (db.js). */
+function testFeedArtBackfill() {
+  const { open } = require('./db');
+  const store = open(fs.mkdtempSync(path.join(os.tmpdir(), 'readlater-art-')));
+  const ep = (id, imageUrl) => store.insertArticle({
+    id, userId: 'u1', url: `audio:${id}`, savedAt: 1, updatedAt: 1, archived: false, favorite: false,
+    readParagraph: 0, source: 'podcast-feed', title: id, byline: null, siteName: 'The Build Show', excerpt: null,
+    html: '<p>x</p>', textContent: 'x', imageUrl,
+  });
+  ep('e1', null); ep('e2', 'https://own.example/art.jpg'); ep('e3', null);
+  store.insertFeed({ id: 'f1', userId: 'u1', url: 'https://example.com/rss', title: 'The Build Show', addedAt: 1 });
+  store.markFeedItemSeen('f1', 'g1', 'e1');
+  store.markFeedItemSeen('f1', 'g2', 'e2');
+  store.markFeedItemSeen('f1', 'g3', null); // could not be taken
+  const n = store.backfillFeedArt('f1', [
+    { guid: 'g1', imageUrl: 'https://cdn.example.com/1.jpg' },
+    { guid: 'g2', imageUrl: 'https://cdn.example.com/2.jpg' },
+    { guid: 'g3', imageUrl: 'https://cdn.example.com/3.jpg' },
+  ]);
+  assert.strictEqual(n, 1, 'only the taken episode with no art changes');
+  const e1 = store.getArticle('e1', 'u1');
+  assert.strictEqual(e1.imageUrl, 'https://cdn.example.com/1.jpg');
+  assert.ok(e1.updatedAt > 1, 'updatedAt moves so the app syncs the art');
+  assert.strictEqual(store.getArticle('e2', 'u1').imageUrl, 'https://own.example/art.jpg', 'existing art kept');
+  assert.strictEqual(store.getArticle('e3', 'u1').imageUrl, null, 'unrelated article untouched');
+
+  assert.strictEqual(store.feedArtByTitle('u1', 'the build show'), '', 'no artwork recorded yet');
+  store.touchFeed('f1', { imageUrl: 'https://cdn.example.com/show.jpg' });
+  assert.strictEqual(store.feedArtByTitle('u1', 'the build show'), 'https://cdn.example.com/show.jpg', 'case-insensitive show match');
+  assert.strictEqual(store.feedArtByTitle('u2', 'The Build Show'), '', "another user's feed is not used");
+  store.touchFeed('f1', { checkedAt: 5 });
+  assert.strictEqual(store.feedArtByTitle('u1', 'The Build Show'), 'https://cdn.example.com/show.jpg', 'a 304 check keeps the art');
+  console.log('  Feed artwork backfill ✔');
+}
+
 testFeedParsing();
+testFeedArtBackfill();
 testProblemDetection();
 testTtsSkipsCaptions();
 testTranscriptShaping();

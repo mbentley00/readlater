@@ -77,7 +77,7 @@ class ShareUploadService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         // Must be foreground within seconds of startForegroundService, whatever follows.
         val notification = NotificationCompat.Builder(this, CHANNEL_ID)
-            .setSmallIcon(R.drawable.ic_launcher_foreground)
+            .setSmallIcon(R.drawable.ic_notification)
             .setContentTitle("Sending episode to Earmark")
             .setProgress(0, 0, true)
             .setOngoing(true)

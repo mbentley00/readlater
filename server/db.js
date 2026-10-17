@@ -741,6 +741,12 @@ function open(dataDir) {
 
   // Kindle location (or page) a highlight came from, so an imported highlight
   // points back at its exact spot in the book.
+  // A feed's show artwork: null until a check has read it, '' when it has none
+  // (feeds.js refetches past a 304 while it is null, to backfill episodes).
+  const feedCols = sqlite.prepare('PRAGMA table_info(feeds)').all().map((c) => c.name);
+  if (!feedCols.includes('imageUrl')) {
+    sqlite.exec('ALTER TABLE feeds ADD COLUMN imageUrl TEXT');
+  }
   const highlightCols = sqlite.prepare('PRAGMA table_info(highlights)').all().map((c) => c.name);
   if (!highlightCols.includes('location')) {
     sqlite.exec("ALTER TABLE highlights ADD COLUMN location TEXT");
@@ -1042,16 +1048,18 @@ function open(dataDir) {
       prep('fd', 'DELETE FROM feeds WHERE id = ? AND userId = ?').run(id, userId).changes,
 
     /** Record the outcome of a check. Only the fields given are written. */
-    touchFeed: (id, { checkedAt, title, etag, lastModified, error } = {}) =>
+    touchFeed: (id, { checkedAt, title, imageUrl, etag, lastModified, error } = {}) =>
       prep('ft', `UPDATE feeds SET
         lastCheckedAt = COALESCE(@checkedAt, lastCheckedAt),
         title = COALESCE(@title, title),
+        imageUrl = COALESCE(@imageUrl, imageUrl),
         etag = @etag, lastModified = @lastModified, lastError = @error
         WHERE id = @id`)
         .run({
           id,
           checkedAt: checkedAt ?? null,
           title: title ?? null,
+          imageUrl: imageUrl ?? null,
           etag: etag ?? null,
           lastModified: lastModified ?? null,
           error: error ?? null,
@@ -1065,6 +1073,30 @@ function open(dataDir) {
         VALUES (@feedId, @guid, @articleId, @seenAt)
         ON CONFLICT(feedId, guid) DO UPDATE SET articleId = COALESCE(@articleId, articleId)`)
         .run({ feedId, guid: String(guid).slice(0, 500), articleId: articleId ?? null, seenAt: Date.now() }),
+
+    /** Give episodes already taken from a feed their artwork — only those
+     *  with none, so an image set since is never overwritten. updatedAt moves
+     *  so the app's next sync picks the change up. Returns how many changed. */
+    backfillFeedArt: (feedId, items) => {
+      const upd = prep('fart', `UPDATE articles SET imageUrl = @imageUrl, updatedAt = @now
+        WHERE imageUrl IS NULL
+          AND id = (SELECT articleId FROM feed_items WHERE feedId = @feedId AND guid = @guid)`);
+      const now = Date.now();
+      let n = 0;
+      sqlite.transaction(() => {
+        for (const { guid, imageUrl } of items) {
+          if (imageUrl) n += upd.run({ feedId, guid: String(guid).slice(0, 500), imageUrl, now }).changes;
+        }
+      })();
+      return n;
+    },
+
+    /** Artwork of the user's subscribed show with this name ('' if none) — for
+     *  an episode shared from a player whose file carries no cover art. */
+    feedArtByTitle: (userId, title) =>
+      (title && (prep('fabt', `SELECT imageUrl FROM feeds
+        WHERE userId = ? AND title = ? COLLATE NOCASE AND imageUrl != '' LIMIT 1`)
+        .get(userId, String(title)) || {}).imageUrl) || '',
 
     /** Mark a whole feed's current contents as already seen — what subscribing
      *  does, so nothing from the back catalogue is imported. */

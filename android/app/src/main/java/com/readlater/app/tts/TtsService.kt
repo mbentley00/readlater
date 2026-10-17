@@ -2992,7 +2992,7 @@ class TtsService : Service() {
             else -> articleSubtitle().ifBlank { "Reading aloud" }
         }
         return NotificationCompat.Builder(this, CHANNEL_ID)
-            .setSmallIcon(R.drawable.ic_launcher_foreground)
+            .setSmallIcon(R.drawable.ic_notification)
             .setContentTitle(articleTitle.ifBlank { "Earmark" })
             .setContentText(progressText)
             .setContentIntent(contentIntent)

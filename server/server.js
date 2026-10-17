@@ -237,6 +237,7 @@ async function saveFeedEpisode({ feed, item, buf }) {
     title: item.title || tags.title || transcribe.PLACEHOLDER_TITLE,
     byline: tags.byline,
     siteName: feed.title || tags.siteName || 'Podcast',
+    imageUrl: item.imageUrl || feed.imageUrl || null,
     excerpt: 'Transcribing…',
     html: '<p>Transcribing… A long episode can take a few minutes; the text appears here when it is done.</p>',
     textContent: '', updatedAt: now,
@@ -287,6 +288,29 @@ fs.mkdirSync(EPISODE_DIR, { recursive: true });
 const EPISODE_KEEP_MS = 30 * 24 * 60 * 60 * 1000;
 const EPISODE_DIR_MAX_BYTES = 1024 * 1024 * 1024;
 const EPISODE_MIN_FREE_BYTES = 1024 * 1024 * 1024;
+// Cover art pulled out of shared audio files, named by a hash of the image so
+// re-shares and episodes of one show share a file. Small (≤600px JPEG) and
+// public: a list thumbnail has to load without the app's token, and a hash
+// name gives nothing away about the library.
+const ART_DIR = path.join(DATA_DIR, 'art');
+fs.mkdirSync(ART_DIR, { recursive: true });
+const ART_NAME = /^[0-9a-f]{24}\.jpg$/;
+
+/** List artwork for a shared episode: its embedded cover, else the artwork of
+ *  the subscribed show it names, else null. */
+async function sharedEpisodeArt(req, file, userId, showName) {
+  const jpg = await transcribe.extractCover(file);
+  if (jpg) {
+    const name = crypto.createHash('sha256').update(jpg).digest('hex').slice(0, 24) + '.jpg';
+    const dest = path.join(ART_DIR, name);
+    try {
+      if (!fs.existsSync(dest)) fs.writeFileSync(dest, jpg);
+      return `${originOf(req)}/api/art/${name}`;
+    } catch (e) { console.warn(`cover art not saved: ${e.message}`); }
+  }
+  return store.feedArtByTitle(userId, showName) || null;
+}
+
 const EPISODE_TYPES = { mp3: 'audio/mpeg', m4a: 'audio/mp4', aac: 'audio/aac', ogg: 'audio/ogg', opus: 'audio/ogg', wav: 'audio/wav' };
 
 const episodeFiles = () => fs.readdirSync(EPISODE_DIR)
@@ -1051,6 +1075,17 @@ const server = http.createServer(async (req, res) => {
     }
   }
 
+  // ---- episode cover art (sharedEpisodeArt): public, see ART_DIR.
+  if (req.method === 'GET' && parts[1] === 'art' && parts.length === 3 && ART_NAME.test(parts[2])) {
+    const file = path.join(ART_DIR, parts[2]);
+    if (!fs.existsSync(file)) return json(res, 404, { error: 'not found' });
+    res.writeHead(200, {
+      'Content-Type': 'image/jpeg',
+      'Cache-Control': 'public, max-age=31536000, immutable', // the name is the content hash
+    });
+    return fs.createReadStream(file).pipe(res);
+  }
+
   // auth: bearer token (devices) or session cookie (web UI)
   const auth = req.headers.authorization || '';
   const presented = auth.startsWith('Bearer ') ? auth.slice(7).trim() : '';
@@ -1387,6 +1422,7 @@ const server = http.createServer(async (req, res) => {
           title: parsed.title || hostOf(feedUrl), addedAt: Date.now(),
         };
         store.insertFeed(feed);
+        store.touchFeed(feed.id, { imageUrl: parsed.imageUrl });
         // Everything in it right now counts as already seen: a subscription
         // starts with the next episode published, not the back catalogue.
         store.markFeedItemsSeen(feed.id, parsed.items.map((i) => i.guid));
@@ -1722,6 +1758,7 @@ const server = http.createServer(async (req, res) => {
         if (!sttQueued.has(id)) fs.writeFileSync(sttSpoolFile(id), buf);
         if (!a) {
           const meta = transcribe.audioMeta(filename, await transcribe.probeTags(sttSpoolFile(id)));
+          const imageUrl = await sharedEpisodeArt(req, sttSpoolFile(id), user.id, meta.siteName);
           a = store.articleByUrl(user.id, artUrl); // the same file may have landed during the probe
           if (!a) {
             const now = Date.now();
@@ -1730,7 +1767,7 @@ const server = http.createServer(async (req, res) => {
               savedAt: now, archived: false, favorite: false, readParagraph: 0,
               source: 'audio',
               title: meta.title || transcribe.PLACEHOLDER_TITLE,
-              byline: meta.byline, siteName: meta.siteName,
+              byline: meta.byline, siteName: meta.siteName, imageUrl,
               excerpt: 'Transcribing…',
               html: '<p>Transcribing… A long episode can take a few minutes; the text appears here when it is done.</p>',
               textContent: '', updatedAt: now,
