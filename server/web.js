@@ -231,6 +231,17 @@ body.dropping::after { content:'Drop to import'; position:fixed; inset:.5rem; z-
 ul.skip-rules { list-style:none; padding:0; margin:.5rem 0 0; }
 ul.skip-rules li { display:flex; gap:.6rem; align-items:center; padding:.35rem 0; border-bottom:1px solid var(--line); }
 ul.skip-rules .phrase { flex:1; min-width:0; color:var(--fg); overflow-wrap:anywhere; }
+.feed-add { margin:.6rem 0 .3rem; }
+.feed-add textarea { width:100%; box-sizing:border-box; padding:.35rem .5rem; border:1px solid var(--line); border-radius:6px; background:transparent; color:var(--fg); font:inherit; resize:vertical; }
+.feed-add-row { display:flex; gap:.6rem; align-items:center; flex-wrap:wrap; margin-top:.3rem; }
+.feed-add-row label { display:flex; gap:.3rem; align-items:center; }
+.feed-add-row input[type=file] { max-width:12rem; }
+ul.feed-results { list-style:none; padding:0; margin:.3rem 0; }
+ul.skip-rules.feeds > li { display:block; }
+.feed-row { display:flex; gap:.6rem; align-items:center; flex-wrap:wrap; }
+.feed-row label { display:flex; gap:.3rem; align-items:center; white-space:nowrap; }
+ul.feed-pending { list-style:none; padding:0 0 0 1rem; margin:.3rem 0 0; }
+ul.feed-pending li { display:flex; gap:.5rem; align-items:center; padding:.2rem 0; flex-wrap:wrap; }
 /* "Never import this text" editor, opened from the reader */
 #skip-dialog, #reparse-dialog, #share-dialog, #type-dialog { position:fixed; inset:0; z-index:80; background:rgba(0,0,0,.45); display:flex; align-items:center; justify-content:center; padding:1rem; }
 #skip-dialog[hidden], #reparse-dialog[hidden], #share-dialog[hidden], #type-dialog[hidden] { display:none; }
@@ -577,9 +588,23 @@ const SOURCES = {
 };
 const cleanSrc = (v) => (SOURCES[v] ? v : '');
 
+/**
+ * The highlights filter, from ?hl=. A typed search defaults to articles you
+ * highlighted: what you search for is usually something you marked. Picking
+ * "Highlights: any" sends hl=any, which widens it back to everything; only a
+ * search with words in it gets the default, so plain lists (Problems, From
+ * phone, a state dropdown alone) are untouched. Returns '' for "any".
+ */
+function hlParam(get) {
+  const raw = get('hl') || (get('highlighted') === '1' ? '1' : '');
+  if (raw === 'any') return '';
+  if (!raw && (get('q') || '').trim()) return '1';
+  return raw;
+}
+
 /** Build searchArticles filters from web form params (q/domain/hl/len/state/src). */
 function filtersFromParams(get, knownDomains = []) {
-  const hl = get('hl') || (get('highlighted') === '1' ? '1' : '');
+  const hl = hlParam(get);
   const src = cleanSrc(get('src'));
   // The "From phone" list is a to-do list: shares whose server-side fetch may
   // have missed content, worth re-saving from Firefox. A share that landed
@@ -680,7 +705,10 @@ function listPage(ctx, user, view, url, prefs = {}) {
 
   const q = get('q').trim();
   const domain = get('domain').trim();
-  const hl = get('hl') || (get('highlighted') === '1' ? '1' : '');
+  const hl = hlParam(get);
+  // What to put back in a URL or form so the same highlights choice survives:
+  // with words typed, "any" must be spelled out or it reverts to the default.
+  const hlKeep = hl || (q ? 'any' : '');
   const len = get('len');
   const state = cleanState(get('state'));
   const src = cleanSrc(get('src'));
@@ -769,7 +797,7 @@ function listPage(ctx, user, view, url, prefs = {}) {
 <form class="saveview" method="post" action="/views/save">
   <input type="hidden" name="q" value="${escapeHtml(q)}">
   <input type="hidden" name="domain" value="${escapeHtml(domain)}">
-  <input type="hidden" name="hl" value="${escapeHtml(hl)}">
+  <input type="hidden" name="hl" value="${escapeHtml(hlKeep)}">
   <input type="hidden" name="len" value="${escapeHtml(len)}">
   <input type="hidden" name="state" value="${escapeHtml(state)}">
   <input type="hidden" name="src" value="${escapeHtml(src)}">
@@ -781,7 +809,7 @@ function listPage(ctx, user, view, url, prefs = {}) {
   const viewParam = get('view');
   // Build a URL preserving the current view/filters/sort with overrides.
   const buildQs = (overrides) => {
-    const cur = { view: viewParam, q, domain, len, hl, src, problems: problems ? '1' : '', state: state === 'any' ? '' : state, sort, seed, ...overrides };
+    const cur = { view: viewParam, q, domain, len, hl: hlKeep, src, problems: problems ? '1' : '', state: state === 'any' ? '' : state, sort, seed, ...overrides };
     const p = new URLSearchParams();
     for (const [k, v] of Object.entries(cur)) if (v && !(k === 'sort' && v === 'newest')) p.set(k, String(v));
     const s = p.toString();
@@ -803,7 +831,7 @@ ${viewChips}
     <option value="long" ${len === 'long' ? 'selected' : ''}>&gt; 20 min</option>
   </select>
   <select name="hl">
-    <option value="">Highlights: any</option>
+    <option value="any">Highlights: any</option>
     <option value="1" ${hl === '1' ? 'selected' : ''}>has highlights</option>
     <option value="3" ${hl === '3' ? 'selected' : ''}>3+ highlights</option>
   </select>
@@ -821,7 +849,7 @@ ${viewChips}
 </form>
 ${savedView ? `<div class="meta">${total.toLocaleString('en-US')} article${total === 1 ? '' : 's'} in “${escapeHtml(savedView.name)}”</div>` : ''}
 ${problems && !savedView ? `<div class="meta">${total.toLocaleString('en-US')} article${total === 1 ? '' : 's'} didn't save properly — they are kept out of the Inbox. Open one in Firefox and the extension re-saves it from the rendered page; or delete it.</div>` : ''}
-${searching && !savedView && !problems ? `<div class="meta">${total.toLocaleString('en-US')} result${total === 1 ? '' : 's'}${q ? ` for “${escapeHtml(q)}”` : ''}${domain ? ` from ${escapeHtml(domain)}` : ''}${state !== 'any' ? ` · ${escapeHtml(STATE_LABELS[state].toLowerCase())}` : ''}${src ? ` · ${escapeHtml(SOURCES[src].label.toLowerCase())}` : ''}${src === 'phone' && total ? ' — open the original and save it again from Firefox to be sure the right version was kept' : ''}</div>${saveViewForm}` : ''}
+${searching && !savedView && !problems ? `<div class="meta">${total.toLocaleString('en-US')} result${total === 1 ? '' : 's'}${q ? ` for “${escapeHtml(q)}”` : ''}${domain ? ` from ${escapeHtml(domain)}` : ''}${hl ? ` · ${hl === '1' ? 'with highlights' : `${escapeHtml(hl)}+ highlights`}${q ? ` — <a href="${buildQs({ hl: 'any', page: '' })}">search all articles</a>` : ''}` : ''}${state !== 'any' ? ` · ${escapeHtml(STATE_LABELS[state].toLowerCase())}` : ''}${src ? ` · ${escapeHtml(SOURCES[src].label.toLowerCase())}` : ''}${src === 'phone' && total ? ' — open the original and save it again from Firefox to be sure the right version was kept' : ''}</div>${saveViewForm}` : ''}
 ${!searching && !savedView ? `<div class="meta">${total.toLocaleString('en-US')} article${total === 1 ? '' : 's'}</div>` : ''}`;
 
   const pager = pageCount > 1 ? `<div class="pager">
@@ -2120,21 +2148,44 @@ ${msg === 'alias' ? '<div class="notice">Email address regenerated — update yo
   transcribed like an episode shared from a player. Subscribing imports nothing:
   it starts with the next episode published. Feeds are checked every
   ${feedIntervalMinutes} minutes, and at most ${feedMaxPerPoll} episodes are taken
-  from one feed per check.
-    <form id="feed-add" class="skip-add">
-      <input type="url" id="feed-url" placeholder="https://example.com/podcast/rss" maxlength="2000">
-      <button class="act" type="submit">Subscribe</button>
+  from one feed per check. With auto-download off, new episodes wait here
+  instead, and nothing is downloaded until you pick one.
+    <form id="feed-add" class="feed-add">
+      <textarea id="feed-urls" rows="3" placeholder="One or more feed URLs, one per line — or paste an OPML export from your podcast app"></textarea>
+      <div class="feed-add-row">
+        <label class="meta"><input type="file" id="feed-file" accept=".opml,.xml,.txt,text/xml,text/plain"> or choose an OPML file</label>
+        <label class="meta"><input type="checkbox" id="feed-auto" checked> Download &amp; transcribe new episodes automatically</label>
+        <button class="act" type="submit">Subscribe</button>
+      </div>
     </form>
     <div id="feed-msg" class="meta"></div>
-    ${feedList.length ? `<ul class="skip-rules">${feedList.map((f) => `
+    <ul id="feed-results" class="meta feed-results"></ul>
+    ${feedList.length ? `<ul class="skip-rules feeds">${feedList.map((f) => {
+      const pending = f.pendingCount ? ctx.store.listPendingFeedItems(f.id, 20) : [];
+      return `
       <li data-id="${escapeHtml(f.id)}">
+        <div class="feed-row">
         <span class="phrase">${escapeHtml(f.title || f.url)}<br>
           <span class="meta">${escapeHtml(f.url)}</span></span>
         <span class="meta">${f.episodes ? `${f.episodes} episode${f.episodes === 1 ? '' : 's'}` : 'nothing yet'}${
+      f.pendingCount ? ` · ${f.pendingCount} waiting` : ''}${
       f.lastError ? ` · <span class="problem-note">${escapeHtml(f.lastError)}</span>`
         : f.lastCheckedAt ? ` · checked ${fmtDate(f.lastCheckedAt)}` : ' · not checked yet'}</span>
+        <label class="meta" title="Download and transcribe new episodes as they come out"><input type="checkbox" class="feed-auto" ${f.autoProcess !== 0 ? 'checked' : ''}> Auto-download</label>
         <button class="act del-feed" type="button">Unsubscribe</button>
-      </li>`).join('')}</ul>
+        </div>${pending.length ? `
+        <ul class="feed-pending">${pending.map((p) => `
+          <li data-guid="${escapeHtml(p.guid)}">
+            <span class="phrase">${escapeHtml(p.title || p.url)}<span class="meta">${
+        p.publishedAt ? ` · ${fmtDate(p.publishedAt)}` : ''}${
+        p.durationS ? ` · ${Math.max(1, Math.round(p.durationS / 60))} min` : ''}</span></span>
+            <button class="act take-ep" type="button">Download &amp; transcribe</button>
+            <button class="act dismiss-ep" type="button" title="Stop offering this episode">Dismiss</button>
+          </li>`).join('')}${f.pendingCount > pending.length ? `
+          <li class="meta">…and ${f.pendingCount - pending.length} older</li>` : ''}
+        </ul>` : ''}
+      </li>`;
+    }).join('')}</ul>
     <form id="feed-check"><button class="act" type="submit">Check now</button></form>`
       : '<div class="meta">No subscriptions yet.</div>'}
   </dd>
@@ -2189,24 +2240,47 @@ document.getElementById('skip-add').addEventListener('submit', async (e) => {
 const feedMsg = document.getElementById('feed-msg');
 const feedSay = (t, bad) => { feedMsg.textContent = t; feedMsg.style.color = bad ? '#b3261e' : ''; };
 
+const feedUrls = document.getElementById('feed-urls');
+// An OPML file is read here and dropped into the box, so what gets sent is
+// visible (and editable) before subscribing.
+document.getElementById('feed-file').addEventListener('change', async (e) => {
+  const file = e.target.files[0];
+  if (!file) return;
+  const text = await file.text();
+  feedUrls.value = (feedUrls.value.trim() ? feedUrls.value.trim() + '\\n' : '') + text;
+  e.target.value = '';
+});
+
 document.getElementById('feed-add').addEventListener('submit', async (e) => {
   e.preventDefault();
-  const input = document.getElementById('feed-url');
-  const url = input.value.trim();
-  if (!url) return;
-  feedSay('Reading that feed…');
-  const res = await fetch('/api/feeds', {
+  const text = feedUrls.value.trim();
+  if (!text) return;
+  const results = document.getElementById('feed-results');
+  results.textContent = '';
+  feedSay('Reading feeds… (a big list can take a minute)');
+  const res = await fetch('/api/feeds/import', {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ url }),
+    body: JSON.stringify({ text, autoProcess: document.getElementById('feed-auto').checked }),
   });
   const data = await res.json().catch(() => ({}));
   if (!res.ok) return feedSay(data.error || 'could not subscribe to that', true);
-  input.value = '';
-  feedSay(data.alreadySubscribed
-    ? 'Already subscribed to that one. Reloading…'
-    : 'Subscribed to ' + (data.title || url) + ' — its ' + data.existingEpisodes
-      + ' existing episode(s) are left alone; the next one published arrives here. Reloading…');
-  setTimeout(() => location.reload(), 1800);
+  const added = data.results.filter((r) => r.ok && !r.alreadySubscribed).length;
+  const already = data.results.filter((r) => r.alreadySubscribed).length;
+  const failed = data.results.filter((r) => !r.ok);
+  for (const r of data.results) {
+    const li = document.createElement('li');
+    li.textContent = (r.ok ? (r.alreadySubscribed ? '• already subscribed: ' : '✓ ') + (r.title || r.url)
+      : '✗ ' + r.url + ' — ' + r.error);
+    if (!r.ok) li.style.color = '#b3261e';
+    results.appendChild(li);
+  }
+  // Keep only what failed in the box, to fix and retry.
+  feedUrls.value = failed.map((r) => r.url).join('\\n');
+  feedSay('Subscribed to ' + added + (already ? ', ' + already + ' already subscribed' : '')
+    + (failed.length ? ', ' + failed.length + ' failed' : '')
+    + '. Existing episodes are left alone; new ones arrive from now on.'
+    + (failed.length ? '' : ' Reloading…'), failed.length > 0);
+  if (!failed.length) setTimeout(() => location.reload(), 1800);
 });
 
 document.querySelectorAll('.del-feed').forEach((b) => {
@@ -2214,6 +2288,42 @@ document.querySelectorAll('.del-feed').forEach((b) => {
     const li = b.closest('li[data-id]');
     await fetch('/api/feeds/' + li.dataset.id, { method: 'DELETE' });
     li.remove();
+  });
+});
+
+document.querySelectorAll('.feed-auto').forEach((box) => {
+  box.addEventListener('change', async () => {
+    const li = box.closest('li[data-id]');
+    const res = await fetch('/api/feeds/' + li.dataset.id, {
+      method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ autoProcess: box.checked }),
+    });
+    if (!res.ok) { box.checked = !box.checked; return feedSay('could not change that', true); }
+    feedSay(box.checked
+      ? 'New episodes from this feed will be downloaded and transcribed as they come out.'
+      : 'New episodes from this feed will wait here for you to pick.');
+  });
+});
+
+document.querySelectorAll('.take-ep, .dismiss-ep').forEach((b) => {
+  b.addEventListener('click', async () => {
+    const ep = b.closest('li[data-guid]');
+    const feedId = b.closest('ul.feeds > li[data-id]').dataset.id;
+    const take = b.classList.contains('take-ep');
+    ep.querySelectorAll('button').forEach((x) => { x.disabled = true; });
+    if (take) b.textContent = 'Downloading…';
+    const res = await fetch('/api/feeds/' + feedId + '/episodes/' + (take ? 'take' : 'dismiss'), {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ guid: ep.dataset.guid }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      ep.querySelectorAll('button').forEach((x) => { x.disabled = false; });
+      if (take) b.textContent = 'Download & transcribe';
+      return feedSay(data.error || 'that did not work', true);
+    }
+    if (take) feedSay(data.alreadyHere ? 'That episode is already in your list.' : 'Downloaded — transcribing now; it is in your list.');
+    ep.remove();
   });
 });
 

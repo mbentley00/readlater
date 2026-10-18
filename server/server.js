@@ -251,6 +251,48 @@ async function saveFeedEpisode({ feed, item, buf }) {
   return a;
 }
 
+/** Most feeds one import may add — a big OPML export is ~100 shows. */
+const FEED_IMPORT_MAX = 200;
+
+/**
+ * Subscribe a user to a feed. Reads it first, refusing one with no episodes;
+ * everything already in it is marked seen, so the subscription starts with
+ * the next episode published. Returns {status, body} for the API to send.
+ */
+async function subscribeFeed(userId, rawUrl, { autoProcess = true } = {}) {
+  const feedUrl = sanitizeString(rawUrl, 2000);
+  if (!feedUrl || !/^https?:\/\//i.test(feedUrl)) {
+    return { status: 400, body: { error: 'a http(s) feed url is required' } };
+  }
+  const already = store.feedByUrl(userId, feedUrl);
+  if (already) return { status: 200, body: { ...already, userId: undefined, alreadySubscribed: true } };
+  let parsed;
+  try {
+    const got = await feeds.fetchFeed(feedUrl);
+    parsed = feeds.parseFeed(got.xml || '');
+  } catch (e) {
+    return { status: 400, body: { error: `could not read that feed: ${e.message}` } };
+  }
+  if (!parsed.items.length) {
+    return { status: 400, body: { error: 'that feed has no episodes in it (no <enclosure> audio found)' } };
+  }
+  // Two imports racing on the same URL: the unique index catches the second.
+  if (store.feedByUrl(userId, feedUrl)) {
+    return { status: 200, body: { ...store.feedByUrl(userId, feedUrl), userId: undefined, alreadySubscribed: true } };
+  }
+  const feed = {
+    id: newId(), userId, url: feedUrl,
+    title: parsed.title || hostOf(feedUrl), addedAt: Date.now(), autoProcess,
+  };
+  store.insertFeed(feed);
+  store.touchFeed(feed.id, { imageUrl: parsed.imageUrl });
+  // Everything in it right now counts as already seen: a subscription
+  // starts with the next episode published, not the back catalogue.
+  store.markFeedItemsSeen(feed.id, parsed.items.map((i) => i.guid));
+  console.log(`feed added "${feed.title}" (${feedUrl}) — ${parsed.items.length} existing episode(s) marked seen${autoProcess ? '' : ', new ones will wait'}`);
+  return { status: 201, body: { ...feed, userId: undefined, existingEpisodes: parsed.items.length } };
+}
+
 /** Stream a file, honouring a single Range request (for seeking). */
 function sendFileRange(req, res, file, mime) {
   const size = fs.statSync(file).size;
@@ -531,6 +573,12 @@ function withSkipRules(userId, fields, url) {
   // Built-in per-publisher rules run first (they truncate), then the user's
   // phrase rules run over what's left.
   let input = fields;
+  // Back-to-back duplicate blocks (a caption per responsive image, …), any site.
+  const { repeats, ...deduped } = skip.applyRepeatedBlocks(input);
+  if (repeats) {
+    console.log(`removed ${repeats} repeated block(s)${url ? ` from ${url}` : ''}`);
+    input = deduped;
+  }
   if (url) {
     const { truncated, cartoons, ...cut } = skip.applyDomainRules(url, input);
     if (truncated) console.log(`domain rule: truncated ${url} at its end-of-article mark`);
@@ -1395,40 +1443,75 @@ const server = http.createServer(async (req, res) => {
     if (parts[1] === 'feeds' && parts.length === 2) {
       if (req.method === 'GET') {
         return json(res, 200, {
-          feeds: store.listFeeds(user.id).map(({ userId, etag, lastModified, ...f }) => f),
+          feeds: store.listFeeds(user.id).map(({ userId, etag, lastModified, ...f }) => ({
+            ...f,
+            autoProcess: f.autoProcess !== 0,
+            pending: f.pendingCount ? store.listPendingFeedItems(f.id) : [],
+          })),
           intervalMinutes: feeds.POLL_INTERVAL_MS / 60000,
         });
       }
       if (req.method === 'POST') {
         const b = parseBody(await readBody(req), req.headers['content-type']);
-        const feedUrl = sanitizeString(b.url, 2000);
-        if (!feedUrl || !/^https?:\/\//i.test(feedUrl)) {
-          return json(res, 400, { error: 'a http(s) feed url is required' });
-        }
-        const already = store.feedByUrl(user.id, feedUrl);
-        if (already) return json(res, 200, { ...already, userId: undefined, alreadySubscribed: true });
-        let parsed;
-        try {
-          const got = await feeds.fetchFeed(feedUrl);
-          parsed = feeds.parseFeed(got.xml || '');
-        } catch (e) {
-          return json(res, 400, { error: `could not read that feed: ${e.message}` });
-        }
-        if (!parsed.items.length) {
-          return json(res, 400, { error: 'that feed has no episodes in it (no <enclosure> audio found)' });
-        }
-        const feed = {
-          id: newId(), userId: user.id, url: feedUrl,
-          title: parsed.title || hostOf(feedUrl), addedAt: Date.now(),
-        };
-        store.insertFeed(feed);
-        store.touchFeed(feed.id, { imageUrl: parsed.imageUrl });
-        // Everything in it right now counts as already seen: a subscription
-        // starts with the next episode published, not the back catalogue.
-        store.markFeedItemsSeen(feed.id, parsed.items.map((i) => i.guid));
-        console.log(`feed added "${feed.title}" (${feedUrl}) — ${parsed.items.length} existing episode(s) marked seen`);
-        return json(res, 201, { ...feed, userId: undefined, existingEpisodes: parsed.items.length });
+        const r = await subscribeFeed(user.id, b.url, { autoProcess: b.autoProcess !== false });
+        return json(res, r.status, r.body);
       }
+    }
+    // POST /api/feeds/import — many at once: {text} is pasted URLs or an OPML
+    // export, {autoProcess} applies to every feed added. Feeds are read a few
+    // at a time; each gets its own result line, and one bad feed fails alone.
+    if (req.method === 'POST' && parts[1] === 'feeds' && parts[2] === 'import' && parts.length === 3) {
+      const b = parseBody(await readBody(req), req.headers['content-type']);
+      const urls = feeds.feedUrlsFrom(Array.isArray(b.urls) ? b.urls.join('\n') : b.text);
+      if (!urls.length) return json(res, 400, { error: 'no feed URLs found in that' });
+      if (urls.length > FEED_IMPORT_MAX) {
+        return json(res, 400, { error: `that is ${urls.length} feeds — import at most ${FEED_IMPORT_MAX} at a time` });
+      }
+      const results = new Array(urls.length);
+      let next = 0;
+      const worker = async () => {
+        while (next < urls.length) {
+          const i = next++;
+          const r = await subscribeFeed(user.id, urls[i], { autoProcess: b.autoProcess !== false });
+          results[i] = r.status < 300
+            ? { url: urls[i], ok: true, title: r.body.title, alreadySubscribed: !!r.body.alreadySubscribed }
+            : { url: urls[i], ok: false, error: r.body.error };
+        }
+      };
+      await Promise.all(Array.from({ length: Math.min(4, urls.length) }, worker));
+      return json(res, 200, { results });
+    }
+    // PATCH /api/feeds/:id — {autoProcess}: take new episodes by themselves, or
+    // leave them waiting to be picked.
+    if (req.method === 'PATCH' && parts[1] === 'feeds' && parts.length === 3) {
+      const b = parseBody(await readBody(req), req.headers['content-type']);
+      if (typeof b.autoProcess !== 'boolean') return json(res, 400, { error: 'autoProcess (true/false) is required' });
+      const n = store.setFeedAutoProcess(parts[2], user.id, b.autoProcess);
+      return json(res, n ? 200 : 404, n ? { ok: true, autoProcess: b.autoProcess } : { error: 'no such feed' });
+    }
+    // POST /api/feeds/:id/episodes/(take|dismiss) {guid} — a waiting episode:
+    // download and transcribe it now, or stop offering it.
+    if (req.method === 'POST' && parts[1] === 'feeds' && parts[3] === 'episodes' && parts.length === 5
+        && ['take', 'dismiss'].includes(parts[4])) {
+      const feed = store.getFeed(parts[2], user.id);
+      if (!feed) return json(res, 404, { error: 'no such feed' });
+      const b = parseBody(await readBody(req), req.headers['content-type']);
+      const item = store.getPendingFeedItem(feed.id, String(b.guid || ''));
+      if (!item) return json(res, 404, { error: 'that episode is not waiting' });
+      if (parts[4] === 'dismiss') {
+        store.clearPendingFeedItem(feed.id, item.guid);
+        return json(res, 200, { ok: true });
+      }
+      let buf;
+      try {
+        buf = await feeds.fetchEpisode(item.url, AUDIO_IMPORT_MAX_BYTES);
+      } catch (e) {
+        // Left waiting: a host that is down now may not be later.
+        return json(res, 502, { error: `could not download that episode: ${e.message}` });
+      }
+      const a = await saveFeedEpisode({ feed: { ...feed, imageUrl: feed.imageUrl || '' }, item, buf });
+      store.clearPendingFeedItem(feed.id, item.guid);
+      return json(res, 200, { ok: true, articleId: a ? a.id : null, alreadyHere: !a });
     }
     // POST /api/feeds/check — check every feed now rather than at the next poll.
     if (req.method === 'POST' && parts[1] === 'feeds' && parts[2] === 'check' && parts.length === 3) {

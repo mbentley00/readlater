@@ -747,6 +747,18 @@ function open(dataDir) {
   if (!feedCols.includes('imageUrl')) {
     sqlite.exec('ALTER TABLE feeds ADD COLUMN imageUrl TEXT');
   }
+  // Off: new episodes wait on the Settings page for you to pick, rather than
+  // being downloaded and transcribed as they arrive.
+  if (!feedCols.includes('autoProcess')) {
+    sqlite.exec('ALTER TABLE feeds ADD COLUMN autoProcess INTEGER NOT NULL DEFAULT 1');
+  }
+  // A waiting episode (pending = 1) keeps what is needed to take it later
+  // without re-reading the feed, which may have dropped it by then.
+  const itemCols = sqlite.prepare('PRAGMA table_info(feed_items)').all().map((c) => c.name);
+  for (const [col, type] of [['pending', 'INTEGER NOT NULL DEFAULT 0'], ['title', 'TEXT'],
+    ['url', 'TEXT'], ['publishedAt', 'INTEGER'], ['durationS', 'INTEGER'], ['imageUrl', 'TEXT']]) {
+    if (!itemCols.includes(col)) sqlite.exec(`ALTER TABLE feed_items ADD COLUMN ${col} ${type}`);
+  }
   const highlightCols = sqlite.prepare('PRAGMA table_info(highlights)').all().map((c) => c.name);
   if (!highlightCols.includes('location')) {
     sqlite.exec("ALTER TABLE highlights ADD COLUMN location TEXT");
@@ -1029,7 +1041,8 @@ function open(dataDir) {
     // ---------------- podcast subscriptions (feeds.js)
 
     listFeeds: (userId) =>
-      prep('flf', `SELECT f.*, (SELECT COUNT(*) FROM feed_items i WHERE i.feedId = f.id AND i.articleId IS NOT NULL) AS episodes
+      prep('flf', `SELECT f.*, (SELECT COUNT(*) FROM feed_items i WHERE i.feedId = f.id AND i.articleId IS NOT NULL) AS episodes,
+        (SELECT COUNT(*) FROM feed_items i WHERE i.feedId = f.id AND i.pending = 1) AS pendingCount
         FROM feeds f WHERE f.userId = ? ORDER BY f.addedAt DESC`).all(userId),
 
     /** Every feed, for the poller — it runs for all users at once. */
@@ -1041,8 +1054,36 @@ function open(dataDir) {
     getFeed: (id, userId) =>
       prep('fg', 'SELECT * FROM feeds WHERE id = ? AND userId = ?').get(id, userId),
 
-    insertFeed: (f) => prep('fi', `INSERT INTO feeds (id, userId, url, title, addedAt)
-      VALUES (@id, @userId, @url, @title, @addedAt)`).run({ title: null, ...f }),
+    insertFeed: (f) => prep('fi', `INSERT INTO feeds (id, userId, url, title, addedAt, autoProcess)
+      VALUES (@id, @userId, @url, @title, @addedAt, @autoProcess)`)
+      .run({ title: null, ...f, autoProcess: f.autoProcess === false ? 0 : 1 }),
+
+    setFeedAutoProcess: (id, userId, on) =>
+      prep('fap', 'UPDATE feeds SET autoProcess = ? WHERE id = ? AND userId = ?').run(on ? 1 : 0, id, userId).changes,
+
+    /** Note a new episode without taking it (a feed with autoProcess off). */
+    addPendingFeedItem: (feedId, item) =>
+      prep('fipa', `INSERT OR IGNORE INTO feed_items
+        (feedId, guid, articleId, seenAt, pending, title, url, publishedAt, durationS, imageUrl)
+        VALUES (@feedId, @guid, NULL, @seenAt, 1, @title, @url, @publishedAt, @durationS, @imageUrl)`)
+        .run({
+          feedId, guid: String(item.guid).slice(0, 500), seenAt: Date.now(),
+          title: item.title || null, url: item.url, publishedAt: item.publishedAt ?? null,
+          durationS: item.durationS ?? null, imageUrl: item.imageUrl || null,
+        }).changes,
+
+    /** Waiting episodes, newest first. */
+    listPendingFeedItems: (feedId, limit = 50) =>
+      prep('fipl', `SELECT guid, title, url, publishedAt, durationS, imageUrl FROM feed_items
+        WHERE feedId = ? AND pending = 1 ORDER BY COALESCE(publishedAt, seenAt) DESC LIMIT ?`).all(feedId, limit),
+
+    getPendingFeedItem: (feedId, guid) =>
+      prep('fipg', `SELECT guid, title, url, publishedAt, durationS, imageUrl FROM feed_items
+        WHERE feedId = ? AND guid = ? AND pending = 1`).get(feedId, String(guid)),
+
+    /** Stop offering a waiting episode (dismissed, or taken). */
+    clearPendingFeedItem: (feedId, guid) =>
+      prep('fipc', 'UPDATE feed_items SET pending = 0 WHERE feedId = ? AND guid = ?').run(feedId, String(guid)).changes,
 
     deleteFeed: (id, userId) =>
       prep('fd', 'DELETE FROM feeds WHERE id = ? AND userId = ?').run(id, userId).changes,
@@ -1071,7 +1112,7 @@ function open(dataDir) {
     markFeedItemSeen: (feedId, guid, articleId) =>
       prep('fim', `INSERT INTO feed_items (feedId, guid, articleId, seenAt)
         VALUES (@feedId, @guid, @articleId, @seenAt)
-        ON CONFLICT(feedId, guid) DO UPDATE SET articleId = COALESCE(@articleId, articleId)`)
+        ON CONFLICT(feedId, guid) DO UPDATE SET articleId = COALESCE(@articleId, articleId), pending = 0`)
         .run({ feedId, guid: String(guid).slice(0, 500), articleId: articleId ?? null, seenAt: Date.now() }),
 
     /** Give episodes already taken from a feed their artwork — only those

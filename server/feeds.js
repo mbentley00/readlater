@@ -9,6 +9,9 @@
  *  - Adding a feed imports NOTHING. Every episode already in it is written down
  *    as seen, so the flow starts with the next one published. A podcast's back
  *    catalogue is hundreds of hours of transcription nobody asked for.
+ *  - A feed can be set not to take anything by itself (autoProcess off): new
+ *    episodes are then only written down as waiting, for you to pick from on
+ *    the Settings page, and nothing is downloaded until you do.
  *  - A poll takes at most [MAX_PER_POLL] episodes from a feed. A show that
  *    dumps a season at once then drains over the following polls instead of
  *    queueing forty transcriptions at midnight.
@@ -205,7 +208,16 @@ async function pollOnce(deps) {
       const show = { ...feed, imageUrl: feed.imageUrl || parsed.imageUrl };
       // Oldest first, so a batch arrives in the order it was published.
       const fresh = parsed.items.filter((i) => !store.feedItemSeen(feed.id, i.guid)).reverse();
-      for (const item of fresh.slice(0, MAX_PER_POLL)) {
+      if (feed.autoProcess === 0) {
+        // Waiting, not taken: costs a row each, so there is no per-poll cap.
+        let waiting = 0;
+        for (const item of fresh) {
+          waiting += store.addPendingFeedItem(feed.id,
+            { ...item, imageUrl: item.imageUrl || show.imageUrl || '' });
+        }
+        if (waiting) log(`feed: ${waiting} new episode(s) waiting from ${feed.title || feed.url}`);
+      }
+      for (const item of feed.autoProcess === 0 ? [] : fresh.slice(0, MAX_PER_POLL)) {
         try {
           const buf = await fetchEpisode(item.url, maxBytes);
           await onEpisode({ feed: show, item, buf });
@@ -225,7 +237,7 @@ async function pollOnce(deps) {
         lastModified: got.lastModified,
         error: null,
       });
-      if (fresh.length > MAX_PER_POLL) {
+      if (feed.autoProcess !== 0 && fresh.length > MAX_PER_POLL) {
         log(`feed: ${fresh.length - MAX_PER_POLL} more waiting from ${feed.title || feed.url} — taking up to ${MAX_PER_POLL} a poll`);
       }
     } catch (e) {
@@ -257,7 +269,24 @@ function start(deps) {
   return () => { stopped = true; };
 }
 
+/**
+ * Pull feed URLs out of whatever was pasted or uploaded: an OPML export from a
+ * podcast app (its xmlUrl attributes), or plain text with URLs anywhere in it.
+ * OPML wins when present, since its other attributes (htmlUrl) are links to
+ * the show's website, not feeds. Deduped, in the order given.
+ */
+function feedUrlsFrom(text) {
+  const t = String(text || '');
+  const opml = [...t.matchAll(/\bxmlUrl\s*=\s*(["'])(.*?)\1/gi)].map((m) => decode(m[2]).trim());
+  // Pasted lists are often comma-separated, or sentences: trailing punctuation
+  // belongs to the text around the URL, not to it.
+  const found = opml.length ? opml
+    : (t.match(/https?:\/\/[^\s"'<>]+/gi) || []).map((u) => u.replace(/[),.;:\]]+$/, ''));
+  return [...new Set(found.filter((u) => /^https?:\/\//i.test(u)).map((u) => u.slice(0, 2000)))];
+}
+
 module.exports = {
+  feedUrlsFrom,
   parseFeed, parseDuration, fetchFeed, fetchEpisode, pollOnce, start,
   MAX_PER_POLL, POLL_INTERVAL_MS,
 };

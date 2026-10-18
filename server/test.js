@@ -717,12 +717,30 @@ async function main() {
     const kFav = await mkState('kestrel-3', 'Kestrel Favorite');
     await api('PATCH', `/api/articles/${kArch}`, { archived: true });
     await api('PATCH', `/api/articles/${kFav}`, { favorite: true });
+    // A typed search defaults to highlighted articles, so the three above get
+    // one each; a fourth, unhighlighted, shows the default and the way out.
+    for (const id of [kInbox, kArch, kFav]) {
+      await api('POST', `/api/articles/${id}/highlights`, { text: 'A kestrel hovers', paragraphIndex: 0 });
+    }
+    const kPlain = await mkState('kestrel-4', 'Kestrel Plain');
 
     const kHits = async (qs) => {
       const page = await fetch(BASE + qs, { headers: { Cookie: aliceCookie } });
       const h = await page.text();
-      return ['Kestrel Inbox', 'Kestrel Archived', 'Kestrel Favorite'].filter((t) => h.includes('>' + t + '<'));
+      return ['Kestrel Inbox', 'Kestrel Archived', 'Kestrel Favorite', 'Kestrel Plain'].filter((t) => h.includes('>' + t + '<'));
     };
+    assert.ok(!(await kHits('/?q=kestrel')).includes('Kestrel Plain'), 'a typed search defaults to highlighted articles');
+    assert.ok((await kHits('/?q=kestrel&hl=any')).includes('Kestrel Plain'), 'hl=any searches every article');
+    assert.ok((await kHits('/?state=inbox')).includes('Kestrel Plain'), 'no words typed, no highlights default');
+    res = await fetch(BASE + '/?q=kestrel', { headers: { Cookie: aliceCookie } });
+    html = await res.text();
+    assert.ok(html.includes('· with highlights'), 'the result line says it is limited to highlights');
+    assert.ok(html.includes('hl=any'), 'and links to searching all articles');
+    res = await fetch(BASE + '/?q=kestrel&hl=any&sort=random', { headers: { Cookie: aliceCookie } });
+    html = await res.text();
+    assert.ok(html.includes('value="any" selected'), '"Highlights: any" stays chosen');
+    assert.ok(html.includes('name="hl" value="any"'), 'save-as-view keeps "any" rather than the default');
+    assert.ok(html.includes('hl=any'), 'pager/shuffle links keep "any"');
     // Default stays "anywhere": a search you typed should reach the archive.
     assert.deepStrictEqual((await kHits('/?q=kestrel')).sort(),
       ['Kestrel Archived', 'Kestrel Favorite', 'Kestrel Inbox'], 'search spans every state by default');
@@ -764,7 +782,7 @@ async function main() {
     assert.ok(!/class="hdr-search"[\s\S]{0,240}value="kestrel"/.test(await res.text()),
       "the highlights page's own q is not echoed into the article-search box");
 
-    for (const id of [kInbox, kArch, kFav]) await api('DELETE', `/api/articles/${id}`);
+    for (const id of [kInbox, kArch, kFav, kPlain]) await api('DELETE', `/api/articles/${id}`);
 
     // ---- reader script can't be closed early by article data ---------------
     // JSON.stringify leaves '<' alone, so a value containing "</script>" used to
@@ -852,7 +870,7 @@ async function main() {
     res = await fetch(BASE + '/?q=borrow', { headers: { Cookie: bobCookie } });
     html = await res.text();
     assert.ok(html.includes('No articles match'), "search is per-user (bob finds nothing)");
-    res = await fetch(BASE + '/?q=borrow', { headers: { Cookie: aliceCookie2 } });
+    res = await fetch(BASE + '/?q=borrow&hl=any', { headers: { Cookie: aliceCookie2 } });
     html = await res.text();
     assert.ok(html.includes('Ownership Explained'), 'web search finds article');
     assert.ok(html.includes('1 result'), 'web search shows count');
@@ -1335,6 +1353,86 @@ async function main() {
     r = await api('GET', '/api/feeds');
     assert.strictEqual(r.body.feeds.length, 0, 'and it is gone');
     await api('DELETE', `/api/articles/${episodeArticle.id}`);
+
+    // ---- many feeds at once, and feeds that wait to be asked
+    const opml = `<?xml version="1.0"?><opml><body>
+      <outline text="Two" type="rss" xmlUrl="${feedBase}/rss2" htmlUrl="https://two.example.com/"/>
+      <outline text="Three" type="rss" xmlUrl="${feedBase}/rss3?a=1&amp;b=2"/></body></opml>`;
+    r = await api('POST', '/api/feeds/import', { text: opml, autoProcess: false });
+    assert.strictEqual(r.status, 200);
+    assert.deepStrictEqual(r.body.results.map((x) => [x.url, x.ok]),
+      [[`${feedBase}/rss2`, true], [`${feedBase}/rss3?a=1&b=2`, true]], 'OPML feeds subscribed, htmlUrl ignored');
+    r = await api('POST', '/api/feeds/import', { text: `${feedBase}/rss2\nhttp://127.0.0.1:1/nothing-here` });
+    assert.strictEqual(r.body.results[0].alreadySubscribed, true, 'a repeat is reported, not re-added');
+    assert.strictEqual(r.body.results[1].ok, false, 'a dead feed fails on its own line');
+    r = await api('POST', '/api/feeds/import', { text: 'no urls in this' });
+    assert.strictEqual(r.status, 400, 'nothing to import is an error');
+    r = await api('GET', '/api/feeds');
+    assert.strictEqual(r.body.feeds.length, 2);
+    assert.ok(r.body.feeds.every((f) => f.autoProcess === false), 'imported with auto-download off');
+    const [fThree, fTwo] = r.body.feeds; // newest first
+    assert.ok(fTwo.url.endsWith('/rss2') && fThree.url.includes('/rss3'));
+
+    // A new episode arrives: written down as waiting, nothing downloaded.
+    const episode3 = Buffer.concat([Buffer.from('ID3'), Buffer.alloc(98)]);
+    let episodeHits = 0;
+    feedItems = `<item><title>Waiting episode</title><guid>new-2</guid><itunes:duration>1:30:00</itunes:duration>
+      <enclosure url="${feedBase}/feed-episode.mp3?n=2" type="audio/mpeg"/></item>` + feedItems;
+    feedServer.removeAllListeners('request');
+    feedServer.on('request', (req2, res2) => {
+      if (req2.url.startsWith('/feed-episode.mp3')) {
+        episodeHits++;
+        res2.writeHead(200, { 'Content-Type': 'audio/mpeg', 'Content-Length': episode3.length });
+        return res2.end(episode3);
+      }
+      res2.writeHead(200, { 'Content-Type': 'application/rss+xml' });
+      res2.end(`<?xml version="1.0"?><rss><channel><title>Test Show</title>${feedItems}</channel></rss>`);
+    });
+    r = await api('POST', '/api/feeds/check');
+    assert.strictEqual(r.body.episodes, 0, 'auto-download off takes nothing');
+    assert.strictEqual(episodeHits, 0, 'and downloads nothing');
+    r = await api('GET', '/api/feeds');
+    for (const f of r.body.feeds) {
+      assert.deepStrictEqual(f.pending.map((p) => [p.guid, p.title, p.durationS]),
+        [['new-2', 'Waiting episode', 5400]], 'the new episode waits, with its details');
+    }
+    r = await api('POST', '/api/feeds/check');
+    r = await api('GET', '/api/feeds');
+    assert.ok(r.body.feeds.every((f) => f.pendingCount === 1), 'a second check does not list it twice');
+    let settingsHtml = await (await fetch(BASE + '/settings', { headers: { Cookie: aliceCookie2 } })).text();
+    assert.ok(settingsHtml.includes('Waiting episode') && settingsHtml.includes('take-ep'), 'waiting episodes are on Settings');
+    assert.ok(settingsHtml.includes('id="feed-urls"'), 'with the multi-feed import box');
+
+    r = await api('POST', `/api/feeds/${fThree.id}/episodes/dismiss`, { guid: 'new-2' });
+    assert.strictEqual(r.status, 200, 'dismissed');
+    r = await api('POST', `/api/feeds/${fThree.id}/episodes/take`, { guid: 'new-2' });
+    assert.strictEqual(r.status, 404, 'a dismissed episode is no longer waiting');
+    r = await api('POST', `/api/feeds/${fTwo.id}/episodes/take`, { guid: 'new-2' });
+    assert.strictEqual(r.status, 200, 'taken on request');
+    assert.strictEqual(episodeHits, 1, 'downloaded once, now');
+    const takenId = r.body.articleId;
+    r = await api('GET', `/api/articles/${takenId}`);
+    assert.strictEqual(r.body.title, 'Waiting episode');
+    assert.strictEqual(r.body.source, 'podcast-feed');
+    r = await api('GET', '/api/feeds');
+    assert.ok(r.body.feeds.every((f) => f.pendingCount === 0), 'nothing left waiting');
+    assert.strictEqual(r.body.feeds.find((f) => f.id === fTwo.id).episodes, 1, 'counted as brought in');
+
+    r = await api('PATCH', `/api/feeds/${fTwo.id}`, { autoProcess: true });
+    assert.strictEqual(r.status, 200);
+    r = await api('GET', '/api/feeds');
+    assert.strictEqual(r.body.feeds.find((f) => f.id === fTwo.id).autoProcess, true, 'auto-download switched on');
+    r = await api('PATCH', `/api/feeds/${fTwo.id}`, { autoProcess: 'yes' });
+    assert.strictEqual(r.status, 400, 'the switch takes a boolean');
+
+    for (let i = 0; i < 50; i++) { // let the transcription finish before deleting
+      r = await api('GET', `/api/articles/${takenId}`);
+      if (!/Transcribing/.test(r.body.excerpt || '')) break;
+      await new Promise((res2) => setTimeout(res2, 100));
+    }
+    await api('DELETE', `/api/articles/${takenId}`);
+    await api('DELETE', `/api/feeds/${fTwo.id}`);
+    await api('DELETE', `/api/feeds/${fThree.id}`);
     feedServer.close();
     console.log('  Podcast subscriptions ✔');
 
@@ -1826,6 +1924,30 @@ async function reparseEngineChecks() {
 }
 
 /** Economist articles end at a black square; nothing after it is the article. */
+function testRepeatedBlocks() {
+  const { applyRepeatedBlocks } = require('./skip');
+  const cap = 'Caffé Toscana on 42nd Street is operating out of a sidewalk newsstand. <span>Photo: Anne Kadet</span>';
+  const html = `<div><picture><img src="a.jpg"></picture><p>${cap}</p></div>` +
+    `<div><img src="b.jpg"><div><p>
+  ${cap}
+</p></div></div>` +
+    `<p>${cap}</p><p>The article starts here and goes on for a while.</p>` +
+    '<p>Ha ha.</p><p>Ha ha.</p>' + // short: could be deliberate, kept
+    '<ul><li><p>A list item long enough to count.</p></li></ul>' +
+    '<p>A pull quote line that repeats later.</p><p>Body.</p><p>A pull quote line that repeats later.</p>';
+  const r = applyRepeatedBlocks({ html, textContent: 'x' });
+  assert.strictEqual(r.repeats, 2, 'two repeated captions dropped');
+  assert.strictEqual(r.html.split('Caffé Toscana').length - 1, 1, 'caption kept once');
+  assert.ok(r.html.includes('a.jpg') && r.html.includes('b.jpg'), 'images stay');
+  assert.strictEqual(r.html.split('Ha ha.').length - 1, 2, 'short repeats kept');
+  assert.ok(r.html.includes('A list item long enough'), 'an <li> is not a repeat of its own <p>');
+  assert.strictEqual(r.html.split('pull quote').length - 1, 2, 'non-adjacent repeats kept');
+  assert.strictEqual(r.textContent.split('Caffé Toscana').length - 1, 1, 'textContent deduped too');
+  const same = { html: '<p>One paragraph here, long enough.</p><p>Another, different one.</p>' };
+  assert.strictEqual(applyRepeatedBlocks(same).html, same.html, 'untouched when nothing repeats');
+  console.log('  Repeated blocks (responsive captions) ✔');
+}
+
 function testEconomistEndMark() {
   const { applyDomainRules, isEconomist } = require('./skip');
   const html = '<div><p>Opening paragraph with real prose in it.</p>'
@@ -2349,6 +2471,12 @@ function testFeedParsing() {
   assert.strictEqual(parseDuration('2:30'), 150, 'mm:ss');
   assert.strictEqual(parseDuration(''), null);
   assert.strictEqual(parseFeed('<rss><channel><title>Empty</title></channel></rss>').items.length, 0);
+  const { feedUrlsFrom } = require('./feeds');
+  assert.deepStrictEqual(feedUrlsFrom('https://a.example/rss\n  https://b.example/feed.xml, https://a.example/rss'),
+    ['https://a.example/rss', 'https://b.example/feed.xml'], 'pasted URLs, deduped');
+  assert.deepStrictEqual(feedUrlsFrom(`<outline xmlUrl='https://c.example/rss?x=1&amp;y=2' htmlUrl="https://c.example/"/>`),
+    ['https://c.example/rss?x=1&y=2'], 'OPML: the feed, not the website');
+  assert.deepStrictEqual(feedUrlsFrom('nothing here'), []);
   console.log('  Podcast feed parsing ✔');
 }
 
@@ -2393,6 +2521,7 @@ testProblemDetection();
 testTtsSkipsCaptions();
 testTranscriptShaping();
 testEmailNormalization();
+testRepeatedBlocks();
 testEconomistEndMark();
 testNewYorkerCartoons();
 testChunkedBodyMerge();

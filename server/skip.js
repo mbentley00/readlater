@@ -102,6 +102,75 @@ function applySkipRules(rules, fields) {
   return { ...fields, html: root.innerHTML, textContent, excerpt, removed };
 }
 
+// ------------------------------------------------------------ repeated blocks
+
+/**
+ * Shortest block the repeat filter will drop. Below this a back-to-back repeat
+ * is as likely to be deliberate (a refrain, "Ha.", a section mark) as cruft.
+ */
+const REPEAT_MIN_CHARS = 20;
+
+/**
+ * Drop a block whose text is an exact repeat of the block just before it.
+ *
+ * Responsive pages ship one photo per layout (phone, tablet, desktop), each
+ * with its own copy of the caption; Curbed's lead image came through three
+ * times, caption and all. The images collapse in the reader, but the captions
+ * read as the same paragraph three times over. Only adjacent leaf blocks are
+ * compared (images between them don't count, since they carry no text), so a
+ * pull quote repeating a line from much earlier is left alone.
+ *
+ * @returns fields plus {repeats: int}; fields untouched when nothing repeats.
+ */
+function applyRepeatedBlocks(fields) {
+  const html = fields.html || '';
+  if (!html) return { ...fields, repeats: 0 };
+
+  let root;
+  try {
+    const { document } = parseHTML('<!doctype html><html><body></body></html>');
+    root = document.createElement('div');
+    document.body.appendChild(root);
+    root.innerHTML = html;
+  } catch {
+    return { ...fields, repeats: 0 }; // never lose the article over a rule
+  }
+
+  // Leaf blocks only: an <li> wrapping a <p> has the same text as its <p>,
+  // which would otherwise look like a repeat of itself.
+  const blocks = [...root.querySelectorAll(BLOCK_SELECTOR)]
+    .filter((el) => !el.querySelector(BLOCK_SELECTOR));
+  let prev = '';
+  let repeats = 0;
+  for (const el of blocks) {
+    const text = norm(el.textContent);
+    if (!text) continue;
+    if (text === prev && text.length >= REPEAT_MIN_CHARS) {
+      el.remove();
+      repeats++;
+      continue;
+    }
+    prev = text;
+  }
+  if (!repeats) return { ...fields, repeats: 0 };
+
+  // An item emptied by the removal leaves an empty <li>/<ul> behind.
+  for (const li of [...root.querySelectorAll('li')]) {
+    if (!norm(li.textContent) && !li.querySelector('img, picture, iframe')) li.remove();
+  }
+  for (const list of [...root.querySelectorAll('ul, ol')]) {
+    if (!list.children.length) list.remove();
+  }
+
+  const textContent = norm(root.textContent) || fields.textContent;
+  return {
+    ...fields,
+    html: root.innerHTML,
+    textContent: typeof fields.textContent === 'string' ? textContent : fields.textContent,
+    repeats,
+  };
+}
+
 // ---------------------------------------------------------------- domain rules
 //
 // Unlike skip rules — user phrases, matched anywhere — these are built-in and
@@ -330,7 +399,7 @@ function applyDomainRules(url, fields) {
 }
 
 module.exports = {
-  applySkipRules, phraseError, applyDomainRules,
+  applySkipRules, phraseError, applyDomainRules, applyRepeatedBlocks, REPEAT_MIN_CHARS,
   applyEconomistEndMark, applyNewYorkerCartoons, isEconomist, isNewYorker,
   MAX_BLOCK_CHARS, MIN_PHRASE_CHARS, BLOCK_SELECTOR, ECONOMIST_END_MARK,
   CARTOON_CREDIT, CARTOON_CAPTION_MAX, CARTOON_CREDIT_MAX,
