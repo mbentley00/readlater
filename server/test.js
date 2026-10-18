@@ -1924,6 +1924,44 @@ async function reparseEngineChecks() {
 }
 
 /** Economist articles end at a black square; nothing after it is the article. */
+/** YouTube videos saved as transcripts (youtube.js) — the offline parts. */
+function testYouTube() {
+  const { videoIdOf, parseCaptions, captionsToParagraphs, pickTrack, PARA_MAX_WORDS } = require('./youtube');
+  for (const [u, id] of [
+    ['https://www.youtube.com/watch?v=ARQnf7wLRiA&t=29', 'ARQnf7wLRiA'],
+    ['https://m.youtube.com/watch?feature=share&v=9JWnxEk__8k', '9JWnxEk__8k'],
+    ['https://youtu.be/9JWnxEk__8k?si=abc', '9JWnxEk__8k'],
+    ['https://www.youtube.com/shorts/ARQnf7wLRiA', 'ARQnf7wLRiA'],
+    ['https://www.youtube.com/live/ARQnf7wLRiA?feature=x', 'ARQnf7wLRiA'],
+    ['https://www.youtube.com/channel/UC123', ''],
+    ['https://www.youtube.com/watch?v=short', ''],
+    ['https://notyoutube.com/watch?v=ARQnf7wLRiA', ''],
+    ['not a url', ''],
+  ]) assert.strictEqual(videoIdOf(u), id, u);
+
+  const segs = parseCaptions('<?xml version="1.0"?><transcript>'
+    + '<text start="0.8" dur="3">There&amp;#39;s a lot &amp;amp; more</text>'
+    + '<text start="2" dur="1">[Music]</text>'
+    + '<text start="3.5" dur="2">in\nthis one.</text></transcript>');
+  assert.deepStrictEqual(segs, [{ start: 0.8, text: "There's a lot & more" }, { start: 3.5, text: 'in this one.' }],
+    'double-escaped entities decoded, sound tags dropped');
+
+  const line = (i, end) => ({ start: i * 2, text: `word ${'w '.repeat(8)}line${end}` }); // 11 words
+  const sentences = Array.from({ length: 20 }, (_, i) => line(i, i % 3 === 2 ? '.' : ''));
+  const paras = captionsToParagraphs(sentences);
+  assert.ok(paras.length >= 2 && paras.every((p) => p.endsWith('.') || p === paras[paras.length - 1]),
+    'paragraphs end at sentence ends');
+  const unpunctuated = captionsToParagraphs(Array.from({ length: 60 }, (_, i) => line(i, '')));
+  assert.ok(unpunctuated.length >= 3, 'auto captions with no punctuation still get broken up');
+  assert.ok(unpunctuated.every((p) => p.split(' ').length <= PARA_MAX_WORDS + 11), 'no paragraph runs on');
+
+  assert.strictEqual(pickTrack([{ languageCode: 'de' }, { languageCode: 'en', kind: 'asr' }, { languageCode: 'en-GB' }]).languageCode,
+    'en-GB', "the uploader's English beats auto captions");
+  assert.strictEqual(pickTrack([{ languageCode: 'de', kind: 'asr' }, { languageCode: 'en', kind: 'asr' }]).languageCode, 'en');
+  assert.strictEqual(pickTrack([]), null);
+  console.log('  YouTube transcripts (parsing) ✔');
+}
+
 function testRepeatedBlocks() {
   const { applyRepeatedBlocks } = require('./skip');
   const cap = 'Caffé Toscana on 42nd Street is operating out of a sidewalk newsstand. <span>Photo: Anne Kadet</span>';
@@ -2521,6 +2559,7 @@ testProblemDetection();
 testTtsSkipsCaptions();
 testTranscriptShaping();
 testEmailNormalization();
+testYouTube();
 testRepeatedBlocks();
 testEconomistEndMark();
 testNewYorkerCartoons();

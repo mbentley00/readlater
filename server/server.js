@@ -38,6 +38,7 @@ const inbound = require('./inbound');
 const skip = require('./skip');
 const { emailToCleanHtml } = require('./email');
 const { reparse, textOf } = require('./reparse');
+const youtube = require('./youtube');
 
 // Cap raw source we keep for reparse/"view original" so a single huge message
 // can't blow the data volume. Big enough for any real newsletter or page.
@@ -613,6 +614,48 @@ function canonicalizeArticleUrl(articleId, userId, artUrl, finalUrl) {
   return artUrl;
 }
 
+/**
+ * Fill an article from a YouTube video's transcript (youtube.js). Returns
+ * false, changing nothing, when the URL isn't a video, YouTube won't say, or
+ * the article has highlights (they are anchored to paragraph numbers, which a
+ * new body would shift). Callers fall back to whatever they did before.
+ */
+async function fillYouTube(articleId, userId, artUrl) {
+  const ytId = youtube.videoIdOf(artUrl);
+  if (!ytId) return false;
+  let video;
+  try {
+    video = await youtube.fetchVideoArticle(ytId);
+  } catch (e) {
+    console.log(`youtube: no transcript for ${artUrl} (${e.message})`);
+    return false;
+  }
+  if (!store.getArticle(articleId, userId) || store.highlightCountForArticle(articleId) > 0) return false;
+  const { transcript, ...fields } = video;
+  store.updateArticleContent(articleId, withSkipRules(userId, { ...fields, updatedAt: Date.now() }, artUrl));
+  enqueueTtsOnSave(articleId, userId, true);
+  console.log(`youtube: ${artUrl} saved as its ${transcript ? 'transcript' : 'description'} (${fields.textContent.length} chars)`);
+  return true;
+}
+
+/**
+ * Retry flagged saves the server can now do better on by itself. Today that
+ * is YouTube videos, saved as the watch page's footer before transcripts were
+ * fetched. Runs shortly after boot and then every few hours; a video YouTube
+ * still refuses stays flagged and is simply tried again next time.
+ */
+async function repairProblems() {
+  let fixed = 0;
+  for (const u of store.allUsers()) {
+    for (const p of store.listProblems(u.id)) {
+      if (youtube.videoIdOf(p.url) && await fillYouTube(p.id, u.id, p.url)) fixed++;
+    }
+  }
+  if (fixed) console.log(`problems: repaired ${fixed} flagged article(s)`);
+  return fixed;
+}
+const REPAIR_INTERVAL_MS = 6 * 60 * 60 * 1000;
+
 // Background page fetch + extraction for save-by-URL, so the client isn't kept
 // waiting on a slow page. Updates the placeholder article in place.
 async function fillSavedUrl(articleId, userId, artUrl) {
@@ -624,6 +667,8 @@ async function fillSavedUrl(articleId, userId, artUrl) {
     }
     return cur;
   };
+  // A video: its transcript, not its watch page (see youtube.js).
+  if (await fillYouTube(articleId, userId, artUrl)) return;
   let pageHtml = '';
   try {
     const r = await fetchPage(artUrl);
@@ -640,7 +685,8 @@ async function fillSavedUrl(articleId, userId, artUrl) {
 
   const titleMatch = pageHtml.match(/<meta[^>]+property=["']og:title["'][^>]+content=["']([^"']+)["']/i)
     || pageHtml.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
-  const metaTitle = titleMatch ? sanitizeString(titleMatch[1].replace(/\s+/g, ' ').trim(), 500) : (hostOf(artUrl) || artUrl);
+  // Decoded: titles are shown escaped, so a raw "&amp;" came out as "&amp;amp;".
+  const metaTitle = titleMatch ? sanitizeString(youtube.decode(titleMatch[1]).replace(/\s+/g, ' ').trim(), 500) : (hostOf(artUrl) || artUrl);
   const imageUrl = ogImage(pageHtml, artUrl);
   const publishedAt = pagePublishedAt(pageHtml);
 
@@ -1319,11 +1365,27 @@ const server = http.createServer(async (req, res) => {
           publishedAt: Number.isFinite(pub) && pub > 0 && pub < now + 86400000 ? pub : null,
           updatedAt: now,
         }, artUrl);
+        // A YouTube page captured by the browser is only its footer; the video's
+        // words are in its captions. Fetched here, before anything is stored, so
+        // the footer never replaces a transcript. A capture that already has
+        // real text (an importer's transcript) is left as it came.
+        let fromYouTube = false;
+        const ytId = youtube.videoIdOf(artUrl);
+        if (ytId && (fields.textContent || String(fields.html).replace(/<[^>]+>/g, ' ')).trim().length < 3000) {
+          try {
+            const { transcript, ...video } = await youtube.fetchVideoArticle(ytId);
+            Object.assign(fields, withSkipRules(user.id, { ...video, updatedAt: now }, artUrl));
+            fromYouTube = true;
+            console.log(`youtube: ${artUrl} saved as its ${transcript ? 'transcript' : 'description'}`);
+          } catch (e) {
+            console.log(`youtube: no transcript for ${artUrl} (${e.message}) — keeping the page capture`);
+          }
+        }
         // Keep the extension's captured page (only sent for weak parses) as the
         // raw source, so those — the ones most likely to be mis-parsed — can be
         // reparsed and shown in the original. A normal, clean save sends none and
         // we store nothing (reparse re-fetches the URL instead).
-        if (typeof b.fallbackHtml === 'string' && b.fallbackHtml.trim()) {
+        if (!fromYouTube && typeof b.fallbackHtml === 'string' && b.fallbackHtml.trim()) {
           fields.sourceHtml = b.fallbackHtml.slice(0, SOURCE_CAP);
         }
         let a = store.articleByUrl(user.id, artUrl);
@@ -1397,7 +1459,7 @@ const server = http.createServer(async (req, res) => {
         // attaching the stripped page HTML. Respond fast with what we have,
         // upgrade the stored article in the background (bumping updatedAt so
         // clients re-sync it).
-        if (typeof b.fallbackHtml === 'string' && b.fallbackHtml.length > 0 && llm.enabled()) {
+        if (!fromYouTube && typeof b.fallbackHtml === 'string' && b.fallbackHtml.length > 0 && llm.enabled()) {
           const articleId = a.id;
           llm.extractArticle({ url: artUrl, title: fields.title, pageHtml: b.fallbackHtml })
             .then((better) => {
@@ -2227,6 +2289,11 @@ server.listen(PORT, '0.0.0.0', () => {
   // Archiving happens on every client; catching up hourly is soon enough.
   sweepEpisodes();
   setInterval(sweepEpisodes, 60 * 60 * 1000).unref();
+  // Flagged saves the server can fix by itself (YouTube videos, for now). Not
+  // right at boot, for the same reason feeds wait: let first syncs go first.
+  const repair = () => repairProblems().catch((e) => console.error(`problems: repair failed (${e.message})`));
+  setTimeout(repair, 2 * 60 * 1000).unref();
+  setInterval(repair, REPAIR_INTERVAL_MS).unref();
   const feedCount = store.listAllFeeds().length;
   if (feedCount) {
     console.log(`feeds: ${feedCount} podcast subscription(s), checked every ${feeds.POLL_INTERVAL_MS / 60000} min`);
