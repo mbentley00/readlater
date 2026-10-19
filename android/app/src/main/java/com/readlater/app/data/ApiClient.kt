@@ -78,6 +78,32 @@ data class RemoteFeed(
     val lastError: String?
 )
 
+/** A subscribed show, for the Podcasts tab's show filter. */
+data class PodcastShow(
+    val id: String,
+    val title: String,
+    val imageUrl: String?,
+    val autoProcess: Boolean
+)
+
+/** A feed episode not yet processed — waiting to be picked (or archived). */
+data class WaitingEpisode(
+    val feedId: String,
+    val guid: String,
+    val title: String,
+    val publishedAt: Long?,
+    val durationS: Int?,
+    val imageUrl: String?
+)
+
+/** GET /api/podcasts: shows, waiting episodes, and which show each
+ *  processed episode (article id → feed id) came from. */
+data class PodcastsData(
+    val shows: List<PodcastShow>,
+    val waiting: List<WaitingEpisode>,
+    val episodeShow: Map<String, String>
+)
+
 /** What POST /api/feeds said about a new subscription. */
 data class FeedAdded(val title: String, val existingEpisodes: Int, val alreadySubscribed: Boolean)
 
@@ -439,6 +465,70 @@ class ApiClient(private val settings: Settings) {
             existingEpisodes = o.optInt("existingEpisodes", 0),
             alreadySubscribed = o.optBoolean("alreadySubscribed", false)
         )
+    }
+
+    /** GET /api/podcasts — raw JSON, so the repository can cache it as is. */
+    suspend fun podcastsJson(): String = execute(builder("/api/podcasts").get().build())
+
+    fun parsePodcasts(body: String): PodcastsData {
+        val o = JSONObject(body)
+        val shows = o.optJSONArray("shows") ?: org.json.JSONArray()
+        val waiting = o.optJSONArray("waiting") ?: org.json.JSONArray()
+        val eps = o.optJSONArray("episodes") ?: org.json.JSONArray()
+        return PodcastsData(
+            shows = (0 until shows.length()).map { i ->
+                val s = shows.getJSONObject(i)
+                PodcastShow(
+                    id = s.getString("id"),
+                    title = s.stringOrNull("title") ?: s.optString("url"),
+                    imageUrl = s.stringOrNull("imageUrl")?.takeIf { it.isNotBlank() },
+                    autoProcess = s.optBoolean("autoProcess", true)
+                )
+            },
+            waiting = (0 until waiting.length()).map { i ->
+                val w = waiting.getJSONObject(i)
+                WaitingEpisode(
+                    feedId = w.getString("feedId"),
+                    guid = w.getString("guid"),
+                    title = w.stringOrNull("title") ?: "Untitled episode",
+                    publishedAt = w.optLong("publishedAt", 0L).takeIf { it > 0 },
+                    durationS = w.optInt("durationS", 0).takeIf { it > 0 },
+                    imageUrl = w.stringOrNull("imageUrl")?.takeIf { it.isNotBlank() }
+                )
+            },
+            episodeShow = (0 until eps.length()).associate { i ->
+                val e = eps.getJSONObject(i)
+                e.getString("articleId") to e.getString("feedId")
+            }
+        )
+    }
+
+    /**
+     * POST /api/feeds/{feedId}/episodes/(take|dismiss|restore). A take has the
+     * server download the episode before answering, so it runs on the
+     * long-timeout client. Returns the new article's id for a take.
+     */
+    suspend fun episodeAction(feedId: String, guid: String, action: String): String? {
+        val json = JSONObject().put("guid", guid)
+        val body = try {
+            execute(
+                builder("/api/feeds/$feedId/episodes/$action")
+                    .post(json.toString().toRequestBody(jsonMediaType)).build(),
+                if (action == "take") uploadClient else client
+            )
+        } catch (e: IOException) {
+            val reason = e.message?.substringAfter(": ", "")
+                ?.let { runCatching { JSONObject(it).stringOrNull("error") }.getOrNull() }
+            throw if (reason != null) IOException(reason, e) else e
+        }
+        return JSONObject(body).stringOrNull("articleId")
+    }
+
+    /** PATCH /api/feeds/{id} {autoProcess} — take new episodes by themselves,
+     *  or leave them under New to be picked. */
+    suspend fun setFeedAutoProcess(id: String, on: Boolean) {
+        val json = JSONObject().put("autoProcess", on)
+        execute(builder("/api/feeds/$id").patch(json.toString().toRequestBody(jsonMediaType)).build())
     }
 
     /** DELETE /api/feeds/{id} */

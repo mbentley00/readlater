@@ -103,6 +103,63 @@ class Repository(
         }.getOrDefault(emptyList())
     }
 
+    // ---------------------------------------------------------------- podcasts
+
+    /** The Podcasts tab's last known shows and waiting episodes, or null. */
+    fun cachedPodcasts(): PodcastsData? =
+        settings.cachedPodcastsJson.takeIf { it.isNotBlank() }
+            ?.let { runCatching { api.parsePodcasts(it) }.getOrNull() }
+
+    suspend fun fetchPodcasts(): PodcastsData = withContext(Dispatchers.IO) {
+        val body = api.podcastsJson()
+        api.parsePodcasts(body).also { settings.cachedPodcastsJson = body }
+    }
+
+    /**
+     * Process a waiting episode: the server downloads and transcribes it. The
+     * article it makes comes down with the next sync (the caller runs one),
+     * then shows among the processed episodes ("Transcribing…" until done).
+     */
+    suspend fun processEpisode(ep: WaitingEpisode): Result<Unit> = withContext(Dispatchers.IO) {
+        runCatching { api.episodeAction(ep.feedId, ep.guid, "take"); Unit }
+    }
+
+    /** Archive a waiting episode (it leaves the New list), or undo that. */
+    suspend fun archiveWaitingEpisode(ep: WaitingEpisode, undo: Boolean = false): Result<Unit> =
+        withContext(Dispatchers.IO) {
+            runCatching { api.episodeAction(ep.feedId, ep.guid, if (undo) "restore" else "dismiss"); Unit }
+        }
+
+    /** Names of the episodes stored on this phone (see [PodcastFiles.storedKeys]). */
+    fun storedEpisodeKeys(): Set<String> = podcasts.storedKeys()
+
+    fun isEpisodeStored(keys: Set<String>, a: ArticleEntity): Boolean = podcasts.isStored(keys, a.id, a.url)
+
+    /**
+     * Download a processed episode's audio to the phone now, on request: the
+     * server's copy (what the transcript was made from), else the host's.
+     * Unlike pressing play, this goes ahead on mobile data — you asked.
+     */
+    suspend fun downloadEpisodeAudio(a: ArticleEntity): Result<Unit> = withContext(Dispatchers.IO) {
+        runCatching {
+            val spool = podcasts.spoolFile()
+            try {
+                val ok = api.downloadServerEpisode(a.id, spool) ||
+                    (a.audioUrl?.takeIf { it.isNotBlank() }?.let { api.downloadEpisode(it, spool) } ?: false)
+                if (!ok) throw java.io.IOException("the episode could not be downloaded")
+                val ext = (a.audioUrl ?: "").substringBefore('?').substringAfterLast('.', "mp3")
+                    .takeIf { it.length in 2..5 } ?: "mp3"
+                podcasts.keep(spool, a.id, ext)
+                Unit
+            } finally {
+                if (spool.exists()) spool.delete()
+            }
+        }
+    }
+
+    /** Free the space: drop the episode's audio from the phone (it stays processed). */
+    fun removeEpisodeAudio(a: ArticleEntity) = podcasts.delete(a.id, a.url)
+
     fun article(id: String): Flow<ArticleEntity?> = articleDao.articleFlow(id)
 
     /** The next inbox article to auto-play after finishing/archiving this one. */

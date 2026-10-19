@@ -71,9 +71,11 @@ interface ArticleDao {
     suspend fun getAll(): List<ArticleEntity>
 
     /** Just enough to decide whether a stored episode is still wanted. A whole
-     *  ArticleEntity here would drag the article's html along with it. */
-    @Query("SELECT id, archived FROM articles WHERE url = :url LIMIT 1")
-    suspend fun stateByUrl(url: String): ArticleState?
+     *  ArticleEntity here would drag the article's html along with it. A file
+     *  is named by its audio hash (`audio:` url) or, from a feed, the
+     *  article's id — so either matches. */
+    @Query("SELECT id, archived FROM articles WHERE url = :key OR id = :key LIMIT 1")
+    suspend fun stateByUrl(key: String): ArticleState?
 
     @Query("SELECT * FROM articles WHERE id IN (:ids)")
     suspend fun getByIds(ids: List<String>): List<ArticleEntity>

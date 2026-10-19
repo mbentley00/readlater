@@ -1085,6 +1085,26 @@ function open(dataDir) {
     clearPendingFeedItem: (feedId, guid) =>
       prep('fipc', 'UPDATE feed_items SET pending = 0 WHERE feedId = ? AND guid = ?').run(feedId, String(guid)).changes,
 
+    /** Offer an archived (dismissed) episode again — undo. Only one never
+     *  taken, and only one that kept what is needed to take it. */
+    restorePendingFeedItem: (feedId, guid) =>
+      prep('fipr', `UPDATE feed_items SET pending = 1
+        WHERE feedId = ? AND guid = ? AND articleId IS NULL AND url IS NOT NULL`).run(feedId, String(guid)).changes,
+
+    /** Every waiting episode across a user's feeds, newest first — the
+     *  phone's Podcasts tab, where they are picked. */
+    listUserPendingFeedItems: (userId, limit = 500) =>
+      prep('fipu', `SELECT i.feedId, i.guid, i.title, i.url, i.publishedAt, i.durationS, i.imageUrl, i.seenAt
+        FROM feed_items i JOIN feeds f ON f.id = i.feedId
+        WHERE f.userId = ? AND i.pending = 1
+        ORDER BY COALESCE(i.publishedAt, i.seenAt) DESC LIMIT ?`).all(userId, limit),
+
+    /** Which show each taken episode came from: [{articleId, feedId}]. Small
+     *  rows, and no join on articles (their html sits in the same rows). */
+    listUserFeedEpisodes: (userId) =>
+      prep('fieu', `SELECT i.articleId, i.feedId FROM feed_items i JOIN feeds f ON f.id = i.feedId
+        WHERE f.userId = ? AND i.articleId IS NOT NULL`).all(userId),
+
     deleteFeed: (id, userId) =>
       prep('fd', 'DELETE FROM feeds WHERE id = ? AND userId = ?').run(id, userId).changes,
 

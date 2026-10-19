@@ -25,6 +25,8 @@ import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Archive
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.Download
+import androidx.compose.material.icons.filled.FileDownloadOff
 import androidx.compose.material.icons.filled.FormatQuote
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.Refresh
@@ -273,12 +275,135 @@ fun ArticleListScreen(
         }
     }
 
+    fun sync(showErrors: Boolean, full: Boolean = false) {
+        if (syncing) return
+        scope.launch {
+            syncing = true
+            val result = repo.syncNow(full)
+            syncing = false
+            if (showErrors) {
+                result.onFailure {
+                    snackbarHostState.showSnackbar("Sync failed: ${it.message ?: "unknown error"}")
+                }
+            }
+        }
+    }
+
+    // ---- The Podcasts tab, Pocket Casts-style: New (not processed yet),
+    // Processed, Downloaded — each narrowed to one show by its artwork.
+    val podcastPane = onPodcasts && selectedView == null && !searchActive
+    var podcasts by remember { mutableStateOf(repo.cachedPodcasts()) }
+    var podcastListName by rememberSaveable { mutableStateOf(PodcastList.NEW.name) }
+    val podcastList = runCatching { PodcastList.valueOf(podcastListName) }.getOrDefault(PodcastList.NEW)
+    var showFilter by rememberSaveable { mutableStateOf<String?>(null) }
+    var storedKeys by remember { mutableStateOf<Set<String>>(emptySet()) }
+    var downloading by remember { mutableStateOf<Set<String>>(emptySet()) }
+    var processing by remember { mutableStateOf<Set<String>>(emptySet()) }
+    // Waiting episodes archived or processed here, hidden until the server's
+    // list catches up (a refresh mid-request would otherwise bring them back).
+    var hiddenWaiting by remember { mutableStateOf<Set<String>>(emptySet()) }
+    LaunchedEffect(podcastPane, syncing) {
+        if (!podcastsTab || syncing) return@LaunchedEffect
+        runCatching { podcasts = repo.fetchPodcasts() }
+    }
+    val showOf: (ArticleEntity) -> String? = remember(podcasts) {
+        val data = podcasts
+        val byTitle = data?.shows.orEmpty().associate { it.title.lowercase() to it.id }
+        val fn: (ArticleEntity) -> String? = { a ->
+            data?.episodeShow?.get(a.id) ?: a.siteName?.lowercase()?.let { byTitle[it] }
+        }
+        fn
+    }
+    val waitingAll = remember(podcasts, hiddenWaiting) {
+        podcasts?.waiting.orEmpty().filter { "${it.feedId}/${it.guid}" !in hiddenWaiting }
+    }
+    val waitingShown = remember(waitingAll, showFilter) {
+        waitingAll.filter { showFilter == null || it.feedId == showFilter }
+    }
+    val processedShown = remember(articles, showFilter, showOf) {
+        if (showFilter == null) articles else articles.filter { showOf(it) == showFilter }
+    }
+    val downloadedShown = remember(processedShown, storedKeys) {
+        processedShown.filter { repo.isEpisodeStored(storedKeys, it) }
+    }
+    // Shows with something recent first: a new episode, else a processed one.
+    val showsOrdered = remember(podcasts, articles, showOf) {
+        val latest = mutableMapOf<String, Long>()
+        podcasts?.waiting.orEmpty().forEach { w ->
+            val t = w.publishedAt ?: 0L
+            if (t > (latest[w.feedId] ?: -1L)) latest[w.feedId] = t
+        }
+        articles.forEach { a ->
+            val s = showOf(a) ?: return@forEach
+            if (a.savedAt > (latest[s] ?: -1L)) latest[s] = a.savedAt
+        }
+        podcasts?.shows.orEmpty().sortedWith(
+            compareByDescending<com.readlater.app.data.PodcastShow> { latest[it.id] ?: -1L }
+                .thenBy { it.title.lowercase() }
+        )
+    }
+    val newCounts = remember(waitingAll) { waitingAll.groupingBy { it.feedId }.eachCount() }
+
     // Open an article, first capturing the exact order currently on screen so that
     // queued ("play through") playback started from it follows THIS view rather
     // than the global inbox (see Repository.playQueue / nextAfterInView).
     fun openArticle(id: String) {
-        repo.playQueue = articles.map { it.id }
+        val onScreen = when {
+            !podcastPane -> articles
+            podcastList == PodcastList.DOWNLOADED -> downloadedShown
+            else -> processedShown
+        }
+        repo.playQueue = onScreen.map { it.id }
         onOpenArticle(id)
+    }
+
+    fun processWaiting(ep: com.readlater.app.data.WaitingEpisode) {
+        val key = "${ep.feedId}/${ep.guid}"
+        processing = processing + key
+        scope.launch {
+            val r = repo.processEpisode(ep)
+            processing = processing - key
+            r.onSuccess {
+                hiddenWaiting = hiddenWaiting + key
+                sync(showErrors = false)
+                snackbarHostState.showSnackbar("Processing “${ep.title}” — it moves to Processed")
+            }.onFailure {
+                snackbarHostState.showSnackbar("Couldn't process it: ${it.message ?: "unknown error"}")
+            }
+        }
+    }
+
+    fun archiveWaiting(ep: com.readlater.app.data.WaitingEpisode) {
+        val key = "${ep.feedId}/${ep.guid}"
+        hiddenWaiting = hiddenWaiting + key
+        scope.launch {
+            repo.archiveWaitingEpisode(ep).onFailure {
+                hiddenWaiting = hiddenWaiting - key
+                snackbarHostState.showSnackbar("Couldn't archive it (offline?)")
+                return@launch
+            }
+            val undo = snackbarHostState.showSnackbar(
+                "Archived “${ep.title}”", actionLabel = "Undo",
+                duration = androidx.compose.material3.SnackbarDuration.Short,
+            )
+            if (undo == androidx.compose.material3.SnackbarResult.ActionPerformed) {
+                repo.archiveWaitingEpisode(ep, undo = true).onSuccess {
+                    runCatching { podcasts = repo.fetchPodcasts() }
+                    hiddenWaiting = hiddenWaiting - key
+                }
+            }
+        }
+    }
+
+    fun downloadAudio(a: ArticleEntity) {
+        if (a.id in downloading) return
+        downloading = downloading + a.id
+        scope.launch {
+            val r = repo.downloadEpisodeAudio(a)
+            downloading = downloading - a.id
+            storedKeys = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) { repo.storedEpisodeKeys() }
+            r.onFailure { snackbarHostState.showSnackbar("Download failed: ${it.message ?: "unknown error"}") }
+        }
     }
 
     // Saved views come from the server; offline we just don't show new ones.
@@ -292,18 +417,11 @@ fun ArticleListScreen(
         ttsState.articleId?.let { repo.article(it) } ?: flowOf(null)
     }.collectAsState(initial = null)
 
-    fun sync(showErrors: Boolean, full: Boolean = false) {
-        if (syncing) return
-        scope.launch {
-            syncing = true
-            val result = repo.syncNow(full)
-            syncing = false
-            if (showErrors) {
-                result.onFailure {
-                    snackbarHostState.showSnackbar("Sync failed: ${it.message ?: "unknown error"}")
-                }
-            }
-        }
+    // Which episodes are on the phone: on entering the tab, and as playback
+    // starts or stops (pressing play downloads an episode).
+    LaunchedEffect(podcastPane, ttsState.articleId, ttsState.preparing, syncing) {
+        if (!podcastPane) return@LaunchedEffect
+        storedKeys = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) { repo.storedEpisodeKeys() }
     }
 
     // Opportunistic sync on first open (silent — the app stays usable offline).
@@ -520,7 +638,7 @@ fun ArticleListScreen(
                     FilterChip(
                         selected = onPodcasts && selectedView == null,
                         onClick = { showPodcasts = true; showArchived = false; showProblems = false; selectedViewId = null },
-                        label = { Text(chipLabel("Podcasts", podcastCount), maxLines = 1) }
+                        label = { Text(chipLabel("Podcasts", podcastCount?.plus(waitingAll.size)), maxLines = 1) }
                     )
                 }
                 FilterChip(
@@ -582,7 +700,143 @@ fun ArticleListScreen(
                 )
             }
 
-            if (articles.isEmpty()) {
+            if (podcastPane) {
+                val shows = podcasts?.shows.orEmpty()
+                val showById = remember(shows) { shows.associateBy { it.id } }
+                if (shows.isNotEmpty()) {
+                    ShowStrip(showsOrdered, newCounts, showFilter) { showFilter = it }
+                }
+                Row(
+                    modifier = Modifier
+                        .padding(horizontal = 16.dp, vertical = 2.dp)
+                        .horizontalScroll(rememberScrollState()),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    PodcastList.entries.forEach { l ->
+                        val n = when (l) {
+                            PodcastList.NEW -> waitingShown.size
+                            PodcastList.PROCESSED -> processedShown.size
+                            PodcastList.DOWNLOADED -> downloadedShown.size
+                        }
+                        FilterChip(
+                            selected = podcastList == l,
+                            onClick = { podcastListName = l.name },
+                            label = { Text(chipLabel(l.label, n), maxLines = 1) }
+                        )
+                    }
+                }
+                val selShow = showById[showFilter]
+                if (selShow != null) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp)
+                    ) {
+                        Column(Modifier.weight(1f)) {
+                            Text(selShow.title, style = MaterialTheme.typography.titleSmall, maxLines = 1,
+                                overflow = TextOverflow.Ellipsis)
+                            Text(
+                                if (selShow.autoProcess) "New episodes are processed automatically"
+                                else "New episodes wait under New for you to pick",
+                                style = MaterialTheme.typography.labelMedium,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                        Switch(
+                            checked = selShow.autoProcess,
+                            onCheckedChange = { on ->
+                                scope.launch {
+                                    runCatching { app.apiClient.setFeedAutoProcess(selShow.id, on) }
+                                        .onSuccess {
+                                            podcasts = podcasts?.let { d ->
+                                                d.copy(shows = d.shows.map { if (it.id == selShow.id) it.copy(autoProcess = on) else it })
+                                            }
+                                        }
+                                        .onFailure { snackbarHostState.showSnackbar("Couldn't change that (offline?)") }
+                                }
+                            }
+                        )
+                    }
+                }
+                HorizontalDivider(
+                    modifier = Modifier.padding(top = 4.dp),
+                    color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f)
+                )
+
+                if (podcastList == PodcastList.NEW) {
+                    if (waitingShown.isEmpty()) {
+                        PodcastEmptyNote(
+                            "Nothing new",
+                            if (shows.isEmpty()) "Subscribe to a show's feed in Settings."
+                            else if (selShow?.autoProcess == true || (selShow == null && shows.all { it.autoProcess }))
+                                "Shows set to process automatically skip this list — their new episodes go straight to Processed. " +
+                                    "Turn that off for a show to pick its episodes here."
+                            else "New episodes from shows you pick by hand appear here."
+                        )
+                    } else {
+                        LazyColumn(contentPadding = PaddingValues(bottom = 24.dp)) {
+                            itemsIndexed(waitingShown, key = { _, e -> "${e.feedId}/${e.guid}" }) { i, ep ->
+                                if (i > 0) HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f))
+                                WaitingEpisodeRow(
+                                    ep = ep,
+                                    show = showById[ep.feedId],
+                                    busy = "${ep.feedId}/${ep.guid}" in processing,
+                                    onProcess = { processWaiting(ep) },
+                                    onArchive = { archiveWaiting(ep) }
+                                )
+                            }
+                        }
+                    }
+                } else {
+                    val list = if (podcastList == PodcastList.DOWNLOADED) downloadedShown else processedShown
+                    if (list.isEmpty()) {
+                        PodcastEmptyNote(
+                            if (podcastList == PodcastList.DOWNLOADED) "Nothing downloaded" else "No processed episodes",
+                            if (podcastList == PodcastList.DOWNLOADED)
+                                "Download an episode from its ⋮ menu, or press play on Wi-Fi."
+                            else "Process an episode from New, or share one here from your podcast player."
+                        )
+                    } else {
+                        LazyColumn(state = listState, contentPadding = PaddingValues(bottom = 24.dp)) {
+                            itemsIndexed(list, key = { _, a -> a.id }) { i, article ->
+                                if (i > 0) HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f))
+                                val stored = repo.isEpisodeStored(storedKeys, article)
+                                ArticleCard(
+                                    article = article,
+                                    onOpen = { openArticle(article.id) },
+                                    onToggleArchive = { repo.toggleArchive(article) },
+                                    onToggleFavorite = { repo.toggleFavorite(article) },
+                                    onDelete = { repo.deleteArticle(article) },
+                                    shareItems = { close -> ShareMenuItems(article, repo, scope, snackbarHostState, close) },
+                                    episode = EpisodeBadge(
+                                        transcribing = article.excerpt == "Transcribing…",
+                                        downloaded = stored,
+                                        downloading = article.id in downloading
+                                    ),
+                                    extraItems = { close ->
+                                        if (stored) {
+                                            DropdownMenuItem(
+                                                text = { Text("Remove download") },
+                                                leadingIcon = { Icon(Icons.Filled.FileDownloadOff, null) },
+                                                onClick = {
+                                                    close()
+                                                    repo.removeEpisodeAudio(article)
+                                                    storedKeys = repo.storedEpisodeKeys()
+                                                }
+                                            )
+                                        } else if (article.audioUrl != null && article.id !in downloading) {
+                                            DropdownMenuItem(
+                                                text = { Text("Download episode") },
+                                                leadingIcon = { Icon(Icons.Filled.Download, null) },
+                                                onClick = { close(); downloadAudio(article) }
+                                            )
+                                        }
+                                    }
+                                )
+                            }
+                        }
+                    }
+                }
+            } else if (articles.isEmpty()) {
                 Box(
                     modifier = Modifier.fillMaxSize().padding(32.dp),
                     contentAlignment = Alignment.Center
@@ -624,6 +878,25 @@ fun ArticleListScreen(
                     }
                 }
             }
+        }
+    }
+}
+
+@Composable
+private fun PodcastEmptyNote(title: String, body: String) {
+    Box(
+        modifier = Modifier.fillMaxWidth().padding(32.dp),
+        contentAlignment = Alignment.Center
+    ) {
+        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+            Text(title, style = MaterialTheme.typography.titleMedium)
+            Spacer(modifier = Modifier.size(8.dp))
+            Text(
+                body,
+                style = MaterialTheme.typography.bodyMedium,
+                textAlign = TextAlign.Center,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
         }
     }
 }
@@ -672,7 +945,11 @@ private fun ArticleCard(
     onToggleArchive: () -> Unit,
     onToggleFavorite: () -> Unit,
     onDelete: () -> Unit,
-    shareItems: @Composable (closeMenu: () -> Unit) -> Unit
+    shareItems: @Composable (closeMenu: () -> Unit) -> Unit,
+    /** On the Podcasts tab: processed / downloaded, shown under the title. */
+    episode: EpisodeBadge? = null,
+    /** Menu entries of its own (an episode's download / remove). */
+    extraItems: (@Composable (closeMenu: () -> Unit) -> Unit)? = null
 ) {
     var menuOpen by remember { mutableStateOf(false) }
     val unread = article.readParagraph == 0 && article.ttsParagraph == 0
@@ -719,6 +996,7 @@ private fun ArticleCard(
                         leadingIcon = { Icon(if (article.favorite) Icons.Filled.Star else Icons.Filled.StarBorder, null) },
                         onClick = { menuOpen = false; onToggleFavorite() }
                     )
+                    extraItems?.invoke { menuOpen = false }
                     shareItems { menuOpen = false }
                     DropdownMenuItem(
                         text = { Text("Delete") },
@@ -771,9 +1049,16 @@ private fun ArticleCard(
                     )
                 }
 
+                if (episode != null) {
+                    Spacer(modifier = Modifier.height(4.dp))
+                    EpisodeBadgeRow(episode)
+                }
+
                 // date · excerpt
                 val date = cardDate(article.savedAt)
-                val excerpt = article.excerpt?.takeIf { it.isNotBlank() && it != "Fetching…" }
+                val excerpt = article.excerpt?.takeIf {
+                    it.isNotBlank() && it != "Fetching…" && !(episode != null && it == "Transcribing…")
+                }
                 if (date.isNotBlank() || excerpt != null) {
                     Spacer(modifier = Modifier.height(4.dp))
                     Text(

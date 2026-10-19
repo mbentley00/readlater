@@ -1403,10 +1403,22 @@ async function main() {
     assert.ok(settingsHtml.includes('Waiting episode') && settingsHtml.includes('take-ep'), 'waiting episodes are on Settings');
     assert.ok(settingsHtml.includes('id="feed-urls"'), 'with the multi-feed import box');
 
+    r = await api('GET', '/api/podcasts');
+    assert.strictEqual(r.body.shows.length, 2, 'the Podcasts tab lists the shows');
+    assert.strictEqual(r.body.waiting.length, 2, 'and every waiting episode, across shows');
+    assert.ok(r.body.waiting.every((w) => w.guid === 'new-2' && w.feedId && w.url), 'each names its show');
+
     r = await api('POST', `/api/feeds/${fThree.id}/episodes/dismiss`, { guid: 'new-2' });
     assert.strictEqual(r.status, 200, 'dismissed');
     r = await api('POST', `/api/feeds/${fThree.id}/episodes/take`, { guid: 'new-2' });
     assert.strictEqual(r.status, 404, 'a dismissed episode is no longer waiting');
+    r = await api('GET', '/api/podcasts');
+    assert.strictEqual(r.body.waiting.length, 1, 'an archived episode leaves the list');
+    r = await api('POST', `/api/feeds/${fThree.id}/episodes/restore`, { guid: 'new-2' });
+    assert.strictEqual(r.status, 200, 'undo puts it back');
+    r = await api('GET', '/api/podcasts');
+    assert.strictEqual(r.body.waiting.length, 2, 'waiting again');
+    r = await api('POST', `/api/feeds/${fThree.id}/episodes/dismiss`, { guid: 'new-2' });
     r = await api('POST', `/api/feeds/${fTwo.id}/episodes/take`, { guid: 'new-2' });
     assert.strictEqual(r.status, 200, 'taken on request');
     assert.strictEqual(episodeHits, 1, 'downloaded once, now');
@@ -1417,6 +1429,10 @@ async function main() {
     r = await api('GET', '/api/feeds');
     assert.ok(r.body.feeds.every((f) => f.pendingCount === 0), 'nothing left waiting');
     assert.strictEqual(r.body.feeds.find((f) => f.id === fTwo.id).episodes, 1, 'counted as brought in');
+    r = await api('GET', '/api/podcasts');
+    assert.deepStrictEqual(r.body.episodes, [{ articleId: takenId, feedId: fTwo.id }], 'the taken episode is tied to its show');
+    r = await api('POST', `/api/feeds/${fTwo.id}/episodes/restore`, { guid: 'new-2' });
+    assert.strictEqual(r.status, 404, 'a taken episode cannot be put back on the waiting list');
 
     r = await api('PATCH', `/api/feeds/${fTwo.id}`, { autoProcess: true });
     assert.strictEqual(r.status, 200);

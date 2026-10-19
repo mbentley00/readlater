@@ -108,6 +108,12 @@ class Settings(context: Context) {
         get() = prefs.getString(KEY_CACHED_VIEWS, "").orEmpty()
         set(value) { prefs.edit().putString(KEY_CACHED_VIEWS, value).apply() }
 
+    /** Last GET /api/podcasts reply (JSON): the Podcasts tab's shows and
+     *  waiting episodes, shown at once (and offline) while it refreshes. */
+    var cachedPodcastsJson: String
+        get() = prefs.getString(KEY_CACHED_PODCASTS, "").orEmpty()
+        set(value) { prefs.edit().putString(KEY_CACHED_PODCASTS, value).apply() }
+
     /** updatedAt watermark of the last successful sync (for delta pulls). */
     var lastSyncAt: Long
         get() = prefs.getLong(KEY_LAST_SYNC, 0L)
@@ -131,6 +137,7 @@ class Settings(context: Context) {
         const val KEY_SKIP_PODCAST_ADS = "skip_podcast_ads"
         const val KEY_PODCASTS_TAB = "podcasts_tab"
         const val KEY_CACHED_VIEWS = "cached_views_json"
+        const val KEY_CACHED_PODCASTS = "cached_podcasts_json"
         const val KEY_LIST_SORT = "list_sort"
         const val KEY_LAST_ARTICLE = "last_article_id"
         const val KEY_TTS_ENGINE = "tts_engine"

@@ -81,6 +81,16 @@ class PodcastFiles(private val dir: File) {
         return files().firstOrNull { it.name.substringBeforeLast('.') in names && it.length() > 0 }
     }
 
+    /** Names (without extension) of every stored episode — one directory
+     *  read, so a list can mark what is downloaded without one per row. */
+    fun storedKeys(): Set<String> =
+        files().filter { !it.name.endsWith(".part") && it.length() > 0 }
+            .map { it.name.substringBeforeLast('.') }.toSet()
+
+    /** Whether [storedKeys] holds the episode for this article. */
+    fun isStored(keys: Set<String>, articleId: String, url: String): Boolean =
+        articleId in keys || hashOfUrl(url)?.let { it in keys } == true
+
     /** Where a download should be written before [keep] takes it. */
     fun spoolFile(): File {
         dir.mkdirs()

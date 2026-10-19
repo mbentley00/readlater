@@ -1519,6 +1519,19 @@ const server = http.createServer(async (req, res) => {
         return json(res, r.status, r.body);
       }
     }
+    // GET /api/podcasts — the phone's Podcasts tab in one call: the shows
+    // (artwork for the show filter), every episode waiting to be picked, and
+    // which show each taken episode came from.
+    if (req.method === 'GET' && parts[1] === 'podcasts' && parts.length === 2) {
+      return json(res, 200, {
+        shows: store.listFeeds(user.id).map((f) => ({
+          id: f.id, title: f.title || hostOf(f.url), url: f.url, imageUrl: f.imageUrl || null,
+          autoProcess: f.autoProcess !== 0, episodes: f.episodes, waiting: f.pendingCount,
+        })),
+        waiting: store.listUserPendingFeedItems(user.id),
+        episodes: store.listUserFeedEpisodes(user.id),
+      });
+    }
     // POST /api/feeds/import — many at once: {text} is pasted URLs or an OPML
     // export, {autoProcess} applies to every feed added. Feeds are read a few
     // at a time; each gets its own result line, and one bad feed fails alone.
@@ -1553,11 +1566,16 @@ const server = http.createServer(async (req, res) => {
     }
     // POST /api/feeds/:id/episodes/(take|dismiss) {guid} — a waiting episode:
     // download and transcribe it now, or stop offering it.
+    // .../restore puts an archived (dismissed) one back.
     if (req.method === 'POST' && parts[1] === 'feeds' && parts[3] === 'episodes' && parts.length === 5
-        && ['take', 'dismiss'].includes(parts[4])) {
+        && ['take', 'dismiss', 'restore'].includes(parts[4])) {
       const feed = store.getFeed(parts[2], user.id);
       if (!feed) return json(res, 404, { error: 'no such feed' });
       const b = parseBody(await readBody(req), req.headers['content-type']);
+      if (parts[4] === 'restore') {
+        const n = store.restorePendingFeedItem(feed.id, String(b.guid || ''));
+        return json(res, n ? 200 : 404, n ? { ok: true } : { error: 'that episode cannot be restored' });
+      }
       const item = store.getPendingFeedItem(feed.id, String(b.guid || ''));
       if (!item) return json(res, 404, { error: 'that episode is not waiting' });
       if (parts[4] === 'dismiss') {
