@@ -2293,6 +2293,20 @@ function testEmailPreambleTrim() {
   console.log('  Email preamble/masthead trim ✔');
 }
 
+/** Titles like "Mr." are spelled out so TTS doesn't pause as at a sentence end. */
+function testTtsTitles() {
+  const { normalizeForTts: n } = require('./tts');
+  assert.strictEqual(n('Mr. Obama said the other day.'), 'Mister Obama said the other day.');
+  assert.strictEqual(n('Mr. and Mrs. Smith met Ms. Lee and Dr. Fauci.'),
+    'Mister and Missus Smith met Miz Lee and Doctor Fauci.');
+  assert.strictEqual(n('Sen. Warren and Gov. Newsom'), 'Senator Warren and Governor Newsom');
+  assert.strictEqual(n('Martin Luther King Jr. said so.'), 'Martin Luther King Jr said so.');
+  assert.strictEqual(n('He met King Jr. Then he left.'), 'He met King Jr. Then he left.', 'sentence-ending Jr. kept');
+  assert.strictEqual(n('She lives in the U.S. now.'), 'She lives in the U.S. now.', 'initialisms untouched');
+  assert.strictEqual(n('Mrs.Smith'), 'Mrs.Smith', 'needs a space before the name');
+  console.log('  TTS spells out titles ✔');
+}
+
 /** Image captions, credits and alt text are never spoken. */
 function testTtsSkipsCaptions() {
   const { paragraphsOf } = require('./tts');
@@ -2573,6 +2587,7 @@ testFeedParsing();
 testFeedArtBackfill();
 testProblemDetection();
 testTtsSkipsCaptions();
+testTtsTitles();
 testTranscriptShaping();
 testEmailNormalization();
 testYouTube();

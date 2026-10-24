@@ -40,7 +40,17 @@ const SIL_THRESHOLD = process.env.TTS_SILENCE_THRESHOLD || '-40dB';
 const SIL_DURATION = process.env.TTS_SILENCE_DURATION || '0.30'; // trim pauses longer than this (s)
 const SIL_KEEP = process.env.TTS_SILENCE_KEEP || '0.20';         // ...down toward this (s)
 
-/** Normalize text so Kokoro doesn't read a full-stop pause inside names and
+// Titles before a name, spelled out so no engine treats the period as a
+// sentence end (NYT writes "Mr. Obama said" constantly). Keep in sync with
+// TITLE_WORDS in android TtsService.kt.
+const TITLE_WORDS = {
+  Mr: 'Mister', Mrs: 'Missus', Ms: 'Miz', Dr: 'Doctor', Prof: 'Professor',
+  Rev: 'Reverend', Gen: 'General', Sen: 'Senator', Rep: 'Representative',
+  Gov: 'Governor', Lt: 'Lieutenant', Sgt: 'Sergeant', Col: 'Colonel', Capt: 'Captain',
+};
+const TITLE_RE = new RegExp(`\\b(${Object.keys(TITLE_WORDS).join('|')})\\.(?=\\s+(?:[A-Z]|and\\b|&))`, 'g');
+
+/** Normalize text so TTS doesn't read a full-stop pause inside names and
  *  titles — e.g. the "D." in "John D. Rockefeller" or "Dr." / "Mr.". Sentence
  *  periods and initialisms like "U.S." are left intact. */
 function normalizeForTts(text) {
@@ -50,8 +60,13 @@ function normalizeForTts(text) {
   for (let i = 0; i < 3; i++) {
     t = t.replace(/\b([A-Z][a-z]+)\s+([A-Z])\.(\s+["'A-Z])/g, '$1 $2$3');
   }
-  // Common courtesy/title abbreviations.
-  t = t.replace(/\b(Mr|Mrs|Ms|Mx|Dr|Prof|Sr|Jr|Rev|Gen|Sen|Rep|Gov|Lt|Sgt|Col|Capt)\.(\s)/g, '$1$2');
+  // Titles before a name ("Mr. Obama", "Mr. and Mrs. Smith") → full words.
+  t = t.replace(TITLE_RE, (_, abbr) => TITLE_WORDS[abbr]);
+  // Gender-neutral "Mx." has no common spelling — just drop its period.
+  t = t.replace(/\bMx\.(?=\s+[A-Z])/g, 'Mx');
+  // "Jr." / "Sr." mid-sentence ("King Jr. said"); keep the period when a new
+  // sentence follows ("...Jr. He") so that pause survives.
+  t = t.replace(/\b(Jr|Sr)\.(?=\s+[a-z0-9,])/g, '$1');
   return t;
 }
 
@@ -437,4 +452,4 @@ function encodeOpus(wav) {
   });
 }
 
-module.exports = { enabled, paragraphsOf, synthesizeArticle, encodeOpus, cfg, shortenPauses };
+module.exports = { enabled, paragraphsOf, synthesizeArticle, encodeOpus, cfg, shortenPauses, normalizeForTts };

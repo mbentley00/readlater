@@ -2727,12 +2727,37 @@ class TtsService : Service() {
     private fun stripSpokenQuotes(text: String): String =
         text.filterNot { it in speechQuoteChars }.replace("  ", " ").trim()
 
+    /** Titles before a name, spelled out so the engine doesn't treat the period
+     *  as a sentence end (NYT writes "Mr. Obama said" constantly; Piper/espeak
+     *  pauses there). Keep in sync with TITLE_WORDS in server/tts.js. */
+    private val titleWords = mapOf(
+        "Mr" to "Mister", "Mrs" to "Missus", "Ms" to "Miz", "Dr" to "Doctor", "Prof" to "Professor",
+        "Rev" to "Reverend", "Gen" to "General", "Sen" to "Senator", "Rep" to "Representative",
+        "Gov" to "Governor", "Lt" to "Lieutenant", "Sgt" to "Sergeant", "Col" to "Colonel", "Capt" to "Captain"
+    )
+    private val titleRegex = Regex("\\b(${titleWords.keys.joinToString("|")})\\.(?=\\s+(?:[A-Z]|and\\b|&))")
+    private val middleInitialRegex = Regex("\\b([A-Z][a-z]+)\\s+([A-Z])\\.(\\s+['A-Z])")
+    private val mxRegex = Regex("\\bMx\\.(?=\\s+[A-Z])")
+    private val suffixRegex = Regex("\\b(Jr|Sr)\\.(?=\\s+[a-z0-9,])")
+
+    /** Same as normalizeForTts in server/tts.js: drop the full-stop pause inside
+     *  names ("John D. Rockefeller", "Mr. Obama", "King Jr. said") while leaving
+     *  sentence ends and initialisms like "U.S." alone. */
+    private fun normalizeForSpeech(text: String): String {
+        var t = text
+        repeat(3) { t = middleInitialRegex.replace(t, "$1 $2$3") }
+        t = titleRegex.replace(t) { titleWords.getValue(it.groupValues[1]) }
+        t = mxRegex.replace(t, "Mx")
+        t = suffixRegex.replace(t, "$1")
+        return t
+    }
+
     /** Text to synthesize for [idx]; the first spoken block gets the intro prepended. */
     private fun synthTextFor(idx: Int): String? {
         val base = speakableText(blocks.getOrNull(idx) ?: return null) ?: return null
         val intro = articleIntro()
         val full = if (idx == speakableBlocks.firstOrNull() && intro.isNotBlank()) "$intro\n\n$base" else base
-        return stripSpokenQuotes(full)
+        return normalizeForSpeech(stripSpokenQuotes(full))
     }
 
     private fun nextSpeakable(from: Int): Int? {
