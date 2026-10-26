@@ -1174,7 +1174,7 @@ function readerPage(ctx, user, article, url) {
   </div>
 </article>
 <aside id="hl-panel" class="hl-panel" hidden>
-  <div class="hl-panel-head"><strong>Highlights (${hls.length})</strong><button class="act" id="hl-close">×</button></div>
+  <div class="hl-panel-head"><strong>Highlights (${hls.length})</strong><span><button class="act" id="hl-del-all"${hls.length ? '' : ' hidden'}>Delete all</button> <button class="act" id="hl-close">×</button></span></div>
   <div class="hl-panel-body">${hls.length ? hlItems : '<div class="meta">No highlights yet. Select text in the article to add one.</div>'}</div>
 </aside>
 <aside id="rel-panel" class="hl-panel" hidden>
@@ -1413,6 +1413,17 @@ function setPanel(open) {
 }
 document.getElementById('hl-toggle').addEventListener('click', () => setPanel(panel.hidden));
 document.getElementById('hl-close').addEventListener('click', () => setPanel(false));
+// Delete every highlight on this article. Unlike a single delete this can't be
+// undone by re-selecting one passage, so it asks first.
+document.getElementById('hl-del-all').addEventListener('click', async () => {
+  const items = [...panel.querySelectorAll('.hl-item')];
+  if (!items.length) return;
+  if (!confirm('Delete all ' + items.length + ' highlights on this article?')) return;
+  const res = await fetch('/api/articles/' + encodeURIComponent(ARTICLE) + '/highlights', { method: 'DELETE' });
+  if (!res.ok) { alert('Could not delete the highlights.'); return; }
+  for (const it of items) removeHighlightFromDom(it.dataset.hlId);
+  HLS.length = 0;
+});
 
 // Related highlights: other articles you highlighted that share this one's
 // distinctive words, with the passages that matched. Fetched on first open —
@@ -1510,6 +1521,7 @@ function removeHighlightFromDom(id) {
   document.getElementById('hl-toggle').textContent = 'Highlights (' + n + ')';
   const head = panel.querySelector('.hl-panel-head strong');
   if (head) head.textContent = 'Highlights (' + n + ')';
+  document.getElementById('hl-del-all').hidden = n === 0;
   if (n === 0) {
     const body = panel.querySelector('.hl-panel-body');
     if (body) body.innerHTML = '<div class="meta">No highlights yet. Select text in the article to add one.</div>';
@@ -1545,6 +1557,7 @@ function addHighlightToDom(h) {
   document.getElementById('hl-toggle').textContent = 'Highlights (' + n + ')';
   const head = panel.querySelector('.hl-panel-head strong');
   if (head) head.textContent = 'Highlights (' + n + ')';
+  document.getElementById('hl-del-all').hidden = n === 0;
 }
 
 // Click a highlight inside the article -> a small Delete menu at that spot.

@@ -723,6 +723,16 @@ async function main() {
       await api('POST', `/api/articles/${id}/highlights`, { text: 'A kestrel hovers', paragraphIndex: 0 });
     }
     const kPlain = await mkState('kestrel-4', 'Kestrel Plain');
+    // "Delete all" on one article clears its highlights and leaves others'.
+    // kPlain ends up unhighlighted again, which the searches below rely on.
+    await api('POST', `/api/articles/${kPlain}/highlights`, { text: 'A kestrel hovers', paragraphIndex: 0 });
+    await api('POST', `/api/articles/${kPlain}/highlights`, { text: 'Then it stoops', paragraphIndex: 0 });
+    let delAll = await api('DELETE', `/api/articles/${kPlain}/highlights`);
+    assert.strictEqual(delAll.body.deleted, 2, 'delete all removes every highlight on the article');
+    delAll = await api('GET', `/api/articles/${kPlain}/highlights`);
+    assert.strictEqual(delAll.body.highlights.length, 0);
+    delAll = await api('GET', `/api/articles/${kInbox}/highlights`);
+    assert.strictEqual(delAll.body.highlights.length, 1, "other articles' highlights untouched");
 
     const kHits = async (qs) => {
       const page = await fetch(BASE + qs, { headers: { Cookie: aliceCookie } });

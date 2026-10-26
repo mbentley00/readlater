@@ -1855,6 +1855,10 @@ const server = http.createServer(async (req, res) => {
       if (req.method === 'GET') {
         return json(res, 200, { highlights: store.highlightsForArticle(a.id).map(pubHighlight) });
       }
+      if (req.method === 'DELETE') {
+        const { changes } = store.deleteHighlightsForArticle(a.id, user.id);
+        return json(res, 200, { ok: true, deleted: changes });
+      }
       if (req.method === 'POST') {
         const b = parseBody(await readBody(req), req.headers['content-type']);
         const text = sanitizeString(b.text, 20000);

@@ -1516,6 +1516,8 @@ function open(dataDir) {
         .run({ id, userId, location: location || null }),
     deleteHighlight: (id, userId) =>
       prep('hd', 'DELETE FROM highlights WHERE id = ? AND userId = ?').run(id, userId),
+    deleteHighlightsForArticle: (articleId, userId) =>
+      prep('hda', 'DELETE FROM highlights WHERE articleId = ? AND userId = ?').run(articleId, userId),
   };
   return db;
 }
