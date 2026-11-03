@@ -78,7 +78,7 @@ class ShareUploadService : Service() {
         // Must be foreground within seconds of startForegroundService, whatever follows.
         val notification = NotificationCompat.Builder(this, CHANNEL_ID)
             .setSmallIcon(R.drawable.ic_notification)
-            .setContentTitle("Sending episode to Earmark")
+            .setContentTitle("Sending episode to ${getString(R.string.app_name)}")
             .setProgress(0, 0, true)
             .setOngoing(true)
             .setSilent(true)
@@ -124,8 +124,8 @@ class ShareUploadService : Service() {
         // Named up front: an episode is tens of MB, so this is the one share that
         // visibly takes a while, and a silent pause reads as nothing happening.
         toast(
-            if (declaredSize > 0) "Sending episode to Earmark (${declaredSize / 1024 / 1024} MB)…"
-            else "Sending episode to Earmark…"
+            if (declaredSize > 0) "Sending episode to ${getString(R.string.app_name)} (${declaredSize / 1024 / 1024} MB)…"
+            else "Sending episode to ${getString(R.string.app_name)}…"
         )
         var spool: File? = null
         try {

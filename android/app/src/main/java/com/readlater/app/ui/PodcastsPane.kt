@@ -17,13 +17,14 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.Archive
 import androidx.compose.material.icons.filled.CheckCircle
-import androidx.compose.material.icons.filled.CloudDownload
+import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.DownloadDone
 import androidx.compose.material.icons.filled.HourglassTop
 import androidx.compose.material.icons.filled.PhoneAndroid
+import androidx.compose.material.icons.outlined.Inventory2
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.FilledTonalIconButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -40,20 +41,24 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.readlater.app.data.BacklogEpisode
 import com.readlater.app.data.PodcastShow
 import com.readlater.app.data.WaitingEpisode
 
 /**
- * The Podcasts tab's three lists, Pocket Casts-style:
+ * The Podcasts tab's lists, Pocket Casts-style:
  *  - NEW: episodes a show published that are not processed yet (only shows
  *    with auto-processing off have any). Process or archive them here.
  *  - PROCESSED: episodes transcribed on the server, ready to read or play.
  *  - DOWNLOADED: the processed ones whose audio is on this phone.
+ *  - OLDER: one show's back catalogue, read from its feed — the episodes from
+ *    before you subscribed (and any archived from New), to process by hand.
  */
 enum class PodcastList(val label: String) {
     NEW("New"),
     PROCESSED("Processed"),
     DOWNLOADED("Downloaded"),
+    OLDER("Older"),
 }
 
 /** How a processed episode stands, shown on its card. */
@@ -173,7 +178,13 @@ private fun ShowTile(
     }
 }
 
-/** An episode in the New list: not processed. Process it, or archive it. */
+/** "Oct 12 · 42m": an episode's date and length, for its show-notes sheet. */
+fun episodeMeta(publishedAt: Long?, durationS: Int?): String =
+    listOf(publishedAt?.let { relativeDay(it) }.orEmpty(), formatEpisodeDuration(durationS))
+        .filter { it.isNotBlank() }.joinToString(" · ")
+
+/** An episode in the New list: not processed. Process it, or archive it;
+ *  tap it for its show notes. */
 @Composable
 fun WaitingEpisodeRow(
     ep: WaitingEpisode,
@@ -181,10 +192,11 @@ fun WaitingEpisodeRow(
     busy: Boolean,
     onProcess: () -> Unit,
     onArchive: () -> Unit,
+    onOpen: () -> Unit,
 ) {
     Row(
         verticalAlignment = Alignment.CenterVertically,
-        modifier = Modifier.fillMaxWidth().padding(start = 16.dp, end = 4.dp, top = 10.dp, bottom = 10.dp),
+        modifier = Modifier.fillMaxWidth().clickable(onClick = onOpen).padding(start = 16.dp, end = 4.dp, top = 10.dp, bottom = 10.dp),
     ) {
         val art = ep.imageUrl ?: show?.imageUrl
         Box(
@@ -228,16 +240,85 @@ fun WaitingEpisodeRow(
                 CircularProgressIndicator(Modifier.size(22.dp), strokeWidth = 2.dp)
             }
         } else {
-            IconButton(onClick = onProcess) {
-                Icon(
-                    Icons.Filled.CloudDownload,
-                    contentDescription = "Process (download and transcribe)",
-                    tint = MaterialTheme.colorScheme.primary,
-                )
+            // a filled circle with a bare arrow, so it can't be mistaken for the outlined archive box beside it
+            FilledTonalIconButton(onClick = onProcess) {
+                Icon(Icons.Filled.Download, contentDescription = "Process (download and transcribe)")
             }
         }
         IconButton(onClick = onArchive, enabled = !busy) {
-            Icon(Icons.Filled.Archive, contentDescription = "Archive", tint = MaterialTheme.colorScheme.onSurfaceVariant)
+            Icon(
+                Icons.Outlined.Inventory2,
+                contentDescription = "Archive",
+                tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f),
+            )
+        }
+    }
+}
+
+/**
+ * An episode of the selected show's back catalogue. One still available gets
+ * the process button; one under New or already processed says so instead.
+ * Tapping it shows its notes.
+ */
+@Composable
+fun BacklogEpisodeRow(
+    ep: BacklogEpisode,
+    busy: Boolean,
+    onProcess: () -> Unit,
+    onOpen: (() -> Unit)?,
+) {
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        modifier = Modifier
+            .fillMaxWidth()
+            .then(if (onOpen != null) Modifier.clickable(onClick = onOpen) else Modifier)
+            .padding(start = 16.dp, end = 8.dp, top = 10.dp, bottom = 10.dp),
+    ) {
+        Box(
+            Modifier.size(48.dp).clip(RoundedCornerShape(8.dp))
+                .background(MaterialTheme.colorScheme.surfaceVariant)
+        ) {
+            if (ep.imageUrl != null) {
+                coil.compose.AsyncImage(
+                    model = ep.imageUrl, contentDescription = null,
+                    contentScale = ContentScale.Crop, modifier = Modifier.size(48.dp),
+                )
+            }
+        }
+        Spacer(Modifier.width(12.dp))
+        Column(Modifier.weight(1f)) {
+            Text(
+                text = ep.title,
+                style = MaterialTheme.typography.titleSmall.copy(fontWeight = FontWeight.SemiBold),
+                maxLines = 2, overflow = TextOverflow.Ellipsis,
+            )
+            val meta = listOf(
+                ep.publishedAt?.let { relativeDay(it) }.orEmpty(),
+                formatEpisodeDuration(ep.durationS),
+                when {
+                    busy -> "Processing…"
+                    ep.state == "processed" -> "Processed"
+                    ep.state == "waiting" -> "In New"
+                    else -> ""
+                },
+            ).filter { it.isNotBlank() }.joinToString(" · ")
+            Text(
+                text = meta,
+                style = MaterialTheme.typography.labelMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+        when {
+            busy -> Box(Modifier.size(48.dp), contentAlignment = Alignment.Center) {
+                CircularProgressIndicator(Modifier.size(22.dp), strokeWidth = 2.dp)
+            }
+            ep.state == "processed" -> Box(Modifier.size(48.dp), contentAlignment = Alignment.Center) {
+                Icon(Icons.Filled.CheckCircle, contentDescription = "Processed",
+                    tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(22.dp))
+            }
+            else -> FilledTonalIconButton(onClick = onProcess) {
+                Icon(Icons.Filled.Download, contentDescription = "Process (download and transcribe)")
+            }
         }
     }
 }

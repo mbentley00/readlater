@@ -1380,13 +1380,16 @@ async function main() {
     r = await api('GET', '/api/feeds');
     assert.strictEqual(r.body.feeds.length, 2);
     assert.ok(r.body.feeds.every((f) => f.autoProcess === false), 'imported with auto-download off');
-    const [fThree, fTwo] = r.body.feeds; // newest first
-    assert.ok(fTwo.url.endsWith('/rss2') && fThree.url.includes('/rss3'));
+    // Imported together, so they can share an addedAt: find each by url, not order.
+    const fTwo = r.body.feeds.find((f) => f.url.endsWith('/rss2'));
+    const fThree = r.body.feeds.find((f) => f.url.includes('/rss3'));
+    assert.ok(fTwo && fThree);
 
     // A new episode arrives: written down as waiting, nothing downloaded.
     const episode3 = Buffer.concat([Buffer.from('ID3'), Buffer.alloc(98)]);
     let episodeHits = 0;
     feedItems = `<item><title>Waiting episode</title><guid>new-2</guid><itunes:duration>1:30:00</itunes:duration>
+      <description><![CDATA[<p>In this one: <a href="https://example.com/x">a link</a></p>]]></description>
       <enclosure url="${feedBase}/feed-episode.mp3?n=2" type="audio/mpeg"/></item>` + feedItems;
     feedServer.removeAllListeners('request');
     feedServer.on('request', (req2, res2) => {
@@ -1418,6 +1421,15 @@ async function main() {
     assert.strictEqual(r.body.waiting.length, 2, 'and every waiting episode, across shows');
     assert.ok(r.body.waiting.every((w) => w.guid === 'new-2' && w.feedId && w.url), 'each names its show');
 
+    r = await api('GET', `/api/feeds/${fThree.id}/episodes/notes?guid=new-2`);
+    assert.strictEqual(r.body.notes, '<p>In this one: <a href="https://example.com/x">a link</a></p>',
+      'a waiting episode has its show notes');
+    r = await api('GET', `/api/feeds/${fThree.id}/episodes/notes?guid=old-1`);
+    assert.strictEqual(r.status, 200, 'older episodes have notes too, read from the feed');
+    assert.strictEqual(r.body.notes, '', 'none given');
+    r = await api('GET', `/api/feeds/${fThree.id}/episodes/notes?guid=nope`);
+    assert.strictEqual(r.status, 404, 'an episode not in the feed');
+
     r = await api('POST', `/api/feeds/${fThree.id}/episodes/dismiss`, { guid: 'new-2' });
     assert.strictEqual(r.status, 200, 'dismissed');
     r = await api('POST', `/api/feeds/${fThree.id}/episodes/take`, { guid: 'new-2' });
@@ -1436,11 +1448,19 @@ async function main() {
     r = await api('GET', `/api/articles/${takenId}`);
     assert.strictEqual(r.body.title, 'Waiting episode');
     assert.strictEqual(r.body.source, 'podcast-feed');
+    // The podcast app's sync asks for episodes only.
+    r = await api('GET', '/api/articles?includeArchived=1&podcasts=1');
+    assert.ok(r.body.articles.some((a) => a.id === takenId), 'podcasts=1 lists the episode');
+    assert.ok(r.body.articles.every((a) => a.audioUrl || a.url.startsWith('audio:')), 'podcasts=1 lists only episodes');
+    r = await api('GET', '/api/articles?includeArchived=1');
+    assert.ok(r.body.articles.some((a) => !a.audioUrl && !a.url.startsWith('audio:')), 'articles exist to be left out');
     r = await api('GET', '/api/feeds');
     assert.ok(r.body.feeds.every((f) => f.pendingCount === 0), 'nothing left waiting');
     assert.strictEqual(r.body.feeds.find((f) => f.id === fTwo.id).episodes, 1, 'counted as brought in');
     r = await api('GET', '/api/podcasts');
     assert.deepStrictEqual(r.body.episodes, [{ articleId: takenId, feedId: fTwo.id }], 'the taken episode is tied to its show');
+    r = await api('GET', `/api/feeds/${fTwo.id}/episodes/notes?articleId=${takenId}`);
+    assert.ok(r.body.notes.includes('a link') && r.body.guid === 'new-2', 'notes of a processed episode, by article');
     r = await api('POST', `/api/feeds/${fTwo.id}/episodes/restore`, { guid: 'new-2' });
     assert.strictEqual(r.status, 404, 'a taken episode cannot be put back on the waiting list');
 
@@ -1451,12 +1471,45 @@ async function main() {
     r = await api('PATCH', `/api/feeds/${fTwo.id}`, { autoProcess: 'yes' });
     assert.strictEqual(r.status, 400, 'the switch takes a boolean');
 
-    for (let i = 0; i < 50; i++) { // let the transcription finish before deleting
-      r = await api('GET', `/api/articles/${takenId}`);
+    // The back catalogue: everything in the feed, marked by what became of it.
+    r = await api('GET', `/api/feeds/${fThree.id}/backlog`);
+    assert.strictEqual(r.status, 200, 'backlog listed');
+    const stateOf = (body, guid) => (body.items.find((i) => i.guid === guid) || {}).state;
+    assert.strictEqual(stateOf(r.body, 'old-1'), 'available', 'pre-subscription episode is in the backlog');
+    assert.strictEqual(stateOf(r.body, 'new-2'), 'available', 'an archived one can be picked again');
+    r = await api('GET', `/api/feeds/${fTwo.id}/backlog`);
+    assert.strictEqual(stateOf(r.body, 'new-2'), 'processed', 'a taken one shows as processed');
+    assert.strictEqual(r.body.items.find((i) => i.guid === 'new-2').articleId, takenId);
+    r = await api('POST', `/api/feeds/${fThree.id}/episodes/take`, { guid: 'old-1' });
+    assert.strictEqual(r.status, 404, 'without backlog:true only waiting episodes are taken');
+    r = await api('POST', `/api/feeds/${fThree.id}/episodes/take`, { guid: 'nope', backlog: true });
+    assert.strictEqual(r.status, 404, 'a guid the feed does not list is refused');
+    const episode4 = Buffer.concat([Buffer.from('ID3'), Buffer.alloc(99)]);
+    feedServer.removeAllListeners('request');
+    feedServer.on('request', (req2, res2) => {
+      if (req2.url.startsWith('/feed-episode.mp3')) {
+        res2.writeHead(200, { 'Content-Type': 'audio/mpeg', 'Content-Length': episode4.length });
+        return res2.end(episode4);
+      }
+      res2.writeHead(200, { 'Content-Type': 'application/rss+xml' });
+      res2.end(`<?xml version="1.0"?><rss><channel><title>Test Show</title>${feedItems}</channel></rss>`);
+    });
+    r = await api('POST', `/api/feeds/${fThree.id}/episodes/take`, { guid: 'old-1', backlog: true });
+    assert.strictEqual(r.status, 200, 'an older episode is processed on request');
+    const backlogId = r.body.articleId;
+    assert.ok(backlogId, 'and becomes an article');
+    r = await api('GET', `/api/feeds/${fThree.id}/backlog`);
+    assert.strictEqual(stateOf(r.body, 'old-1'), 'processed', 'then shows as processed');
+    r = await api('POST', `/api/feeds/${fThree.id}/episodes/take`, { guid: 'old-1', backlog: true });
+    assert.strictEqual(r.status, 409, 'and is not processed twice');
+
+    for (const id of [takenId, backlogId]) for (let i = 0; i < 50; i++) { // let transcription finish before deleting
+      r = await api('GET', `/api/articles/${id}`);
       if (!/Transcribing/.test(r.body.excerpt || '')) break;
       await new Promise((res2) => setTimeout(res2, 100));
     }
     await api('DELETE', `/api/articles/${takenId}`);
+    await api('DELETE', `/api/articles/${backlogId}`);
     await api('DELETE', `/api/feeds/${fTwo.id}`);
     await api('DELETE', `/api/feeds/${fThree.id}`);
     feedServer.close();
@@ -1663,6 +1716,19 @@ async function main() {
     res = await fetch(BASE + '/apk/test-engine', { headers: { Cookie: aliceCookie2 } });
     assert.strictEqual(res.status, 200);
     assert.strictEqual(Buffer.from(await res.arrayBuffer()).toString(), 'PK-side-apk', 'named apk round-trips');
+    r = await api('GET', '/api/app-version?app=test-engine');
+    assert.strictEqual(r.status, 404, 'a named apk uploaded without a version has none');
+    // A second app (the podcast app) keeps its own version, apart from the main one.
+    res = await fetch(BASE + '/api/apk/podcasts?versionName=1.0&versionCode=3', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${TOKEN}` },
+      body: Buffer.from('PK-podcasts'),
+    });
+    assert.strictEqual(res.status, 201);
+    r = await api('GET', '/api/app-version?app=podcasts');
+    assert.strictEqual(r.body.versionCode, 3, 'named app reports its own version');
+    r = await api('GET', '/api/app-version');
+    assert.strictEqual(r.body.versionCode, 99, 'main app version untouched by a named upload');
     res = await fetch(BASE + '/api/apk/Bad Name!', {
       method: 'POST',
       headers: { Authorization: `Bearer ${TOKEN}` },
@@ -2420,6 +2486,8 @@ function testTranscriptShaping() {
   assert.deepStrictEqual(spans.map((s) => [s.first, s.last, s.startS, s.endS]), [[5, 9, 50, 100]], 'adjacent ads are one break');
   assert.strictEqual(adSpans(sents, [{ first: 5, last: 6 }], 400).length, 0, 'a 20 s "ad" is not skipped');
   assert.strictEqual(adSpans(sents, [{ first: 5, last: 7 }], 400).length, 1, 'a 30 s ad is');
+  assert.strictEqual(adSpans(sents, [{ first: 0, last: 1 }], 400).length, 1, 'a 20 s pre-roll is skipped');
+  assert.strictEqual(adSpans(sents, [{ first: 1, last: 1 }], 400).length, 0, 'a 10 s spot after the top is not');
   spans = adSpans(sents, [{ first: 0, last: 2 }, { first: 37, last: 39 }], 425);
   assert.deepStrictEqual(spans.map((s) => [s.startS, s.endS]), [[0, 30], [370, 425]], 'pre-roll from 0, post-roll to the end');
   assert.strictEqual(adSpans(sents.map((s) => ({ ...s, start: null })), [{ first: 5, last: 9 }], null).length, 0,
@@ -2538,6 +2606,18 @@ function testFeedParsing() {
   assert.strictEqual(feed.imageUrl, 'https://cdn.example.com/show.jpg', 'show artwork from itunes:image');
   assert.strictEqual(first.imageUrl, 'https://cdn.example.com/ep42.jpg?w=1&h=1', 'episode art, entities decoded');
   assert.strictEqual(second.imageUrl, '', 'no episode art: the caller falls back to the show');
+  assert.strictEqual(second.notes, '', 'no show notes');
+  const notesOf = (inner) => parseFeed(`<rss><channel><title>T</title><item>${inner}
+    <enclosure url="https://cdn.example.com/a.mp3" type="audio/mpeg"/></item></channel></rss>`).items[0].notes;
+  assert.strictEqual(notesOf(`<description>&lt;p&gt;Hi &lt;b onclick="x"&gt;there&lt;/b&gt;&lt;/p&gt;&lt;script&gt;bad()&lt;/script&gt;</description>`),
+    '<p>Hi <b>there</b></p>', 'escaped HTML unescaped once; attributes and scripts dropped');
+  assert.strictEqual(notesOf(`<description>short</description><content:encoded><![CDATA[<p>Long <a href="javascript:x">a</a> <a href='https://e.com/?a=1&amp;b=2' target="_blank">b</a><img src="https://i/x.png"></p>]]></content:encoded>`),
+    '<p>Long <a>a</a> <a href="https://e.com/?a=1&amp;b=2">b</a></p>', 'content:encoded preferred; only http(s) hrefs kept');
+  assert.strictEqual(notesOf(`<itunes:summary>Line one
+line two
+
+Para &amp; two</itunes:summary>`), '<p>Line one<br>line two</p><p>Para &amp; two</p>', 'plain text keeps its breaks');
+  assert.ok(notesOf(`<description>${'word '.repeat(6000)}</description>`).length <= 20003, 'long notes are cut');
   assert.strictEqual(parseFeed(`<rss><channel><title>T</title>
     <image><url>https://cdn.example.com/rss.png</url><title>T</title></image>
     <item><enclosure url="https://cdn.example.com/a.mp3" type="audio/mpeg"/></item></channel></rss>`).imageUrl,

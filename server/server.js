@@ -214,7 +214,7 @@ for (const f of fs.readdirSync(DATA_DIR)) {
  *
  * Returns the article, or null when this audio is already here.
  */
-async function saveFeedEpisode({ feed, item, buf }) {
+async function saveFeedEpisode({ feed, item, buf, picked = false }) {
   const artUrl = 'audio:' + crypto.createHash('sha256').update(buf).digest('hex').slice(0, 24);
   let a = store.articleByUrl(feed.userId, artUrl);
   if (a) {
@@ -231,7 +231,9 @@ async function saveFeedEpisode({ feed, item, buf }) {
   const now = Date.now();
   a = {
     id, userId: feed.userId, url: artUrl,
-    savedAt: item.publishedAt && item.publishedAt < now ? item.publishedAt : now,
+    // One you picked by hand (often an old one) is new to your list now; one
+    // taken by itself keeps the feed's order.
+    savedAt: !picked && item.publishedAt && item.publishedAt < now ? item.publishedAt : now,
     publishedAt: item.publishedAt || null,
     archived: false, favorite: false, readParagraph: 0,
     source: 'podcast-feed',
@@ -1261,23 +1263,29 @@ const server = http.createServer(async (req, res) => {
         req.pipe(out);
       });
       fs.renameSync(tmp, target);
-      // main app uploads carry version metadata so clients can offer updates
-      if (target === APK_FILE) {
+      // App uploads carry version metadata so clients can offer updates. The
+      // main app's sits in app-apk.json; a named one's (e.g. the podcast app,
+      // /apk/podcasts) beside its file, read by GET /api/app-version?app=<name>.
+      if (target === APK_FILE || url.searchParams.has('versionCode')) {
+        const metaFile = target === APK_FILE ? APK_META_FILE : target.replace(/\.apk$/, '.json');
         const meta = {
           versionName: sanitizeString(url.searchParams.get('versionName'), 32) || null,
           versionCode: parseInt(url.searchParams.get('versionCode') || '0', 10) || 0,
           size,
           uploadedAt: Date.now(),
         };
-        fs.writeFileSync(APK_META_FILE, JSON.stringify(meta));
+        fs.writeFileSync(metaFile, JSON.stringify(meta));
       }
       return json(res, 201, { ok: true, size });
     }
 
     // ---- latest app version (for the in-app update check)
     if (req.method === 'GET' && parts[1] === 'app-version' && parts.length === 2) {
-      if (!fs.existsSync(APK_META_FILE)) return json(res, 404, { error: 'no app uploaded' });
-      return json(res, 200, JSON.parse(fs.readFileSync(APK_META_FILE, 'utf8')));
+      const app = url.searchParams.get('app');
+      if (app && !/^[a-z0-9-]{1,64}$/.test(app)) return json(res, 400, { error: 'bad app name' });
+      const metaFile = app ? path.join(DATA_DIR, `apk-${app}.json`) : APK_META_FILE;
+      if (!fs.existsSync(metaFile)) return json(res, 404, { error: 'no app uploaded' });
+      return json(res, 200, JSON.parse(fs.readFileSync(metaFile, 'utf8')));
     }
 
     // ---- Firefox extension hosting: POST uploads a Mozilla-signed .xpi; the
@@ -1340,6 +1348,8 @@ const server = http.createServer(async (req, res) => {
           // to leave them out. The Android app asks for everything and sorts
           // them out itself, since each article carries the flag.
           problemsOnly: url.searchParams.get('problems') === '1',
+          // The podcast app (Hark) syncs only episodes.
+          podcastsOnly: url.searchParams.get('podcasts') === '1',
           excludeProblems: url.searchParams.get('problems') === '0',
           limit: num('limit'),
         });
@@ -1564,6 +1574,55 @@ const server = http.createServer(async (req, res) => {
       const n = store.setFeedAutoProcess(parts[2], user.id, b.autoProcess);
       return json(res, n ? 200 : 404, n ? { ok: true, autoProcess: b.autoProcess } : { error: 'no such feed' });
     }
+    // GET /api/feeds/:id/backlog — every episode the show's feed lists now,
+    // newest first, each marked: processed (has an article), waiting (under
+    // New), or available — the back catalogue subscribing left alone, plus
+    // anything archived from New. Read live from the feed, so it can be slow.
+    if (req.method === 'GET' && parts[1] === 'feeds' && parts[3] === 'backlog' && parts.length === 4) {
+      const feed = store.getFeed(parts[2], user.id);
+      if (!feed) return json(res, 404, { error: 'no such feed' });
+      let parsed;
+      try {
+        parsed = feeds.parseFeed((await feeds.fetchFeed(feed.url)).xml);
+      } catch (e) {
+        return json(res, 502, { error: `could not read the feed: ${e.message}` });
+      }
+      const states = new Map(store.feedItemStates(feed.id).map((s) => [s.guid, s]));
+      const art = feed.imageUrl || parsed.imageUrl || null;
+      const items = parsed.items.map((i) => {
+        const s = states.get(i.guid);
+        return {
+          guid: i.guid, title: i.title || 'Untitled episode', publishedAt: i.publishedAt,
+          durationS: i.durationS, imageUrl: i.imageUrl || art,
+          state: s && s.articleId ? 'processed' : s && s.pending ? 'waiting' : 'available',
+          articleId: (s && s.articleId) || null,
+        };
+      }).sort((a, b) => (b.publishedAt || 0) - (a.publishedAt || 0));
+      return json(res, 200, { feedId: feed.id, title: feed.title || parsed.title || '', items });
+    }
+    // GET /api/feeds/:id/episodes/notes?guid=… (or ?articleId=… for one
+    // already processed) — the episode's show notes, as a small safe subset of
+    // HTML. Stored with a waiting episode; otherwise read from the feed once
+    // and kept. {notes: ''} when the feed gives none.
+    if (req.method === 'GET' && parts[1] === 'feeds' && parts[3] === 'episodes' && parts[4] === 'notes'
+        && parts.length === 5) {
+      const feed = store.getFeed(parts[2], user.id);
+      if (!feed) return json(res, 404, { error: 'no such feed' });
+      const articleId = url.searchParams.get('articleId');
+      const row = store.getFeedItemNotes(feed.id, { guid: url.searchParams.get('guid') || '', articleId });
+      const guid = row ? row.guid : url.searchParams.get('guid') || '';
+      if (row && row.notes != null) return json(res, 200, { guid, notes: row.notes });
+      if (!guid) return json(res, 404, { error: 'no such episode' });
+      let found;
+      try {
+        found = feeds.parseFeed((await feeds.fetchFeed(feed.url)).xml).items.find((i) => i.guid === guid);
+      } catch (e) {
+        return json(res, 502, { error: `could not read the feed: ${e.message}` });
+      }
+      if (!found) return json(res, 404, { error: 'that episode is no longer in the feed' });
+      if (row) store.setFeedItemNotes(feed.id, guid, found.notes);
+      return json(res, 200, { guid, notes: found.notes });
+    }
     // POST /api/feeds/:id/episodes/(take|dismiss) {guid} — a waiting episode:
     // download and transcribe it now, or stop offering it.
     // .../restore puts an archived (dismissed) one back.
@@ -1576,7 +1635,24 @@ const server = http.createServer(async (req, res) => {
         const n = store.restorePendingFeedItem(feed.id, String(b.guid || ''));
         return json(res, n ? 200 : 404, n ? { ok: true } : { error: 'that episode cannot be restored' });
       }
-      const item = store.getPendingFeedItem(feed.id, String(b.guid || ''));
+      let item = store.getPendingFeedItem(feed.id, String(b.guid || ''));
+      // {backlog: true}: an older episode picked from GET .../backlog. Found in
+      // the feed again (never trusting a client-sent audio url), put on the
+      // waiting list, then taken like any other.
+      if (!item && parts[4] === 'take' && b.backlog === true) {
+        let found;
+        try {
+          found = feeds.parseFeed((await feeds.fetchFeed(feed.url)).xml).items
+            .find((i) => i.guid === String(b.guid || ''));
+        } catch (e) {
+          return json(res, 502, { error: `could not read the feed: ${e.message}` });
+        }
+        if (!found) return json(res, 404, { error: 'that episode is no longer in the feed' });
+        if (!store.offerFeedItem(feed.id, { ...found, imageUrl: found.imageUrl || feed.imageUrl || '' })) {
+          return json(res, 409, { error: 'that episode has already been processed' });
+        }
+        item = store.getPendingFeedItem(feed.id, found.guid);
+      }
       if (!item) return json(res, 404, { error: 'that episode is not waiting' });
       if (parts[4] === 'dismiss') {
         store.clearPendingFeedItem(feed.id, item.guid);
@@ -1589,7 +1665,7 @@ const server = http.createServer(async (req, res) => {
         // Left waiting: a host that is down now may not be later.
         return json(res, 502, { error: `could not download that episode: ${e.message}` });
       }
-      const a = await saveFeedEpisode({ feed: { ...feed, imageUrl: feed.imageUrl || '' }, item, buf });
+      const a = await saveFeedEpisode({ feed: { ...feed, imageUrl: feed.imageUrl || '' }, item, buf, picked: true });
       store.clearPendingFeedItem(feed.id, item.guid);
       return json(res, 200, { ok: true, articleId: a ? a.id : null, alreadyHere: !a });
     }

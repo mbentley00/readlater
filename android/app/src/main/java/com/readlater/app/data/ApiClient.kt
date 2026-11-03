@@ -96,6 +96,20 @@ data class WaitingEpisode(
     val imageUrl: String?
 )
 
+/** An episode in a show's feed, from GET /api/feeds/{id}/backlog: the back
+ *  catalogue, with what became of each one. */
+data class BacklogEpisode(
+    val guid: String,
+    val title: String,
+    val publishedAt: Long?,
+    val durationS: Int?,
+    val imageUrl: String?,
+    /** "available" (can be processed), "waiting" (under New), "processed". */
+    val state: String,
+    /** The article it became, once processed. */
+    val articleId: String?
+)
+
 /** GET /api/podcasts: shows, waiting episodes, and which show each
  *  processed episode (article id → feed id) came from. */
 data class PodcastsData(
@@ -189,15 +203,21 @@ class ApiClient(private val settings: Settings) {
     /** GET /api/articles?includeArchived=1 — metadata only, no html.
      *  Pass [since] (updatedAt watermark) to fetch only changed articles. */
     suspend fun listArticles(since: Long = 0): List<RemoteArticle> {
-        val qs = if (since > 0) "&since=$since" else ""
+        val qs = (if (since > 0) "&since=$since" else "") +
+            // Hark wants episodes only. Asking the server for them, rather than
+            // filtering the whole library here, matters: the full list is
+            // ~25k rows and takes the server over a minute to build.
+            (if (com.readlater.app.BuildConfig.PODCAST_APP) "&podcasts=1" else "")
         val body = execute(builder("/api/articles?includeArchived=1$qs").get().build())
         val arr = JSONObject(body).getJSONArray("articles")
         return (0 until arr.length()).map { parseArticle(arr.getJSONObject(it)) }
     }
 
-    /** GET /api/app-version — metadata of the newest APK uploaded to the server. */
+    /** GET /api/app-version — metadata of the newest APK of this app uploaded to
+     *  the server (Hark's is ?app=podcasts, apart from Earmark's). */
     suspend fun latestAppVersion(): Pair<String, Int>? = try {
-        val body = execute(builder("/api/app-version").get().build())
+        val app = com.readlater.app.BuildConfig.APK_NAME
+        val body = execute(builder("/api/app-version" + if (app.isEmpty()) "" else "?app=$app").get().build())
         val o = JSONObject(body)
         (o.stringOrNull("versionName") ?: "?") to o.optInt("versionCode", 0)
     } catch (_: Exception) {
@@ -508,8 +528,10 @@ class ApiClient(private val settings: Settings) {
      * server download the episode before answering, so it runs on the
      * long-timeout client. Returns the new article's id for a take.
      */
-    suspend fun episodeAction(feedId: String, guid: String, action: String): String? {
+    suspend fun episodeAction(feedId: String, guid: String, action: String, backlog: Boolean = false): String? {
         val json = JSONObject().put("guid", guid)
+        // An older episode from the back catalogue, not one waiting under New.
+        if (backlog) json.put("backlog", true)
         val body = try {
             execute(
                 builder("/api/feeds/$feedId/episodes/$action")
@@ -522,6 +544,35 @@ class ApiClient(private val settings: Settings) {
             throw if (reason != null) IOException(reason, e) else e
         }
         return JSONObject(body).stringOrNull("articleId")
+    }
+
+    /** GET /api/feeds/{id}/backlog — every episode the show's feed lists, newest
+     *  first. The server reads the feed live, so give it time. */
+    suspend fun feedBacklog(feedId: String): List<BacklogEpisode> {
+        val o = JSONObject(execute(builder("/api/feeds/$feedId/backlog").get().build(), uploadClient))
+        val arr = o.optJSONArray("items") ?: org.json.JSONArray()
+        return (0 until arr.length()).map { i ->
+            val e = arr.getJSONObject(i)
+            BacklogEpisode(
+                guid = e.getString("guid"),
+                title = e.stringOrNull("title") ?: "Untitled episode",
+                publishedAt = e.optLong("publishedAt", 0L).takeIf { it > 0 },
+                durationS = e.optInt("durationS", 0).takeIf { it > 0 },
+                imageUrl = e.stringOrNull("imageUrl")?.takeIf { it.isNotBlank() },
+                state = e.optString("state", "available"),
+                articleId = e.stringOrNull("articleId")
+            )
+        }
+    }
+
+    /** GET /api/feeds/{id}/episodes/notes — an episode's show notes as simple
+     *  HTML ("" when the feed gives none): by guid, or by the article a
+     *  processed one became. May read the feed live, so the slow client. */
+    suspend fun episodeNotes(feedId: String, guid: String?, articleId: String?): String {
+        val q = if (articleId != null) "articleId=" + URLEncoder.encode(articleId, "UTF-8")
+            else "guid=" + URLEncoder.encode(guid.orEmpty(), "UTF-8")
+        val o = JSONObject(execute(builder("/api/feeds/$feedId/episodes/notes?$q").get().build(), uploadClient))
+        return o.optString("notes", "")
     }
 
     /** PATCH /api/feeds/{id} {autoProcess} — take new episodes by themselves,

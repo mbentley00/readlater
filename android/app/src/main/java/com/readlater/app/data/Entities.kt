@@ -81,3 +81,10 @@ data class HighlightWithArticle(
     val synced: Boolean,
     val articleTitle: String
 )
+
+/** A podcast episode: from a subscribed feed (it has audio to fetch), or
+ *  shared out of a player (the server names those by the audio's hash). */
+fun isPodcastEpisode(url: String, audioUrl: String?): Boolean =
+    audioUrl != null || url.startsWith(PodcastFiles.URL_PREFIX)
+
+fun ArticleEntity.isPodcast(): Boolean = isPodcastEpisode(url, audioUrl)

@@ -273,6 +273,10 @@ function sentencesToParagraphsAt(sentences, starts) {
  *  is the model mistaking a mention for a pitch, and skipping it would cut
  *  the show itself. */
 const MIN_AD_S = 30;
+/** Except at the very top: nothing of the show comes before a pre-roll, so
+ *  there is nothing to cut, and the one-line underwriting reads public radio
+ *  opens with ("This episode's sponsor is…") run 15 seconds or so. */
+const MIN_PREROLL_S = 10;
 /** Two ads with less than this between them are one break (the "and now a
  *  word from…" between two sponsors), so they are judged as one length. */
 const AD_JOIN_GAP_S = 5;
@@ -282,8 +286,9 @@ const AD_JOIN_GAP_S = 5;
  * from its first sentence's start to the start of whatever follows it — the
  * jingle or silence after the last word is part of the break — or to the end
  * of the episode. One at the very top starts at 0, taking the intro sting with
- * it. Spans that touch are joined before the length rule is applied, so a
- * break made of two short spots is kept whole. Untimed transcripts get none:
+ * it, and needs only MIN_PREROLL_S to count. Spans that touch are joined
+ * before the length rule is applied, so a break made of two short spots is
+ * kept whole. Untimed transcripts get none:
  * there is nothing to skip by.
  */
 function adSpans(sentences, ads, durationS) {
@@ -304,7 +309,7 @@ function adSpans(sentences, ads, durationS) {
   return merged
     .map((a) => ({ ...a, startS: startOf(a.first), endS: endOf(a.last) }))
     .filter((a) => typeof a.startS === 'number' && typeof a.endS === 'number'
-      && a.endS - a.startS >= MIN_AD_S);
+      && a.endS - a.startS >= (a.first === 0 ? MIN_PREROLL_S : MIN_AD_S));
 }
 
 /**

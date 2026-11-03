@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Hark's icon is the gold medallion alone: no backdrop behind it. The
+         foreground PNGs (and monochrome + notification icons) are cut out of
+         the source pixel art, its dark purple surround made transparent. -->
+    <color name="ic_launcher_background">#00000000</color>
+</resources>

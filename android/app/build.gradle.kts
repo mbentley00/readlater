@@ -21,8 +21,34 @@ android {
         applicationId = "com.readlater.app"
         minSdk = 26
         targetSdk = 34
-        versionCode = 87
-        versionName = "5.46"
+        versionCode = 88
+        versionName = "5.47"
+    }
+
+    // Two apps from one codebase, signed with the same key and signed in to the
+    // same server account: Earmark (articles) and Hark (podcasts). They share
+    // the player, transcript reader and sync; BuildConfig.PODCAST_APP picks the
+    // podcast-only home screen. Each installs and updates on its own.
+    flavorDimensions += "app"
+    productFlavors {
+        create("reader") {
+            dimension = "app"
+            isDefault = true
+            buildConfigField("boolean", "PODCAST_APP", "false")
+            // The other app of the pair: where a sign-in can be borrowed from.
+            buildConfigField("String", "SIBLING_PACKAGE", "\"com.readlater.podcasts\"")
+            // Server APK name for the update check; "" = the main /app.apk.
+            buildConfigField("String", "APK_NAME", "\"\"")
+        }
+        create("podcasts") {
+            dimension = "app"
+            applicationId = "com.readlater.podcasts"
+            versionCode = 4
+            versionName = "1.3"
+            buildConfigField("boolean", "PODCAST_APP", "true")
+            buildConfigField("String", "SIBLING_PACKAGE", "\"com.readlater.app\"")
+            buildConfigField("String", "APK_NAME", "\"podcasts\"")
+        }
     }
 
     signingConfigs {

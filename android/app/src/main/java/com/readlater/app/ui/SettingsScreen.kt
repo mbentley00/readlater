@@ -54,6 +54,7 @@ import androidx.compose.material3.Switch
 import androidx.compose.runtime.collectAsState
 import androidx.compose.ui.unit.sp
 import com.readlater.app.BuildConfig
+import com.readlater.app.R
 import com.readlater.app.ReadLaterApp
 import com.readlater.app.tts.TtsService
 import kotlinx.coroutines.launch
@@ -73,6 +74,7 @@ fun SettingsScreen(onBack: () -> Unit) {
     val settings = app.settings
     val scope = rememberCoroutineScope()
     val snackbarHostState = remember { SnackbarHostState() }
+    val appName = androidx.compose.ui.res.stringResource(R.string.app_name)
 
     var url by remember { mutableStateOf(settings.serverUrl.ifBlank { DEFAULT_SERVER_URL }) }
     var username by remember { mutableStateOf("") }
@@ -216,6 +218,26 @@ fun SettingsScreen(onBack: () -> Unit) {
                 singleLine = true,
                 modifier = Modifier.fillMaxWidth()
             )
+
+            // The other app of the pair (Earmark ↔ Hark) shares its sign-in:
+            // done by itself on first open, and here on demand (e.g. after
+            // signing in to a different account over there).
+            val siblingName = if (BuildConfig.PODCAST_APP) "Earmark" else "Hark"
+            var sibling by remember { mutableStateOf<Pair<String, String>?>(null) }
+            LaunchedEffect(Unit) {
+                sibling = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                    com.readlater.app.AccountProvider.siblingAccount(context)
+                }
+            }
+            sibling?.takeIf { it.first != settings.serverUrl || it.second != token }?.let { (sUrl, sToken) ->
+                OutlinedButton(onClick = {
+                    settings.serverUrl = sUrl
+                    settings.token = sToken
+                    url = settings.serverUrl
+                    token = sToken
+                    testResult = "Signed in with $siblingName's account — connected."
+                }) { Text("Use $siblingName's sign-in") }
+            }
 
             HorizontalDivider()
 
@@ -415,12 +437,14 @@ fun SettingsScreen(onBack: () -> Unit) {
                 })
             }
             var podcastsTab by remember { mutableStateOf(settings.podcastsTab) }
-            Row(verticalAlignment = Alignment.CenterVertically) {
+            // Hark is nothing but podcasts, so there is no tab to turn off.
+            if (!BuildConfig.PODCAST_APP) Row(verticalAlignment = Alignment.CenterVertically) {
                 Column(modifier = Modifier.weight(1f)) {
                     Text("Podcasts tab", style = MaterialTheme.typography.bodyLarge)
                     Text(
-                        "Lists episodes under their own tab instead of in the Inbox. " +
-                            "Archive and search still include them.",
+                        "Keeps episodes out of the Inbox, under their own Podcasts tab — " +
+                            "which opens Hark when it's installed. Archive and search " +
+                            "still include them.",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
@@ -447,9 +471,9 @@ fun SettingsScreen(onBack: () -> Unit) {
             }
             Text(
                 text = if (ignoringBattery)
-                    "Battery optimization is off for Earmark — playback should keep running in the background."
+                    "Battery optimization is off for $appName — playback should keep running in the background."
                 else
-                    "Android may stop playback when Earmark is in the background. Allow it to run unrestricted so listening isn't interrupted.",
+                    "Android may stop playback when $appName is in the background. Allow it to run unrestricted so listening isn't interrupted.",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
@@ -490,7 +514,7 @@ fun SettingsScreen(onBack: () -> Unit) {
                     context.startActivity(
                         android.content.Intent(
                             android.content.Intent.ACTION_VIEW,
-                            android.net.Uri.parse("${settings.serverUrl.ifBlank { DEFAULT_SERVER_URL }}/app.apk")
+                            android.net.Uri.parse(settings.apkDownloadUrl())
                         )
                     )
                 }
@@ -498,7 +522,12 @@ fun SettingsScreen(onBack: () -> Unit) {
                 Text(if (updateAvailable) "Download update" else "Download latest APK")
             }
             Text(
-                text = "Earmark is a self-hosted read-it-later client. Save articles with " +
+                text = if (BuildConfig.PODCAST_APP)
+                    "Hark is Earmark's podcast app: the same account and server, just the " +
+                        "episodes. Subscribe to shows above, or share an episode file here from " +
+                        "your podcast player, and read or listen to its transcript. Articles " +
+                        "stay in Earmark."
+                else "Earmark is a self-hosted read-it-later client. Save articles with " +
                     "the ReadLater Firefox extension (or email them in) and they sync here " +
                     "for offline reading, highlighting and listening. Sign in with your " +
                     "account above; create accounts on the server's /signup page.",

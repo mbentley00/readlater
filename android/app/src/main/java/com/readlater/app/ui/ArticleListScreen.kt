@@ -20,6 +20,8 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.Notes
+import androidx.compose.material.icons.automirrored.filled.OpenInNew
 import androidx.compose.material.icons.automirrored.filled.Sort
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Archive
@@ -97,6 +99,7 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.ui.platform.LocalContext
 import kotlinx.coroutines.flow.flowOf
+import com.readlater.app.data.isPodcast
 import kotlinx.coroutines.launch
 import kotlin.math.max
 import kotlin.math.roundToInt
@@ -117,10 +120,6 @@ enum class SortMode(val label: String) {
 fun readingMinutes(wordCount: Int): Int =
     if (wordCount <= 0) 0 else max(1, (wordCount / 225.0).roundToInt())
 
-/** A podcast episode: from a subscribed feed (it has audio to fetch), or
- *  shared out of a player (the server names those by the audio's hash). */
-private fun ArticleEntity.isPodcast(): Boolean =
-    audioUrl != null || url.startsWith(com.readlater.app.data.PodcastFiles.URL_PREFIX)
 
 /** Local evaluation of a server-defined saved view. `q` matches title/excerpt only. */
 private fun matchesView(a: ArticleEntity, v: RemoteView, highlightCount: Int): Boolean {
@@ -164,9 +163,17 @@ fun ArticleListScreen(
     var showProblems by rememberSaveable { mutableStateOf(false) }
     // The Podcasts tab: unarchived episodes, kept out of the Inbox so an hour
     // of audio doesn't sit among the articles. A setting puts them back.
-    var showPodcasts by rememberSaveable { mutableStateOf(false) }
-    val podcastsTab = remember { app.settings.podcastsTab }
-    val onPodcasts = podcastsTab && showPodcasts
+    // Hark, the podcast app, is this screen pinned to that tab: no Inbox,
+    // Archive or views, just shows and their episodes.
+    val podcastApp = com.readlater.app.BuildConfig.PODCAST_APP
+    var showPodcasts by rememberSaveable { mutableStateOf(podcastApp) }
+    val podcastsTab = remember { podcastApp || app.settings.podcastsTab }
+    val onPodcasts = podcastsTab && (showPodcasts || podcastApp)
+    // In Earmark, the Podcasts chip hands off to Hark when it's installed.
+    val earshotLaunch = remember {
+        if (podcastApp) null
+        else context.packageManager.getLaunchIntentForPackage(com.readlater.app.BuildConfig.SIBLING_PACKAGE)
+    }
     var selectedViewId by rememberSaveable { mutableStateOf<String?>(null) }
     var views by remember { mutableStateOf(repo.cachedViews()) }
     val selectedView = remember(views, selectedViewId) { views.firstOrNull { it.id == selectedViewId } }
@@ -366,7 +373,7 @@ fun ArticleListScreen(
             r.onSuccess {
                 hiddenWaiting = hiddenWaiting + key
                 sync(showErrors = false)
-                snackbarHostState.showSnackbar("Processing “${ep.title}” — it moves to Processed")
+                snackbarHostState.showSnackbar("Processing “${ep.title}” — it moves to Processed and downloads to the phone")
             }.onFailure {
                 snackbarHostState.showSnackbar("Couldn't process it: ${it.message ?: "unknown error"}")
             }
@@ -395,6 +402,48 @@ fun ArticleListScreen(
         }
     }
 
+    // ---- Older: the selected show's back catalogue, read live from its feed
+    // (slow-ish, so kept per show for as long as the screen is up).
+    var backlogs by remember { mutableStateOf<Map<String, List<com.readlater.app.data.BacklogEpisode>>>(emptyMap()) }
+    var backlogError by remember { mutableStateOf<String?>(null) }
+    var backlogReload by remember { mutableStateOf(0) }
+    LaunchedEffect(podcastPane, podcastList, showFilter, backlogReload) {
+        val feedId = showFilter
+        if (!podcastPane || podcastList != PodcastList.OLDER || feedId == null) return@LaunchedEffect
+        if (backlogReload == 0 && feedId in backlogs) return@LaunchedEffect
+        backlogError = null
+        repo.feedBacklog(feedId)
+            .onSuccess { backlogs = backlogs + (feedId to it) }
+            .onFailure { backlogError = it.message ?: "unknown error" }
+    }
+
+    // The show-notes sheet: whichever episode was tapped, if any.
+    var notesTarget by remember { mutableStateOf<NotesTarget?>(null) }
+    notesTarget?.let { t ->
+        EpisodeNotesSheet(
+            target = t,
+            load = { repo.episodeNotes(t.feedId, t.guid, t.articleId) },
+            onDismiss = { notesTarget = null }
+        )
+    }
+
+    fun processBacklog(feedId: String, ep: com.readlater.app.data.BacklogEpisode) {
+        val key = "$feedId/${ep.guid}"
+        processing = processing + key
+        scope.launch {
+            val r = repo.processBacklogEpisode(feedId, ep.guid)
+            processing = processing - key
+            r.onSuccess {
+                backlogs = backlogs + (feedId to backlogs[feedId].orEmpty()
+                    .map { if (it.guid == ep.guid) it.copy(state = "processed") else it })
+                sync(showErrors = false)
+                snackbarHostState.showSnackbar("Processing “${ep.title}” — it moves to Processed and downloads to the phone")
+            }.onFailure {
+                snackbarHostState.showSnackbar("Couldn't process it: ${it.message ?: "unknown error"}")
+            }
+        }
+    }
+
     fun downloadAudio(a: ArticleEntity) {
         if (a.id in downloading) return
         downloading = downloading + a.id
@@ -403,6 +452,19 @@ fun ArticleListScreen(
             downloading = downloading - a.id
             storedKeys = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) { repo.storedEpisodeKeys() }
             r.onFailure { snackbarHostState.showSnackbar("Download failed: ${it.message ?: "unknown error"}") }
+        }
+    }
+
+    // Episodes processed here download as soon as they sync: processing one
+    // is asking for it, so it should end up on the phone.
+    LaunchedEffect(articles, podcastsTab) {
+        if (!podcastsTab) return@LaunchedEffect
+        val want = repo.autoDownloadIds()
+        if (want.isEmpty()) return@LaunchedEffect
+        val stored = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) { repo.storedEpisodeKeys() }
+        articles.filter { it.id in want }.forEach { a ->
+            repo.clearAutoDownload(a.id)
+            if (!repo.isEpisodeStored(stored, a)) downloadAudio(a)
         }
     }
 
@@ -425,7 +487,15 @@ fun ArticleListScreen(
     }
 
     // Opportunistic sync on first open (silent — the app stays usable offline).
+    // Not signed in yet? Borrow the other app's sign-in (Earmark ↔ Hark).
     LaunchedEffect(Unit) {
+        val imported = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+            com.readlater.app.AccountProvider.importFromSibling(context, app.settings)
+        }
+        if (imported) {
+            runCatching { podcasts = repo.fetchPodcasts() }
+            runCatching { views = repo.fetchViews() }
+        }
         if (app.settings.serverUrl.isNotBlank()) {
             sync(showErrors = false)
         }
@@ -447,7 +517,7 @@ fun ArticleListScreen(
                         TextField(
                             value = searchQuery,
                             onValueChange = { searchQuery = it },
-                            placeholder = { Text("Search your library") },
+                            placeholder = { Text(if (podcastApp) "Search episodes" else "Search your library") },
                             singleLine = true,
                             colors = TextFieldDefaults.colors(
                                 focusedContainerColor = Color.Transparent,
@@ -458,7 +528,7 @@ fun ArticleListScreen(
                             modifier = Modifier.fillMaxWidth()
                         )
                     } else {
-                        Text("Earmark")
+                        Text(androidx.compose.ui.res.stringResource(com.readlater.app.R.string.app_name))
                     }
                 },
                 actions = {
@@ -491,8 +561,10 @@ fun ArticleListScreen(
                             }
                         }
                     }
-                    IconButton(onClick = onOpenHighlights) {
-                        Icon(Icons.Filled.FormatQuote, contentDescription = "Highlights")
+                    if (!podcastApp) {
+                        IconButton(onClick = onOpenHighlights) {
+                            Icon(Icons.Filled.FormatQuote, contentDescription = "Highlights")
+                        }
                     }
                     IconButton(onClick = onOpenSettings) {
                         Icon(Icons.Filled.Settings, contentDescription = "Settings")
@@ -591,9 +663,7 @@ fun ArticleListScreen(
                                     context.startActivity(
                                         Intent(
                                             Intent.ACTION_VIEW,
-                                            android.net.Uri.parse(
-                                                "${app.settings.serverUrl.ifBlank { "https://readlater-mbent.fly.dev" }}/app.apk"
-                                            )
+                                            android.net.Uri.parse(app.settings.apkDownloadUrl())
                                         )
                                     )
                                 }
@@ -623,7 +693,7 @@ fun ArticleListScreen(
                     }
                 }
             }
-            Row(
+            if (!podcastApp) Row(
                 modifier = Modifier
                     .padding(horizontal = 16.dp, vertical = 4.dp)
                     .horizontalScroll(rememberScrollState()),
@@ -637,8 +707,14 @@ fun ArticleListScreen(
                 if (podcastsTab) {
                     FilterChip(
                         selected = onPodcasts && selectedView == null,
-                        onClick = { showPodcasts = true; showArchived = false; showProblems = false; selectedViewId = null },
-                        label = { Text(chipLabel("Podcasts", podcastCount?.plus(waitingAll.size)), maxLines = 1) }
+                        onClick = {
+                            if (earshotLaunch != null) runCatching { context.startActivity(earshotLaunch) }
+                            else { showPodcasts = true; showArchived = false; showProblems = false; selectedViewId = null }
+                        },
+                        label = { Text(chipLabel("Podcasts", podcastCount?.plus(waitingAll.size)), maxLines = 1) },
+                        trailingIcon = if (earshotLaunch != null) {
+                            { Icon(Icons.AutoMirrored.Filled.OpenInNew, contentDescription = "Opens Hark", modifier = Modifier.size(16.dp)) }
+                        } else null
                     )
                 }
                 FilterChip(
@@ -717,6 +793,8 @@ fun ArticleListScreen(
                             PodcastList.NEW -> waitingShown.size
                             PodcastList.PROCESSED -> processedShown.size
                             PodcastList.DOWNLOADED -> downloadedShown.size
+                            // Not yet processed, for the selected show once read.
+                            PodcastList.OLDER -> showFilter?.let { f -> backlogs[f]?.count { it.state == "available" } }
                         }
                         FilterChip(
                             selected = podcastList == l,
@@ -762,7 +840,66 @@ fun ArticleListScreen(
                     color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f)
                 )
 
-                if (podcastList == PodcastList.NEW) {
+                if (podcastList == PodcastList.OLDER) {
+                    val feedId = showFilter
+                    val items = feedId?.let { backlogs[it] }
+                    when {
+                        feedId == null -> PodcastEmptyNote(
+                            "Pick a show",
+                            if (shows.isEmpty()) "Subscribe to a show's feed in Settings."
+                            else "Tap a show above to see all its older episodes, and pick any to process."
+                        )
+                        backlogError != null && items == null -> Column(
+                            Modifier.fillMaxWidth().padding(32.dp),
+                            horizontalAlignment = Alignment.CenterHorizontally
+                        ) {
+                            Text("Couldn't read the show's feed", style = MaterialTheme.typography.titleMedium)
+                            Text(
+                                backlogError.orEmpty(),
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                textAlign = TextAlign.Center
+                            )
+                            androidx.compose.material3.TextButton(onClick = { backlogReload++ }) { Text("Try again") }
+                        }
+                        items == null -> Box(
+                            Modifier.fillMaxWidth().padding(32.dp),
+                            contentAlignment = Alignment.Center
+                        ) { CircularProgressIndicator() }
+                        items.isEmpty() -> PodcastEmptyNote("No episodes", "The show's feed lists no episodes right now.")
+                        else -> {
+                            // Processed episodes open when they've synced here.
+                            val openable = processedShown.map { it.id }.toSet()
+                            LazyColumn(contentPadding = PaddingValues(bottom = 24.dp)) {
+                                itemsIndexed(items, key = { _, e -> e.guid }) { i, ep ->
+                                    if (i > 0) HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f))
+                                    val openId = ep.articleId?.takeIf { it in openable }
+                                    BacklogEpisodeRow(
+                                        ep = ep,
+                                        busy = "$feedId/${ep.guid}" in processing,
+                                        onProcess = { processBacklog(feedId, ep) },
+                                        onOpen = {
+                                            notesTarget = NotesTarget(
+                                                feedId = feedId, guid = ep.guid, articleId = null,
+                                                title = ep.title, showTitle = selShow?.title, imageUrl = ep.imageUrl,
+                                                meta = episodeMeta(ep.publishedAt, ep.durationS),
+                                                actionLabel = when {
+                                                    openId != null -> "Open transcript"
+                                                    ep.state == "available" -> "Process"
+                                                    else -> null
+                                                },
+                                                onAction = {
+                                                    notesTarget = null
+                                                    if (openId != null) openArticle(openId) else processBacklog(feedId, ep)
+                                                }
+                                            )
+                                        }
+                                    )
+                                }
+                            }
+                        }
+                    }
+                } else if (podcastList == PodcastList.NEW) {
                     if (waitingShown.isEmpty()) {
                         PodcastEmptyNote(
                             "Nothing new",
@@ -781,7 +918,18 @@ fun ArticleListScreen(
                                     show = showById[ep.feedId],
                                     busy = "${ep.feedId}/${ep.guid}" in processing,
                                     onProcess = { processWaiting(ep) },
-                                    onArchive = { archiveWaiting(ep) }
+                                    onArchive = { archiveWaiting(ep) },
+                                    onOpen = {
+                                        val show = showById[ep.feedId]
+                                        notesTarget = NotesTarget(
+                                            feedId = ep.feedId, guid = ep.guid, articleId = null,
+                                            title = ep.title, showTitle = show?.title,
+                                            imageUrl = ep.imageUrl ?: show?.imageUrl,
+                                            meta = episodeMeta(ep.publishedAt, ep.durationS),
+                                            actionLabel = "Process",
+                                            onAction = { notesTarget = null; processWaiting(ep) }
+                                        )
+                                    }
                                 )
                             }
                         }
@@ -813,6 +961,24 @@ fun ArticleListScreen(
                                         downloading = article.id in downloading
                                     ),
                                     extraItems = { close ->
+                                        val feedId = podcasts?.episodeShow?.get(article.id)
+                                        if (feedId != null) {
+                                            DropdownMenuItem(
+                                                text = { Text("Show notes") },
+                                                leadingIcon = { Icon(Icons.AutoMirrored.Filled.Notes, null) },
+                                                onClick = {
+                                                    close()
+                                                    notesTarget = NotesTarget(
+                                                        feedId = feedId, guid = null, articleId = article.id,
+                                                        title = article.title, showTitle = showById[feedId]?.title,
+                                                        imageUrl = article.imageUrl ?: showById[feedId]?.imageUrl,
+                                                        meta = "",
+                                                        actionLabel = "Open transcript",
+                                                        onAction = { notesTarget = null; openArticle(article.id) }
+                                                    )
+                                                }
+                                            )
+                                        }
                                         if (stored) {
                                             DropdownMenuItem(
                                                 text = { Text("Remove download") },

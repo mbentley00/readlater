@@ -121,7 +121,40 @@ class Repository(
      * then shows among the processed episodes ("Transcribing…" until done).
      */
     suspend fun processEpisode(ep: WaitingEpisode): Result<Unit> = withContext(Dispatchers.IO) {
-        runCatching { api.episodeAction(ep.feedId, ep.guid, "take"); Unit }
+        runCatching { api.episodeAction(ep.feedId, ep.guid, "take")?.let(::queueAutoDownload); Unit }
+    }
+
+    /** Download this episode's audio once it has synced (see [autoDownloadIds]). */
+    private fun queueAutoDownload(articleId: String) {
+        synchronized(settings) { settings.autoDownloadIds = settings.autoDownloadIds + articleId }
+    }
+
+    fun autoDownloadIds(): Set<String> = settings.autoDownloadIds
+
+    fun clearAutoDownload(articleId: String) {
+        synchronized(settings) { settings.autoDownloadIds = settings.autoDownloadIds - articleId }
+    }
+
+    /** A show's back catalogue: every episode its feed lists, marked by state. */
+    suspend fun feedBacklog(feedId: String): Result<List<BacklogEpisode>> = withContext(Dispatchers.IO) {
+        runCatching { api.feedBacklog(feedId) }
+    }
+
+    private val notesCache = java.util.concurrent.ConcurrentHashMap<String, String>()
+
+    /** An episode's show notes (simple HTML, "" for none), kept for the session. */
+    suspend fun episodeNotes(feedId: String, guid: String?, articleId: String?): Result<String> =
+        withContext(Dispatchers.IO) {
+            val key = "$feedId/${articleId ?: guid}"
+            notesCache[key]?.let { return@withContext Result.success(it) }
+            runCatching { api.episodeNotes(feedId, guid, articleId).also { notesCache[key] = it } }
+        }
+
+    /** Process an older episode picked from the back catalogue. Like
+     *  [processEpisode], the article comes down with the next sync, and its
+     *  audio right after. */
+    suspend fun processBacklogEpisode(feedId: String, guid: String): Result<Unit> = withContext(Dispatchers.IO) {
+        runCatching { api.episodeAction(feedId, guid, "take", backlog = true)?.let(::queueAutoDownload); Unit }
     }
 
     /** Archive a waiting episode (it leaves the New list), or undo that. */
@@ -263,7 +296,12 @@ class Repository(
             // 3. Pull article metadata (delta unless a full sync was asked for,
             //    with a safety overlap so clock skew can't drop updates).
             val since = if (full) 0L else (settings.lastSyncAt - 10 * 60 * 1000L).coerceAtLeast(0L)
-            val remoteArticles = api.listArticles(since)
+            // Hark (the podcast app) keeps only episodes: the article
+            // library stays out of its database and off its storage.
+            val remoteArticles = api.listArticles(since).let { all ->
+                if (com.readlater.app.BuildConfig.PODCAST_APP) all.filter { isPodcastEpisode(it.url, it.audioUrl) }
+                else all
+            }
             // A delta sync only touches the articles it returned, so load just
             // those local rows (getAll pulls all ~24k every time — including the
             // cached inbox bodies — which is needlessly slow). Full syncs need

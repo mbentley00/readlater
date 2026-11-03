@@ -35,7 +35,7 @@ class ShareActivity : ComponentActivity() {
 
         val app = application as ReadLaterApp
         if (app.settings.token.isBlank()) {
-            Toast.makeText(applicationContext, "Sign in to Earmark in Settings first", Toast.LENGTH_LONG).show()
+            Toast.makeText(applicationContext, "Sign in to ${getString(R.string.app_name)} in Settings first", Toast.LENGTH_LONG).show()
             finish()
             return
         }

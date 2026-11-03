@@ -66,6 +66,58 @@ function decode(s) {
     .trim();
 }
 
+/** Show notes past this are cut: some feeds put a whole transcript here. */
+const NOTES_MAX_CHARS = 20000;
+
+/** Inner markup of the first <tag>, CDATA unwrapped — undecoded, unlike tagText. */
+function tagRaw(xml, tag) {
+  const m = new RegExp(`<${tag}(?:\\s[^>]*)?>([\\s\\S]*?)</${tag}>`, 'i').exec(xml);
+  if (!m) return '';
+  const inner = m[1].trim();
+  const cdata = /^<!\[CDATA\[([\s\S]*?)\]\]>$/.exec(inner);
+  // Outside CDATA the HTML arrives entity-escaped (&lt;p&gt;): unescape once.
+  return cdata ? cdata[1] : inner.replace(/&(lt|gt|quot|apos|#39|amp);/g, (w, e) => ENTITIES[e]);
+}
+
+/** Tags kept in show notes; every attribute goes except an http(s) link's href. */
+const NOTES_TAGS = new Set(['p', 'br', 'a', 'b', 'strong', 'i', 'em', 'u', 'ul', 'ol', 'li',
+  'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'blockquote']);
+
+/**
+ * An episode's show notes as a small, safe subset of HTML (paragraphs, links,
+ * lists, emphasis): <content:encoded>, else <description>, else
+ * <itunes:summary>. Plain-text notes get their line breaks kept. '' when none.
+ */
+function episodeNotes(item) {
+  let html = tagRaw(item, 'content:encoded') || tagRaw(item, 'description') || tagRaw(item, 'itunes:summary');
+  if (!html) return '';
+  if (!/<[a-z][^>]*>/i.test(html)) {
+    html = html.replace(/&(?![a-z]+;|#\d+;|#x[0-9a-f]+;)/gi, '&amp;').replace(/</g, '&lt;')
+      .split(/\n\s*\n/).map((para) => `<p>${para.trim().replace(/\n/g, '<br>')}</p>`).join('');
+  }
+  const out = html
+    .replace(/<!--[\s\S]*?-->/g, '')
+    .replace(/<(script|style|iframe|object|svg)\b[\s\S]*?<\/\1\s*>/gi, '')
+    .replace(/<\/?([a-z][a-z0-9]*)\b([^>]*)>/gi, (whole, name, attrs) => {
+      const tag = name.toLowerCase();
+      if (!NOTES_TAGS.has(tag)) return tag === 'div' ? (whole[1] === '/' ? '<br>' : '') : '';
+      if (whole[1] === '/') return tag === 'br' ? '' : `</${tag}>`;
+      if (tag === 'a') {
+        const m = /\bhref\s*=\s*("([^"]*)"|'([^']*)')/i.exec(attrs);
+        const href = m ? (m[2] !== undefined ? m[2] : m[3]).trim() : '';
+        return /^https?:\/\//i.test(href) ? `<a href="${href.replace(/"/g, '&quot;')}">` : '<a>';
+      }
+      return `<${tag}>`;
+    })
+    .replace(/<[^>]*$/, '') // a tag cut open
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (out.length <= NOTES_MAX_CHARS) return out;
+  // Cut at a word, then drop any tag the cut left open.
+  const cut = out.slice(0, NOTES_MAX_CHARS);
+  return cut.slice(0, Math.max(cut.lastIndexOf('>') + 1, cut.lastIndexOf(' '))).replace(/<[^>]*$/, '') + ' …';
+}
+
 /** Audio enclosures only: a feed's items can carry images and video too. */
 const audioEnclosure = (item) => {
   const url = tagAttr(item, 'enclosure', 'url');
@@ -88,7 +140,7 @@ function channelImage(head) {
 
 /**
  * Parse a podcast feed. Returns { title, imageUrl, items: [{guid, title, url,
- * publishedAt, durationS, imageUrl}] }, newest first as the feed gave them.
+ * publishedAt, durationS, imageUrl, notes}] }, newest first as the feed gave them.
  * An item's imageUrl is its own episode art, '' when it has none (the show's
  * artwork is the fallback, left to the caller).
  */
@@ -116,6 +168,7 @@ function parseFeed(xml) {
       publishedAt: Number.isFinite(when) ? when : null,
       durationS: parseDuration(tagText(item, 'itunes:duration')),
       imageUrl: httpUrl(tagAttr(item, 'itunes:image', 'href')),
+      notes: episodeNotes(item),
     });
   }
   return { title, imageUrl, items };
@@ -287,6 +340,6 @@ function feedUrlsFrom(text) {
 
 module.exports = {
   feedUrlsFrom,
-  parseFeed, parseDuration, fetchFeed, fetchEpisode, pollOnce, start,
+  parseFeed, parseDuration, episodeNotes, fetchFeed, fetchEpisode, pollOnce, start,
   MAX_PER_POLL, POLL_INTERVAL_MS,
 };

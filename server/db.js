@@ -422,10 +422,24 @@ const ARTICLE_SORTS = {
 function buildArticleWhere(userId, {
   q = '', domain = '', domains = null, highlighted = false, includeArchived = false, since = 0,
   favoriteOnly = false, archivedOnly = false, minWords = 0, maxWords = 0, minHighlights = 0,
-  sources = null, problemsOnly = false, excludeProblems = false,
+  sources = null, problemsOnly = false, excludeProblems = false, podcastsOnly = false,
 } = {}) {
   const where = ['a.userId = @userId'];
   const args = { userId };
+  // Podcast episodes only (the podcast app's sync): from a feed (they have a
+  // row in article_audio) or shared from a player (url 'audio:<hash>'). FIRST,
+  // and as a rowid set, so SQLite visits just those rows: the other filters
+  // (updatedAt above all) live past each article's inline html, and testing
+  // them on all ~25k rows reads most of the database — over a minute, during
+  // which this single-threaded server answers nothing else.
+  if (podcastsOnly) {
+    // The unary + keeps the userId indexes out of the plan, so the rowid set
+    // drives the lookup instead of being a filter on a walk of every article.
+    where[0] = '+a.userId = @userId';
+    where.unshift(`a.rowid IN (
+      SELECT x.rowid FROM articles x JOIN article_audio au ON au.articleId = x.id WHERE x.userId = @userId
+      UNION SELECT x.rowid FROM articles x WHERE x.userId = @userId AND x.url LIKE 'audio:%')`);
+  }
   // How the article was saved (android-share, browser-page, email, …): the web
   // UI's "From phone" list is this with ['android-share'].
   if (sources && sources.length) {
@@ -756,7 +770,8 @@ function open(dataDir) {
   // without re-reading the feed, which may have dropped it by then.
   const itemCols = sqlite.prepare('PRAGMA table_info(feed_items)').all().map((c) => c.name);
   for (const [col, type] of [['pending', 'INTEGER NOT NULL DEFAULT 0'], ['title', 'TEXT'],
-    ['url', 'TEXT'], ['publishedAt', 'INTEGER'], ['durationS', 'INTEGER'], ['imageUrl', 'TEXT']]) {
+    ['url', 'TEXT'], ['publishedAt', 'INTEGER'], ['durationS', 'INTEGER'], ['imageUrl', 'TEXT'],
+    ['notes', 'TEXT']]) {
     if (!itemCols.includes(col)) sqlite.exec(`ALTER TABLE feed_items ADD COLUMN ${col} ${type}`);
   }
   const highlightCols = sqlite.prepare('PRAGMA table_info(highlights)').all().map((c) => c.name);
@@ -866,6 +881,93 @@ function open(dataDir) {
     sqlite.pragma('user_version = 5');
     if (fixed) console.log(`sources: replaced the "Email" placeholder on ${fixed} article(s)`);
   }
+
+  // ---- article_meta: each article's list fields, without its html.
+  //
+  // Most list metadata (updatedAt, wordCount, imageUrl, source, …) sits PAST
+  // the inline html/textContent/sourceHtml in an articles row, so listing the
+  // whole library — every phone's full sync, the Refresh button — walked every
+  // row's overflow chain: ~1 GB read, over a minute and a half on the
+  // production volume, with this single-threaded server answering nothing
+  // else meanwhile. This side table holds just those fields (a few hundred
+  // bytes a row), kept current by triggers, so such a list reads a few MB.
+  //
+  // rid is the article's rowid: the FTS clauses in buildArticleWhere match on
+  // a.rowid, and here that is rid. Filled by the triggers from now on, and for
+  // existing rows by fillArticleMeta — in small batches off a timer when there
+  // are many, since filling it in one go is that same minute-long read.
+  // Until it is full, lists read articles as before.
+  const META_COLS = ['id', 'userId', 'url', 'domain', 'savedAt', 'archived', 'favorite', 'readParagraph',
+    'ttsParagraph', 'title', 'byline', 'siteName', 'excerpt', 'source', 'wordCount', 'shareId',
+    'archivedAt', 'updatedAt', 'imageUrl', 'publishedAt'];
+  const metaList = META_COLS.join(', ');
+  const metaNew = META_COLS.map((c) => `new.${c}`).join(', ');
+  sqlite.exec(`
+    CREATE TABLE IF NOT EXISTS article_meta (
+      rid INTEGER PRIMARY KEY,
+      id TEXT NOT NULL, userId TEXT NOT NULL, url TEXT NOT NULL, domain TEXT NOT NULL DEFAULT '',
+      savedAt INTEGER NOT NULL, archived INTEGER NOT NULL DEFAULT 0, favorite INTEGER NOT NULL DEFAULT 0,
+      readParagraph INTEGER NOT NULL DEFAULT 0, ttsParagraph INTEGER NOT NULL DEFAULT 0,
+      title TEXT, byline TEXT, siteName TEXT, excerpt TEXT, source TEXT,
+      wordCount INTEGER NOT NULL DEFAULT 0, shareId TEXT, archivedAt INTEGER,
+      updatedAt INTEGER NOT NULL, imageUrl TEXT, publishedAt INTEGER
+    );
+    CREATE INDEX IF NOT EXISTS article_meta_user_saved ON article_meta(userId, savedAt DESC);
+    CREATE INDEX IF NOT EXISTS article_meta_user_updated ON article_meta(userId, updatedAt);
+    CREATE INDEX IF NOT EXISTS article_meta_user_arch_saved ON article_meta(userId, archived, savedAt DESC);
+    CREATE TRIGGER IF NOT EXISTS article_meta_ai AFTER INSERT ON articles BEGIN
+      INSERT OR REPLACE INTO article_meta (rid, ${metaList}) VALUES (new.rowid, ${metaNew});
+    END;
+    CREATE TRIGGER IF NOT EXISTS article_meta_au AFTER UPDATE ON articles BEGIN
+      DELETE FROM article_meta WHERE rid = old.rowid AND old.rowid != new.rowid;
+      INSERT OR REPLACE INTO article_meta (rid, ${metaList}) VALUES (new.rowid, ${metaNew});
+    END;
+    CREATE TRIGGER IF NOT EXISTS article_meta_ad AFTER DELETE ON articles BEGIN
+      DELETE FROM article_meta WHERE rid = old.rowid;
+    END;
+  `);
+  // Both counts come from an index, so this check is cheap on every start.
+  const metaMissing = () => sqlite.prepare(
+    'SELECT (SELECT COUNT(*) FROM articles) - (SELECT COUNT(*) FROM article_meta) AS n').get().n;
+  let metaReady = metaMissing() === 0;
+  let metaCursor = 0;
+  const metaPick = sqlite.prepare(`SELECT a.rowid AS rid FROM articles a
+    WHERE a.rowid > ? AND NOT EXISTS (SELECT 1 FROM article_meta m WHERE m.rid = a.rowid)
+    ORDER BY a.rowid LIMIT ?`);
+  const metaFill = sqlite.prepare(`INSERT OR IGNORE INTO article_meta (rid, ${metaList})
+    SELECT rowid, ${metaList} FROM articles WHERE rowid = ?`);
+  /** Copy up to [batch] articles not yet in article_meta. True once it is full. */
+  function fillArticleMeta(batch) {
+    if (metaReady) return true;
+    const rids = metaPick.all(metaCursor, batch).map((r) => r.rid);
+    sqlite.transaction(() => { for (const rid of rids) metaFill.run(rid); })();
+    if (rids.length) metaCursor = rids[rids.length - 1];
+    if (rids.length < batch) {
+      // Reached the end; rows inserted behind the cursor came with their
+      // trigger, so a mismatch now means a row was missed — go round again.
+      metaCursor = 0;
+      metaReady = metaMissing() === 0;
+    }
+    return metaReady;
+  }
+  if (!metaReady) {
+    if (metaMissing() <= 2000) {
+      while (!fillArticleMeta(500)) { /* small library: fill now */ }
+    } else {
+      // 40 rows at a time leaves the server answering between batches.
+      const started = Date.now();
+      console.log('article_meta: filling the list table in the background');
+      const tick = () => {
+        let done = false;
+        try { done = fillArticleMeta(40); } catch (e) { console.error('article_meta:', e.message); }
+        if (done) console.log(`article_meta: ready in ${Math.round((Date.now() - started) / 1000)}s`);
+        else setTimeout(tick, 25).unref();
+      };
+      setTimeout(tick, 1000).unref();
+    }
+  }
+  /** Which table a list reads its rows from (see article_meta above). */
+  const listTable = () => (metaReady ? 'article_meta' : 'articles');
 
   migrateLegacyJson(sqlite, dataDir);
 
@@ -1064,12 +1166,32 @@ function open(dataDir) {
     /** Note a new episode without taking it (a feed with autoProcess off). */
     addPendingFeedItem: (feedId, item) =>
       prep('fipa', `INSERT OR IGNORE INTO feed_items
-        (feedId, guid, articleId, seenAt, pending, title, url, publishedAt, durationS, imageUrl)
-        VALUES (@feedId, @guid, NULL, @seenAt, 1, @title, @url, @publishedAt, @durationS, @imageUrl)`)
+        (feedId, guid, articleId, seenAt, pending, title, url, publishedAt, durationS, imageUrl, notes)
+        VALUES (@feedId, @guid, NULL, @seenAt, 1, @title, @url, @publishedAt, @durationS, @imageUrl, @notes)`)
         .run({
           feedId, guid: String(item.guid).slice(0, 500), seenAt: Date.now(),
           title: item.title || null, url: item.url, publishedAt: item.publishedAt ?? null,
-          durationS: item.durationS ?? null, imageUrl: item.imageUrl || null,
+          durationS: item.durationS ?? null, imageUrl: item.imageUrl || null, notes: item.notes || null,
+        }).changes,
+
+    /** What has become of each episode of a feed seen so far: taken (an
+     *  articleId), waiting (pending), or neither — for the back catalogue. */
+    feedItemStates: (feedId) =>
+      prep('fist', 'SELECT guid, articleId, pending FROM feed_items WHERE feedId = ?').all(feedId),
+
+    /** Put an episode from the back catalogue on the waiting list, so it can
+     *  be taken like a new one. Not one already taken. Returns changes. */
+    offerFeedItem: (feedId, item) =>
+      prep('fio', `INSERT INTO feed_items
+        (feedId, guid, articleId, seenAt, pending, title, url, publishedAt, durationS, imageUrl, notes)
+        VALUES (@feedId, @guid, NULL, @seenAt, 1, @title, @url, @publishedAt, @durationS, @imageUrl, @notes)
+        ON CONFLICT(feedId, guid) DO UPDATE SET pending = 1, title = @title, url = @url,
+          publishedAt = @publishedAt, durationS = @durationS, imageUrl = @imageUrl, notes = @notes
+        WHERE feed_items.articleId IS NULL`)
+        .run({
+          feedId, guid: String(item.guid).slice(0, 500), seenAt: Date.now(),
+          title: item.title || null, url: item.url, publishedAt: item.publishedAt ?? null,
+          durationS: item.durationS ?? null, imageUrl: item.imageUrl || null, notes: item.notes || null,
         }).changes,
 
     /** Waiting episodes, newest first. */
@@ -1080,6 +1202,16 @@ function open(dataDir) {
     getPendingFeedItem: (feedId, guid) =>
       prep('fipg', `SELECT guid, title, url, publishedAt, durationS, imageUrl FROM feed_items
         WHERE feedId = ? AND guid = ? AND pending = 1`).get(feedId, String(guid)),
+
+    /** An episode's stored show notes, by guid or by the article it became:
+     *  {guid, notes} (notes null when never stored), or undefined. */
+    getFeedItemNotes: (feedId, { guid, articleId }) => (articleId
+      ? prep('finA', 'SELECT guid, notes FROM feed_items WHERE feedId = ? AND articleId = ?').get(feedId, String(articleId))
+      : prep('finG', 'SELECT guid, notes FROM feed_items WHERE feedId = ? AND guid = ?').get(feedId, String(guid))),
+
+    /** Keep show notes read live from the feed, for next time. */
+    setFeedItemNotes: (feedId, guid, notes) =>
+      prep('finS', 'UPDATE feed_items SET notes = ? WHERE feedId = ? AND guid = ?').run(notes, feedId, String(guid)).changes,
 
     /** Stop offering a waiting episode (dismissed, or taken). */
     clearPendingFeedItem: (feedId, guid) =>
@@ -1198,7 +1330,9 @@ function open(dataDir) {
       const lim = Number(filters.limit) || 0;
       if (lim <= 0) {
         // Unpaged (exports, sync): nothing to gain from the two-step below.
-        return sqlite.prepare(`SELECT ${cols} FROM articles a
+        // From article_meta once it's filled — the full sync's whole library
+        // without reading a single html blob.
+        return sqlite.prepare(`SELECT ${cols} FROM ${listTable()} a
           WHERE ${where.join(' AND ')} ORDER BY ${order}`).all(args).map(rowArticle);
       }
       args.limit = lim;
@@ -1230,6 +1364,10 @@ function open(dataDir) {
       const { where, args } = buildArticleWhere(userId, filters);
       return sqlite.prepare(`SELECT COUNT(*) c FROM articles a WHERE ${where.join(' AND ')}`).get(args).c;
     },
+
+    /** Whether lists read from article_meta yet (it fills in the background
+     *  on a large library's first start with it). */
+    articleMetaReady: () => metaReady,
 
     domainCounts: (userId) =>
       prep('dc', "SELECT domain, COUNT(*) n FROM articles WHERE userId = ? AND domain != '' GROUP BY domain ORDER BY n DESC")

@@ -7,7 +7,19 @@
         <intent>
             <action android:name="android.intent.action.TTS_SERVICE" />
         </intent>
+        <!-- The other app of the pair (Earmark / Hark): to borrow its sign-in
+             and, from Earmark, to open Hark from the Podcasts chip. -->
+        <package android:name="com.readlater.app" />
+        <package android:name="com.readlater.podcasts" />
     </queries>
+
+    <!-- Lets the two apps hand each other the server sign-in. Signature-level,
+         so only an app signed with the same key gets it; both declare it so it
+         is granted whichever one is installed first. -->
+    <permission
+        android:name="com.readlater.permission.SHARE_ACCOUNT"
+        android:protectionLevel="signature" />
+    <uses-permission android:name="com.readlater.permission.SHARE_ACCOUNT" />
 
     <uses-permission android:name="android.permission.INTERNET" />
     <!-- isActiveNetworkMetered (an episode waits for unmetered Wi-Fi before
@@ -38,33 +50,23 @@
             </intent-filter>
         </activity>
 
-        <!-- Share a link (or plain text containing one) from any app: saves in
-             the background without opening the app (translucent, no-UI). -->
+        <!-- Share target. Its intent filters are per app (src/reader, src/podcasts):
+             Earmark takes links, Hark takes episode files. Translucent and
+             no-history, so sharing never shows the app. -->
         <activity
             android:name=".ShareActivity"
             android:exported="true"
             android:theme="@android:style/Theme.Translucent.NoTitleBar"
             android:excludeFromRecents="true"
             android:noHistory="true"
-            android:taskAffinity=""
-            android:label="Save to Earmark">
-            <intent-filter>
-                <action android:name="android.intent.action.SEND" />
-                <category android:name="android.intent.category.DEFAULT" />
-                <data android:mimeType="text/plain" />
-            </intent-filter>
-            <!-- A podcast episode shared out of a player: the file itself, which
-                 the server transcribes. A player's link to an episode is no use
-                 here — nothing resolves a podcast URL to its audio. application/ogg
-                 is listed because some providers type an .ogg/.opus episode that
-                 way rather than audio/*. -->
-            <intent-filter>
-                <action android:name="android.intent.action.SEND" />
-                <category android:name="android.intent.category.DEFAULT" />
-                <data android:mimeType="audio/*" />
-                <data android:mimeType="application/ogg" />
-            </intent-filter>
-        </activity>
+            android:taskAffinity="" />
+
+        <!-- Hands this app's server sign-in to the other app of the pair. -->
+        <provider
+            android:name=".AccountProvider"
+            android:authorities="${applicationId}.account"
+            android:exported="true"
+            android:readPermission="com.readlater.permission.SHARE_ACCOUNT" />
 
         <!-- Uploads a shared podcast episode. Outlives the noHistory share
              activity, whose own scope was cancelled mid-upload whenever the user

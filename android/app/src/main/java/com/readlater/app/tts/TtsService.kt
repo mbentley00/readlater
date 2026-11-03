@@ -3018,7 +3018,7 @@ class TtsService : Service() {
         }
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setSmallIcon(R.drawable.ic_notification)
-            .setContentTitle(articleTitle.ifBlank { "Earmark" })
+            .setContentTitle(articleTitle.ifBlank { getString(com.readlater.app.R.string.app_name) })
             .setContentText(progressText)
             .setContentIntent(contentIntent)
             .setOnlyAlertOnce(true)

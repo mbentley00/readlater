@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Earmark (articles). Merged over src/main. -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <application>
+        <!-- Share a link (or plain text containing one) from any app: saved in
+             the background without opening the app. Episode files go to
+             Hark, the podcast app, instead. -->
+        <activity
+            android:name=".ShareActivity"
+            android:label="Save to Earmark">
+            <intent-filter>
+                <action android:name="android.intent.action.SEND" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="text/plain" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>

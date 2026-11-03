@@ -11,6 +11,14 @@ class Settings(context: Context) {
     private val prefs: SharedPreferences =
         context.getSharedPreferences("readlater_settings", Context.MODE_PRIVATE)
 
+    /** Where this app's newest build downloads from: Earmark's /app.apk, or a
+     *  named APK such as Hark's /apk/podcasts. */
+    fun apkDownloadUrl(): String {
+        val base = serverUrl.ifBlank { "https://readlater-mbent.fly.dev" }
+        val name = com.readlater.app.BuildConfig.APK_NAME
+        return if (name.isEmpty()) "$base/app.apk" else "$base/apk/$name"
+    }
+
     /** Base URL of the companion server, stored without a trailing slash. */
     var serverUrl: String
         get() = prefs.getString(KEY_SERVER_URL, "").orEmpty()
@@ -110,6 +118,12 @@ class Settings(context: Context) {
 
     /** Last GET /api/podcasts reply (JSON): the Podcasts tab's shows and
      *  waiting episodes, shown at once (and offline) while it refreshes. */
+    /** Episodes processed from the Podcasts tab whose audio is still to come
+     *  down to the phone: downloaded as soon as each one syncs. */
+    var autoDownloadIds: Set<String>
+        get() = prefs.getStringSet(KEY_AUTO_DOWNLOAD, emptySet()).orEmpty().toSet()
+        set(value) { prefs.edit().putStringSet(KEY_AUTO_DOWNLOAD, value).apply() }
+
     var cachedPodcastsJson: String
         get() = prefs.getString(KEY_CACHED_PODCASTS, "").orEmpty()
         set(value) { prefs.edit().putString(KEY_CACHED_PODCASTS, value).apply() }
@@ -138,6 +152,7 @@ class Settings(context: Context) {
         const val KEY_PODCASTS_TAB = "podcasts_tab"
         const val KEY_CACHED_VIEWS = "cached_views_json"
         const val KEY_CACHED_PODCASTS = "cached_podcasts_json"
+        const val KEY_AUTO_DOWNLOAD = "auto_download_ids"
         const val KEY_LIST_SORT = "list_sort"
         const val KEY_LAST_ARTICLE = "last_article_id"
         const val KEY_TTS_ENGINE = "tts_engine"
