@@ -142,7 +142,27 @@ class Settings(context: Context) {
             prefs.edit().putString(KEY_LAST_ARTICLE, value).apply()
         }
 
+    /**
+     * Article the player had loaded when it last went away; "" = none. Lets a
+     * headset / lock-screen Play pick it back up after Android has closed the
+     * paused player. Cleared by a deliberate Stop or the article finishing.
+     */
+    var resumeArticleId: String
+        get() = prefs.getString(KEY_RESUME_ARTICLE, "").orEmpty()
+        set(value) {
+            prefs.edit().putString(KEY_RESUME_ARTICLE, value).apply()
+        }
+
+    /** Whether play-through was on for [resumeArticleId]. */
+    var resumeAutoAdvance: Boolean
+        get() = prefs.getBoolean(KEY_RESUME_AUTO_ADVANCE, false)
+        set(value) {
+            prefs.edit().putBoolean(KEY_RESUME_AUTO_ADVANCE, value).apply()
+        }
+
     private companion object {
+        const val KEY_RESUME_ARTICLE = "resume_article_id"
+        const val KEY_RESUME_AUTO_ADVANCE = "resume_auto_advance"
         const val KEY_SERVER_URL = "server_url"
         const val KEY_TOKEN = "token"
         const val KEY_TTS_RATE = "tts_speech_rate"

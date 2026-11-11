@@ -312,7 +312,12 @@ class TtsService : Service() {
             ACTION_ARCHIVE_AND_NEXT -> handleArchiveAndNext()
             // System-delivered media buttons (MediaButtonReceiver in the
             // manifest) route into the session callback.
-            Intent.ACTION_MEDIA_BUTTON -> MediaButtonReceiver.handleIntent(mediaSession, intent)
+            Intent.ACTION_MEDIA_BUTTON -> {
+                MediaButtonReceiver.handleIntent(mediaSession, intent)
+                // A cold start from a key that didn't bring anything back
+                // (pause, next…) has nothing to do.
+                if (articleId == null && !reviving) stopSelf()
+            }
             else -> if (articleId == null) stopSelf()
         }
         return START_NOT_STICKY
@@ -443,9 +448,13 @@ class TtsService : Service() {
                 autoAdvance = intent.getBooleanExtra(EXTRA_AUTO_ADVANCE, false)
             }
             disarmArchive() // a pending confirmation never carries to a new article
+            reviving = false
             // Make this the cold-start resume target: if the process is killed
             // while listening, reopening returns to this article.
             app.settings.lastArticleId = article.id
+            // ...and the target for a Play press after Android closes the player.
+            app.settings.resumeArticleId = article.id
+            app.settings.resumeAutoAdvance = autoAdvance
             articleTitle = article.title
             articleSite = article.siteName?.takeIf { it.isNotBlank() }
                 ?: runCatching { android.net.Uri.parse(article.url).host?.removePrefix("www.") }.getOrNull().orEmpty()
@@ -565,9 +574,33 @@ class TtsService : Service() {
         updateNotification()
     }
 
+    /** Set while a Play press is reloading the last article after the service
+     *  was closed; cleared once handlePlay has it. */
+    private var reviving = false
+
+    /**
+     * Android sometimes closes the paused player (its notification and
+     * lock-screen controls go with it). A Play press from the headset or lock
+     * screen then lands on an empty service: reload the last article at its
+     * saved position instead of ignoring the press.
+     */
+    private fun reviveLastArticle(): Boolean {
+        if (reviving) return true
+        val id = app.settings.resumeArticleId.takeIf { it.isNotBlank() } ?: return false
+        logDbg("PLAY on a closed player → reloading $id")
+        reviving = true
+        handlePlay(
+            Intent(this, TtsService::class.java)
+                .setAction(ACTION_PLAY)
+                .putExtra(EXTRA_ARTICLE_ID, id)
+                .putExtra(EXTRA_AUTO_ADVANCE, app.settings.resumeAutoAdvance)
+        )
+        return true
+    }
+
     private fun handleResume() {
         if (articleId == null) {
-            stopSelf()
+            if (!reviveLastArticle()) stopSelf()
             return
         }
         if (isPlaying) return
@@ -985,9 +1018,13 @@ class TtsService : Service() {
         publishState()
     }
 
-    private fun handleStop() {
-        logDbg("STOP (idx=$currentIndex)")
+    /** [forget] = false keeps the article as the Play-to-resume target (used
+     *  when we only tidy away a long-paused player). */
+    private fun handleStop(forget: Boolean = true) {
+        logDbg("STOP (idx=$currentIndex)${if (forget) "" else " (kept for resume)"}")
         pendingStart = false
+        reviving = false
+        if (forget) app.settings.resumeArticleId = ""
         cancelPausedTimers()
         isPlaying = false
         disarmArchive()
@@ -2925,7 +2962,7 @@ class TtsService : Service() {
     private val idleStopRunnable = Runnable {
         if (!isPlaying && articleId != null) {
             logDbg("paused ${PAUSED_IDLE_STOP_MS / 60_000} min → stopping")
-            handleStop()
+            handleStop(forget = false)
         }
     }
 

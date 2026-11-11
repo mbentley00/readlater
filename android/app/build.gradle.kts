@@ -21,8 +21,8 @@ android {
         applicationId = "com.readlater.app"
         minSdk = 26
         targetSdk = 34
-        versionCode = 88
-        versionName = "5.47"
+        versionCode = 89
+        versionName = "5.48"
     }
 
     // Two apps from one codebase, signed with the same key and signed in to the
@@ -43,8 +43,8 @@ android {
         create("podcasts") {
             dimension = "app"
             applicationId = "com.readlater.podcasts"
-            versionCode = 5
-            versionName = "1.4"
+            versionCode = 6
+            versionName = "1.5"
             buildConfigField("boolean", "PODCAST_APP", "true")
             buildConfigField("String", "SIBLING_PACKAGE", "\"com.readlater.app\"")
             buildConfigField("String", "APK_NAME", "\"podcasts\"")
