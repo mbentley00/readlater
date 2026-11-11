@@ -303,6 +303,8 @@ fun ArticleListScreen(
     var podcastListName by rememberSaveable { mutableStateOf(PodcastList.NEW.name) }
     val podcastList = runCatching { PodcastList.valueOf(podcastListName) }.getOrDefault(PodcastList.NEW)
     var showFilter by rememberSaveable { mutableStateOf<String?>(null) }
+    // Every show as a grid of artwork, in place of the lists.
+    var showGrid by rememberSaveable { mutableStateOf(false) }
     var storedKeys by remember { mutableStateOf<Set<String>>(emptySet()) }
     var downloading by remember { mutableStateOf<Set<String>>(emptySet()) }
     var processing by remember { mutableStateOf<Set<String>>(emptySet()) }
@@ -351,12 +353,47 @@ fun ArticleListScreen(
     }
     val newCounts = remember(waitingAll) { waitingAll.groupingBy { it.feedId }.eachCount() }
 
+    // ---- A show's back catalogue, read live from its feed (slow-ish, so
+    // kept per show for as long as the screen is up).
+    var backlogs by remember { mutableStateOf<Map<String, List<com.readlater.app.data.BacklogEpisode>>>(emptyMap()) }
+    var backlogError by remember { mutableStateOf<String?>(null) }
+    var backlogReload by remember { mutableStateOf(0) }
+
+    // One show picked: New, Processed/Downloaded and Older in a single list,
+    // newest first, told apart only by their status icon.
+    val showItems = remember(showFilter, waitingShown, processedShown, backlogs) {
+        val feedId = showFilter ?: return@remember emptyList<ShowItem>()
+        val backlog = backlogs[feedId].orEmpty()
+        val backlogByArticle = backlog.filter { it.articleId != null }.associateBy { it.articleId!! }
+        val waitingGuids = waitingShown.map { it.guid }.toSet()
+        val processedIds = processedShown.map { it.id }.toSet()
+        val out = mutableListOf<ShowItem>()
+        waitingShown.forEach { out += ShowItem.New(it) }
+        processedShown.forEach { a ->
+            val b = backlogByArticle[a.id]
+            out += ShowItem.Processed(a, b?.publishedAt ?: a.publishedAt ?: a.savedAt, b?.durationS)
+        }
+        backlog.forEach { b ->
+            when {
+                b.guid in waitingGuids -> {}
+                b.articleId != null && b.articleId in processedIds -> {}
+                b.state == "available" -> out += ShowItem.Older(b, archived = false)
+                // processed, then archived: still listed so the feed reads whole
+                b.state == "processed" -> out += ShowItem.Older(b, archived = true)
+                // "waiting" but hidden here (just archived or processed)
+                else -> {}
+            }
+        }
+        out.sortedByDescending { it.date ?: Long.MIN_VALUE }
+    }
+
     // Open an article, first capturing the exact order currently on screen so that
     // queued ("play through") playback started from it follows THIS view rather
     // than the global inbox (see Repository.playQueue / nextAfterInView).
     fun openArticle(id: String) {
         val onScreen = when {
             !podcastPane -> articles
+            showFilter != null -> showItems.mapNotNull { (it as? ShowItem.Processed)?.article }
             podcastList == PodcastList.DOWNLOADED -> downloadedShown
             else -> processedShown
         }
@@ -402,14 +439,10 @@ fun ArticleListScreen(
         }
     }
 
-    // ---- Older: the selected show's back catalogue, read live from its feed
-    // (slow-ish, so kept per show for as long as the screen is up).
-    var backlogs by remember { mutableStateOf<Map<String, List<com.readlater.app.data.BacklogEpisode>>>(emptyMap()) }
-    var backlogError by remember { mutableStateOf<String?>(null) }
-    var backlogReload by remember { mutableStateOf(0) }
-    LaunchedEffect(podcastPane, podcastList, showFilter, backlogReload) {
+    // ---- The selected show's back catalogue (loaded above, with the lists).
+    LaunchedEffect(podcastPane, showFilter, backlogReload) {
         val feedId = showFilter
-        if (!podcastPane || podcastList != PodcastList.OLDER || feedId == null) return@LaunchedEffect
+        if (!podcastPane || feedId == null) return@LaunchedEffect
         if (backlogReload == 0 && feedId in backlogs) return@LaunchedEffect
         backlogError = null
         repo.feedBacklog(feedId)
@@ -776,13 +809,18 @@ fun ArticleListScreen(
                 )
             }
 
-            if (podcastPane) {
+            if (podcastPane && showGrid) {
+                androidx.activity.compose.BackHandler { showGrid = false }
+                ShowGrid(showsOrdered, newCounts, showFilter) { showFilter = it; showGrid = false }
+            } else if (podcastPane) {
                 val shows = podcasts?.shows.orEmpty()
                 val showById = remember(shows) { shows.associateBy { it.id } }
                 if (shows.isNotEmpty()) {
-                    ShowStrip(showsOrdered, newCounts, showFilter) { showFilter = it }
+                    ShowStrip(showsOrdered, newCounts, showFilter, onOpenGrid = { showGrid = true }) { showFilter = it }
                 }
-                Row(
+                val selShow = showById[showFilter]
+                // A picked show has one combined list, so the chips are for All only.
+                if (selShow == null) Row(
                     modifier = Modifier
                         .padding(horizontal = 16.dp, vertical = 2.dp)
                         .horizontalScroll(rememberScrollState()),
@@ -793,8 +831,6 @@ fun ArticleListScreen(
                             PodcastList.NEW -> waitingShown.size
                             PodcastList.PROCESSED -> processedShown.size
                             PodcastList.DOWNLOADED -> downloadedShown.size
-                            // Not yet processed, for the selected show once read.
-                            PodcastList.OLDER -> showFilter?.let { f -> backlogs[f]?.count { it.state == "available" } }
                         }
                         FilterChip(
                             selected = podcastList == l,
@@ -803,7 +839,6 @@ fun ArticleListScreen(
                         )
                     }
                 }
-                val selShow = showById[showFilter]
                 if (selShow != null) {
                     Row(
                         verticalAlignment = Alignment.CenterVertically,
@@ -840,63 +875,128 @@ fun ArticleListScreen(
                     color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f)
                 )
 
-                if (podcastList == PodcastList.OLDER) {
-                    val feedId = showFilter
-                    val items = feedId?.let { backlogs[it] }
-                    when {
-                        feedId == null -> PodcastEmptyNote(
-                            "Pick a show",
-                            if (shows.isEmpty()) "Subscribe to a show's feed in Settings."
-                            else "Tap a show above to see all its older episodes, and pick any to process."
-                        )
-                        backlogError != null && items == null -> Column(
-                            Modifier.fillMaxWidth().padding(32.dp),
-                            horizontalAlignment = Alignment.CenterHorizontally
-                        ) {
-                            Text("Couldn't read the show's feed", style = MaterialTheme.typography.titleMedium)
-                            Text(
-                                backlogError.orEmpty(),
-                                style = MaterialTheme.typography.bodyMedium,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                textAlign = TextAlign.Center
-                            )
-                            androidx.compose.material3.TextButton(onClick = { backlogReload++ }) { Text("Try again") }
-                        }
-                        items == null -> Box(
-                            Modifier.fillMaxWidth().padding(32.dp),
-                            contentAlignment = Alignment.Center
-                        ) { CircularProgressIndicator() }
-                        items.isEmpty() -> PodcastEmptyNote("No episodes", "The show's feed lists no episodes right now.")
-                        else -> {
-                            // Processed episodes open when they've synced here.
-                            val openable = processedShown.map { it.id }.toSet()
-                            LazyColumn(contentPadding = PaddingValues(bottom = 24.dp)) {
-                                itemsIndexed(items, key = { _, e -> e.guid }) { i, ep ->
-                                    if (i > 0) HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f))
-                                    val openId = ep.articleId?.takeIf { it in openable }
-                                    BacklogEpisodeRow(
-                                        ep = ep,
-                                        busy = "$feedId/${ep.guid}" in processing,
-                                        onProcess = { processBacklog(feedId, ep) },
-                                        onOpen = {
+                if (selShow != null) {
+                    val feedId = selShow.id
+                    val backlogLoaded = feedId in backlogs
+                    if (showItems.isEmpty() && backlogLoaded) {
+                        PodcastEmptyNote("No episodes", "The show's feed lists no episodes right now.")
+                    } else LazyColumn(state = listState, contentPadding = PaddingValues(bottom = 24.dp)) {
+                        itemsIndexed(showItems, key = { _, it -> it.key }) { i, item ->
+                            if (i > 0) HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f))
+                            when (item) {
+                                is ShowItem.New -> {
+                                    val ep = item.ep
+                                    val busy = "${ep.feedId}/${ep.guid}" in processing
+                                    ShowEpisodeRow(
+                                        title = ep.title,
+                                        imageUrl = ep.imageUrl ?: selShow.imageUrl,
+                                        meta = episodeMeta(ep.publishedAt, ep.durationS),
+                                        status = EpisodeStatus.NEW,
+                                        onClick = {
+                                            notesTarget = NotesTarget(
+                                                feedId = ep.feedId, guid = ep.guid, articleId = null,
+                                                title = ep.title, showTitle = selShow.title,
+                                                imageUrl = ep.imageUrl ?: selShow.imageUrl,
+                                                meta = episodeMeta(ep.publishedAt, ep.durationS),
+                                                actionLabel = "Process",
+                                                onAction = { notesTarget = null; processWaiting(ep) }
+                                            )
+                                        },
+                                    ) {
+                                        ProcessButton(busy) { processWaiting(ep) }
+                                        ArchiveWaitingButton(enabled = !busy) { archiveWaiting(ep) }
+                                    }
+                                }
+                                is ShowItem.Older -> {
+                                    val ep = item.ep
+                                    val busy = "$feedId/${ep.guid}" in processing
+                                    val meta = episodeMeta(ep.publishedAt, ep.durationS)
+                                    ShowEpisodeRow(
+                                        title = ep.title,
+                                        imageUrl = ep.imageUrl ?: selShow.imageUrl,
+                                        meta = if (item.archived) listOf(meta, "Archived").filter { it.isNotBlank() }.joinToString(" · ") else meta,
+                                        status = if (item.archived) EpisodeStatus.PROCESSED else EpisodeStatus.OLDER,
+                                        dim = item.archived,
+                                        onClick = {
                                             notesTarget = NotesTarget(
                                                 feedId = feedId, guid = ep.guid, articleId = null,
-                                                title = ep.title, showTitle = selShow?.title, imageUrl = ep.imageUrl,
-                                                meta = episodeMeta(ep.publishedAt, ep.durationS),
-                                                actionLabel = when {
-                                                    openId != null -> "Open transcript"
-                                                    ep.state == "available" -> "Process"
-                                                    else -> null
-                                                },
-                                                onAction = {
-                                                    notesTarget = null
-                                                    if (openId != null) openArticle(openId) else processBacklog(feedId, ep)
-                                                }
+                                                title = ep.title, showTitle = selShow.title,
+                                                imageUrl = ep.imageUrl ?: selShow.imageUrl,
+                                                meta = meta,
+                                                actionLabel = if (item.archived) null else "Process",
+                                                onAction = { notesTarget = null; processBacklog(feedId, ep) }
                                             )
+                                        },
+                                    ) {
+                                        if (!item.archived) ProcessButton(busy) { processBacklog(feedId, ep) }
+                                    }
+                                }
+                                is ShowItem.Processed -> {
+                                    val article = item.article
+                                    val stored = repo.isEpisodeStored(storedKeys, article)
+                                    val transcribing = article.excerpt == "Transcribing…"
+                                    ShowEpisodeRow(
+                                        title = article.title.ifBlank { article.url },
+                                        imageUrl = article.imageUrl ?: selShow.imageUrl,
+                                        meta = listOf(
+                                            episodeMeta(item.date, item.durationS),
+                                            listenedLabel(article),
+                                        ).filter { it.isNotBlank() }.joinToString(" · "),
+                                        status = when {
+                                            transcribing -> EpisodeStatus.TRANSCRIBING
+                                            stored -> EpisodeStatus.DOWNLOADED
+                                            else -> EpisodeStatus.PROCESSED
+                                        },
+                                        onClick = { openArticle(article.id) },
+                                    ) {
+                                        if (article.id in downloading) {
+                                            Box(Modifier.size(48.dp), contentAlignment = Alignment.Center) {
+                                                CircularProgressIndicator(Modifier.size(20.dp), strokeWidth = 2.dp)
+                                            }
                                         }
-                                    )
+                                        ProcessedEpisodeMenu(
+                                            stored = stored,
+                                            canDownload = article.audioUrl != null && article.id !in downloading,
+                                            onNotes = {
+                                                notesTarget = NotesTarget(
+                                                    feedId = feedId, guid = null, articleId = article.id,
+                                                    title = article.title, showTitle = selShow.title,
+                                                    imageUrl = article.imageUrl ?: selShow.imageUrl,
+                                                    meta = "",
+                                                    actionLabel = "Open transcript",
+                                                    onAction = { notesTarget = null; openArticle(article.id) }
+                                                )
+                                            },
+                                            onDownload = { downloadAudio(article) },
+                                            onRemoveDownload = {
+                                                repo.removeEpisodeAudio(article)
+                                                storedKeys = repo.storedEpisodeKeys()
+                                            },
+                                            onArchive = { repo.toggleArchive(article) },
+                                            onDelete = { repo.deleteArticle(article) },
+                                        )
+                                    }
                                 }
                             }
+                        }
+                        // The back catalogue comes from the feed, so it can lag or fail.
+                        if (!backlogLoaded) item(key = "backlog-status") {
+                            if (backlogError != null) Column(
+                                Modifier.fillMaxWidth().padding(24.dp),
+                                horizontalAlignment = Alignment.CenterHorizontally
+                            ) {
+                                Text("Couldn't read older episodes from the feed", style = MaterialTheme.typography.bodyMedium)
+                                Text(
+                                    backlogError.orEmpty(),
+                                    style = MaterialTheme.typography.labelMedium,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    textAlign = TextAlign.Center
+                                )
+                                androidx.compose.material3.TextButton(onClick = { backlogReload++ }) { Text("Try again") }
+                            } else Box(
+                                Modifier.fillMaxWidth().padding(24.dp),
+                                contentAlignment = Alignment.Center
+                            ) { CircularProgressIndicator(Modifier.size(28.dp)) }
                         }
                     }
                 } else if (podcastList == PodcastList.NEW) {
@@ -1389,4 +1489,84 @@ private fun randomOrderKey(seed: Long, id: String): Long {
         h *= 1099511628211L // FNV-1a 64-bit prime
     }
     return h
+}
+
+
+/** An entry in one show's combined episode list. */
+private sealed class ShowItem {
+    abstract val key: String
+    abstract val date: Long?
+
+    class New(val ep: com.readlater.app.data.WaitingEpisode) : ShowItem() {
+        override val key get() = "w:${ep.feedId}/${ep.guid}"
+        override val date get() = ep.publishedAt
+    }
+
+    class Processed(val article: ArticleEntity, override val date: Long?, val durationS: Int?) : ShowItem() {
+        override val key get() = "a:${article.id}"
+    }
+
+    /** From the feed's back catalogue: not processed, or processed and since archived. */
+    class Older(val ep: com.readlater.app.data.BacklogEpisode, val archived: Boolean) : ShowItem() {
+        override val key get() = "b:${ep.guid}"
+        override val date get() = ep.publishedAt
+    }
+}
+
+/** "40% listened" / "Finished" / "" (not started). */
+private fun listenedLabel(article: ArticleEntity): String {
+    val pos = maxOf(article.ttsParagraph, article.readParagraph)
+    if (pos <= 0 || article.paragraphCount <= 0) return ""
+    val frac = ((pos + 1).toFloat() / article.paragraphCount).coerceIn(0f, 1f)
+    return if (frac >= 0.98f) "Finished" else "${(frac * 100).roundToInt()}% listened"
+}
+
+/** The ⋮ menu of a processed episode in a show's combined list. */
+@Composable
+private fun ProcessedEpisodeMenu(
+    stored: Boolean,
+    canDownload: Boolean,
+    onNotes: () -> Unit,
+    onDownload: () -> Unit,
+    onRemoveDownload: () -> Unit,
+    onArchive: () -> Unit,
+    onDelete: () -> Unit,
+) {
+    var open by remember { mutableStateOf(false) }
+    Box {
+        IconButton(onClick = { open = true }) {
+            Icon(Icons.Filled.MoreVert, contentDescription = "More actions",
+                tint = MaterialTheme.colorScheme.onSurfaceVariant)
+        }
+        DropdownMenu(expanded = open, onDismissRequest = { open = false }) {
+            DropdownMenuItem(
+                text = { Text("Show notes") },
+                leadingIcon = { Icon(Icons.AutoMirrored.Filled.Notes, null) },
+                onClick = { open = false; onNotes() }
+            )
+            if (stored) {
+                DropdownMenuItem(
+                    text = { Text("Remove download") },
+                    leadingIcon = { Icon(Icons.Filled.FileDownloadOff, null) },
+                    onClick = { open = false; onRemoveDownload() }
+                )
+            } else if (canDownload) {
+                DropdownMenuItem(
+                    text = { Text("Download episode") },
+                    leadingIcon = { Icon(Icons.Filled.Download, null) },
+                    onClick = { open = false; onDownload() }
+                )
+            }
+            DropdownMenuItem(
+                text = { Text("Archive") },
+                leadingIcon = { Icon(Icons.Filled.Archive, null) },
+                onClick = { open = false; onArchive() }
+            )
+            DropdownMenuItem(
+                text = { Text("Delete") },
+                leadingIcon = { Icon(Icons.Filled.Delete, null) },
+                onClick = { open = false; onDelete() }
+            )
+        }
+    }
 }

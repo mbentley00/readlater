@@ -18,6 +18,9 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.CheckCircle
+import androidx.compose.material.icons.filled.FiberNew
+import androidx.compose.material.icons.filled.GridView
+import androidx.compose.material.icons.filled.History
 import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.DownloadDone
 import androidx.compose.material.icons.filled.HourglassTop
@@ -39,6 +42,7 @@ import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.readlater.app.data.BacklogEpisode
@@ -51,14 +55,13 @@ import com.readlater.app.data.WaitingEpisode
  *    with auto-processing off have any). Process or archive them here.
  *  - PROCESSED: episodes transcribed on the server, ready to read or play.
  *  - DOWNLOADED: the processed ones whose audio is on this phone.
- *  - OLDER: one show's back catalogue, read from its feed — the episodes from
- *    before you subscribed (and any archived from New), to process by hand.
+ * Picking a show swaps these for one combined list (see ShowEpisodeRow) that
+ * also holds its back catalogue, read from the feed.
  */
 enum class PodcastList(val label: String) {
     NEW("New"),
     PROCESSED("Processed"),
     DOWNLOADED("Downloaded"),
-    OLDER("Older"),
 }
 
 /** How a processed episode stands, shown on its card. */
@@ -87,6 +90,7 @@ fun ShowStrip(
     shows: List<PodcastShow>,
     newCounts: Map<String, Int>,
     selectedId: String?,
+    onOpenGrid: () -> Unit,
     onSelect: (String?) -> Unit,
 ) {
     Row(
@@ -96,6 +100,7 @@ fun ShowStrip(
             .padding(horizontal = 12.dp, vertical = 6.dp),
         horizontalArrangement = Arrangement.spacedBy(10.dp),
     ) {
+        GridTile(onOpenGrid)
         ShowTile(title = "All", imageUrl = null, newCount = 0, selected = selectedId == null) { onSelect(null) }
         shows.forEach { s ->
             ShowTile(
@@ -108,22 +113,81 @@ fun ShowStrip(
     }
 }
 
+/** First tile of the strip: opens every show as a grid. */
+@Composable
+private fun GridTile(onClick: () -> Unit) {
+    Column(
+        horizontalAlignment = Alignment.CenterHorizontally,
+        modifier = Modifier.width(68.dp).clickable(onClick = onClick),
+    ) {
+        Box(
+            Modifier.size(64.dp).clip(RoundedCornerShape(10.dp))
+                .background(MaterialTheme.colorScheme.secondaryContainer),
+            contentAlignment = Alignment.Center,
+        ) {
+            Icon(Icons.Filled.GridView, contentDescription = null,
+                tint = MaterialTheme.colorScheme.onSecondaryContainer)
+        }
+        Spacer(Modifier.height(3.dp))
+        Text("Shows", style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1)
+    }
+}
+
+/**
+ * Every show at once, as a grid of artwork: quicker than scrolling the strip
+ * sideways once there are more than a handful. Picking one (or All) closes it.
+ */
+@Composable
+fun ShowGrid(
+    shows: List<PodcastShow>,
+    newCounts: Map<String, Int>,
+    selectedId: String?,
+    onSelect: (String?) -> Unit,
+) {
+    androidx.compose.foundation.lazy.grid.LazyVerticalGrid(
+        columns = androidx.compose.foundation.lazy.grid.GridCells.Adaptive(96.dp),
+        contentPadding = androidx.compose.foundation.layout.PaddingValues(12.dp),
+        horizontalArrangement = Arrangement.spacedBy(10.dp),
+        verticalArrangement = Arrangement.spacedBy(14.dp),
+    ) {
+        item(key = "all") {
+            ShowTile(title = "All", imageUrl = null, newCount = 0, selected = selectedId == null, size = 88.dp) {
+                onSelect(null)
+            }
+        }
+        items(shows.size, key = { shows[it].id }) { i ->
+            val s = shows[i]
+            ShowTile(
+                title = s.title,
+                imageUrl = s.imageUrl,
+                newCount = newCounts[s.id] ?: 0,
+                selected = selectedId == s.id,
+                size = 88.dp,
+                lines = 2,
+            ) { onSelect(s.id) }
+        }
+    }
+}
+
 @Composable
 private fun ShowTile(
     title: String,
     imageUrl: String?,
     newCount: Int,
     selected: Boolean,
+    size: Dp = 64.dp,
+    lines: Int = 1,
     onClick: () -> Unit,
 ) {
     val shape = RoundedCornerShape(10.dp)
     Column(
         horizontalAlignment = Alignment.CenterHorizontally,
-        modifier = Modifier.width(68.dp).clickable(onClick = onClick),
+        modifier = Modifier.width(size + 4.dp).clickable(onClick = onClick),
     ) {
         Box {
             val frame = Modifier
-                .size(64.dp)
+                .size(size)
                 .clip(shape)
                 .background(MaterialTheme.colorScheme.surfaceVariant)
                 .border(
@@ -171,7 +235,7 @@ private fun ShowTile(
             style = MaterialTheme.typography.labelSmall,
             fontWeight = if (selected) FontWeight.Bold else FontWeight.Normal,
             color = if (selected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
-            maxLines = 1,
+            maxLines = lines,
             overflow = TextOverflow.Ellipsis,
             textAlign = TextAlign.Center,
         )
@@ -255,71 +319,107 @@ fun WaitingEpisodeRow(
     }
 }
 
+/** Where an episode stands, in a single show's combined list. Only the icon
+ *  on the artwork's corner tells them apart. */
+enum class EpisodeStatus(val icon: ImageVector, val label: String) {
+    NEW(Icons.Filled.FiberNew, "New"),
+    TRANSCRIBING(Icons.Filled.HourglassTop, "Transcribing"),
+    PROCESSED(Icons.Filled.CheckCircle, "Processed"),
+    DOWNLOADED(Icons.Filled.DownloadDone, "Downloaded"),
+    OLDER(Icons.Filled.History, "Older"),
+}
+
 /**
- * An episode of the selected show's back catalogue. One still available gets
- * the process button; one under New or already processed says so instead.
- * Tapping it shows its notes.
+ * One episode in a show's combined list: artwork with the status icon on its
+ * corner, title, a meta line. [actions] holds whatever applies to it
+ * (process, archive, a menu).
  */
 @Composable
-fun BacklogEpisodeRow(
-    ep: BacklogEpisode,
-    busy: Boolean,
-    onProcess: () -> Unit,
-    onOpen: (() -> Unit)?,
+fun ShowEpisodeRow(
+    title: String,
+    imageUrl: String?,
+    meta: String,
+    status: EpisodeStatus,
+    /** Faded: processed but archived, so no longer in the lists. */
+    dim: Boolean = false,
+    onClick: () -> Unit,
+    actions: @Composable () -> Unit,
 ) {
+    val tint = when (status) {
+        EpisodeStatus.TRANSCRIBING -> MaterialTheme.colorScheme.tertiary
+        EpisodeStatus.OLDER -> MaterialTheme.colorScheme.onSurfaceVariant
+        else -> MaterialTheme.colorScheme.primary
+    }
+    val textAlpha = if (dim) 0.6f else 1f
     Row(
         verticalAlignment = Alignment.CenterVertically,
-        modifier = Modifier
-            .fillMaxWidth()
-            .then(if (onOpen != null) Modifier.clickable(onClick = onOpen) else Modifier)
-            .padding(start = 16.dp, end = 8.dp, top = 10.dp, bottom = 10.dp),
+        modifier = Modifier.fillMaxWidth().clickable(onClick = onClick)
+            .padding(start = 16.dp, end = 4.dp, top = 10.dp, bottom = 10.dp),
     ) {
-        Box(
-            Modifier.size(48.dp).clip(RoundedCornerShape(8.dp))
-                .background(MaterialTheme.colorScheme.surfaceVariant)
-        ) {
-            if (ep.imageUrl != null) {
-                coil.compose.AsyncImage(
-                    model = ep.imageUrl, contentDescription = null,
-                    contentScale = ContentScale.Crop, modifier = Modifier.size(48.dp),
+        Box(Modifier.size(54.dp)) {
+            Box(
+                Modifier.size(48.dp).clip(RoundedCornerShape(8.dp))
+                    .background(MaterialTheme.colorScheme.surfaceVariant)
+            ) {
+                if (imageUrl != null) {
+                    coil.compose.AsyncImage(
+                        model = imageUrl, contentDescription = null,
+                        contentScale = ContentScale.Crop, modifier = Modifier.size(48.dp),
+                    )
+                }
+            }
+            Box(
+                Modifier.align(Alignment.BottomEnd).size(22.dp)
+                    .background(MaterialTheme.colorScheme.surface, RoundedCornerShape(11.dp)),
+                contentAlignment = Alignment.Center,
+            ) {
+                Icon(status.icon, contentDescription = status.label, tint = tint, modifier = Modifier.size(18.dp))
+            }
+        }
+        Spacer(Modifier.width(10.dp))
+        Column(Modifier.weight(1f)) {
+            Text(
+                text = title,
+                style = MaterialTheme.typography.titleSmall.copy(fontWeight = FontWeight.SemiBold),
+                color = MaterialTheme.colorScheme.onSurface.copy(alpha = textAlpha),
+                maxLines = 2, overflow = TextOverflow.Ellipsis,
+            )
+            if (meta.isNotBlank()) {
+                Text(
+                    text = meta,
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = textAlpha),
+                    maxLines = 1, overflow = TextOverflow.Ellipsis,
                 )
             }
         }
-        Spacer(Modifier.width(12.dp))
-        Column(Modifier.weight(1f)) {
-            Text(
-                text = ep.title,
-                style = MaterialTheme.typography.titleSmall.copy(fontWeight = FontWeight.SemiBold),
-                maxLines = 2, overflow = TextOverflow.Ellipsis,
-            )
-            val meta = listOf(
-                ep.publishedAt?.let { relativeDay(it) }.orEmpty(),
-                formatEpisodeDuration(ep.durationS),
-                when {
-                    busy -> "Processing…"
-                    ep.state == "processed" -> "Processed"
-                    ep.state == "waiting" -> "In New"
-                    else -> ""
-                },
-            ).filter { it.isNotBlank() }.joinToString(" · ")
-            Text(
-                text = meta,
-                style = MaterialTheme.typography.labelMedium,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
+        actions()
+    }
+}
+
+/** The process button (or its spinner) on New and Older rows. */
+@Composable
+fun ProcessButton(busy: Boolean, onProcess: () -> Unit) {
+    if (busy) {
+        Box(Modifier.size(48.dp), contentAlignment = Alignment.Center) {
+            CircularProgressIndicator(Modifier.size(22.dp), strokeWidth = 2.dp)
         }
-        when {
-            busy -> Box(Modifier.size(48.dp), contentAlignment = Alignment.Center) {
-                CircularProgressIndicator(Modifier.size(22.dp), strokeWidth = 2.dp)
-            }
-            ep.state == "processed" -> Box(Modifier.size(48.dp), contentAlignment = Alignment.Center) {
-                Icon(Icons.Filled.CheckCircle, contentDescription = "Processed",
-                    tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(22.dp))
-            }
-            else -> FilledTonalIconButton(onClick = onProcess) {
-                Icon(Icons.Filled.Download, contentDescription = "Process (download and transcribe)")
-            }
+    } else {
+        FilledTonalIconButton(onClick = onProcess) {
+            Icon(Icons.Filled.Download, contentDescription = "Process (download and transcribe)")
         }
+    }
+}
+
+/** The archive button on a New row. */
+@Composable
+fun ArchiveWaitingButton(enabled: Boolean, onArchive: () -> Unit) {
+    IconButton(onClick = onArchive, enabled = enabled) {
+        Icon(
+            Icons.Outlined.Inventory2,
+            contentDescription = "Archive",
+            tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f),
+        )
     }
 }
 
@@ -355,7 +455,7 @@ private fun BadgeLabel(icon: ImageVector, text: String, tint: Color) {
 }
 
 /** "Today" / "Yesterday" / "Oct 12" / "Oct 12, 2024". */
-private fun relativeDay(ms: Long): String {
+fun relativeDay(ms: Long): String {
     val now = java.util.Calendar.getInstance()
     val then = java.util.Calendar.getInstance().apply { timeInMillis = ms }
     val sameYear = now.get(java.util.Calendar.YEAR) == then.get(java.util.Calendar.YEAR)
