@@ -1,6 +1,7 @@
 package com.readlater.app
 
 import android.Manifest
+import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
@@ -22,8 +23,17 @@ import com.readlater.app.ui.HighlightsScreen
 import com.readlater.app.ui.ReadLaterTheme
 import com.readlater.app.ui.ReaderScreen
 import com.readlater.app.ui.SettingsScreen
+import kotlinx.coroutines.flow.MutableStateFlow
 
 class MainActivity : ComponentActivity() {
+
+    companion object {
+        /** Article id to open, from a notification (ShareUploadService's "ready"). */
+        const val EXTRA_OPEN_ARTICLE = "openArticle"
+    }
+
+    /** An article a notification asked to open, until the nav graph takes it. */
+    private val openRequest = MutableStateFlow<String?>(null)
 
     private val notificationPermissionLauncher =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) {
@@ -42,6 +52,7 @@ class MainActivity : ComponentActivity() {
         }
 
         val app = application as ReadLaterApp
+        if (savedInstanceState == null) takeOpenRequest(intent)
 
         setContent {
             ReadLaterTheme {
@@ -55,8 +66,14 @@ class MainActivity : ComponentActivity() {
                     if (!resumeHandled) {
                         resumeHandled = true
                         val last = app.settings.lastArticleId
-                        if (last.isNotBlank()) navController.navigate("reader/$last")
+                        if (last.isNotBlank() && openRequest.value == null) navController.navigate("reader/$last")
                     }
+                }
+                val requested by openRequest.collectAsState()
+                LaunchedEffect(requested) {
+                    val id = requested ?: return@LaunchedEffect
+                    openRequest.value = null
+                    navController.navigate("reader/$id") { popUpTo("list") }
                 }
 
                 NavHost(navController = navController, startDestination = "list") {
@@ -102,5 +119,14 @@ class MainActivity : ComponentActivity() {
                 }
             }
         }
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        takeOpenRequest(intent)
+    }
+
+    private fun takeOpenRequest(intent: Intent?) {
+        intent?.getStringExtra(EXTRA_OPEN_ARTICLE)?.takeIf { it.isNotBlank() }?.let { openRequest.value = it }
     }
 }

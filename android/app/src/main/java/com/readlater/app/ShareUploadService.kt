@@ -2,6 +2,7 @@ package com.readlater.app
 
 import android.app.NotificationChannel
 import android.app.NotificationManager
+import android.app.PendingIntent
 import android.app.Service
 import android.content.Context
 import android.content.Intent
@@ -15,10 +16,12 @@ import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
 import androidx.core.content.ContextCompat
 import com.readlater.app.data.PodcastFiles
+import com.readlater.app.data.RemoteArticle
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
@@ -34,13 +37,27 @@ import java.io.IOException
  * as an error toast about an episode that was already transcribing. A foreground
  * service outlives the activity, and keeps the process from being frozen as a
  * cached app halfway through a long upload.
+ *
+ * Once the upload lands the service stays up until the transcript does, polling
+ * the article, and then posts a notification that opens it. The server has no
+ * way to push to the phone, and the episode is no use until it's transcribed,
+ * so "it's ready" is the notification worth having.
  */
 class ShareUploadService : Service() {
 
     companion object {
         private const val CHANNEL_ID = "uploads"
         private const val NOTIFICATION_ID = 2
+        /** Separate from [CHANNEL_ID] so "ready" can make a sound while the
+         *  ongoing progress notification stays silent. */
+        private const val READY_CHANNEL_ID = "transcripts"
         private const val EXTRA_TITLE_HINT = "titleHint"
+
+        /** How often to check on a transcription, and when to stop. A long
+         *  episode takes a few minutes, but the server transcribes one at a
+         *  time, so a share can wait behind feed episodes. */
+        private const val POLL_MS = 20_000L
+        private const val POLL_LIMIT_MS = 2 * 60 * 60 * 1000L
 
         /** Matches AUDIO_IMPORT_MAX_BYTES on the server, which hangs up past it.
          *  Checked here so an oversized episode says so instead of failing at the
@@ -69,22 +86,19 @@ class ShareUploadService : Service() {
 
     override fun onCreate() {
         super.onCreate()
-        (getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager).createNotificationChannel(
+        val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        nm.createNotificationChannel(
             NotificationChannel(CHANNEL_ID, "Episode uploads", NotificationManager.IMPORTANCE_LOW)
+        )
+        nm.createNotificationChannel(
+            NotificationChannel(READY_CHANNEL_ID, "Transcripts ready", NotificationManager.IMPORTANCE_DEFAULT)
         )
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         // Must be foreground within seconds of startForegroundService, whatever follows.
-        val notification = NotificationCompat.Builder(this, CHANNEL_ID)
-            .setSmallIcon(R.drawable.ic_notification)
-            .setContentTitle("Sending episode to ${getString(R.string.app_name)}")
-            .setProgress(0, 0, true)
-            .setOngoing(true)
-            .setSilent(true)
-            .build()
         ServiceCompat.startForeground(
-            this, NOTIFICATION_ID, notification,
+            this, NOTIFICATION_ID, progressNotification("Sending episode to ${getString(R.string.app_name)}"),
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC else 0
         )
         val uri = intent?.data
@@ -109,6 +123,75 @@ class ShareUploadService : Service() {
         super.onDestroy()
     }
 
+    private fun progressNotification(title: String) =
+        NotificationCompat.Builder(this, CHANNEL_ID)
+            .setSmallIcon(R.drawable.ic_notification)
+            .setContentTitle(title)
+            .setProgress(0, 0, true)
+            .setOngoing(true)
+            .setSilent(true)
+            .build()
+
+    private fun showProgress(title: String) = runCatching {
+        (getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager)
+            .notify(NOTIFICATION_ID, progressNotification(title))
+    }
+
+    /** The server's stub says "Transcribing…" until the transcript replaces it
+     *  (server.js pumpStt), or "Transcription failed" if it couldn't. */
+    private fun RemoteArticle.transcribing() = excerpt == "Transcribing…"
+    private fun RemoteArticle.failed() = excerpt == "Transcription failed"
+
+    /** Wait out the server's transcription of [first], then say it's ready.
+     *  A network hiccup just means another try; a deleted article ends it. */
+    private suspend fun awaitTranscript(app: ReadLaterApp, first: RemoteArticle) {
+        var article = first
+        val deadline = System.currentTimeMillis() + POLL_LIMIT_MS
+        while (article.transcribing()) {
+            if (System.currentTimeMillis() > deadline) {
+                notifyDone(article, "Still transcribing", article.title)
+                return
+            }
+            delay(POLL_MS)
+            article = try {
+                app.apiClient.getArticle(article.id)
+            } catch (e: IOException) {
+                if (e.message?.startsWith("Server error 404") == true) return
+                continue
+            }
+        }
+        runCatching { app.repository.syncNow() } // so the tap opens the transcript, not the stub
+        notifyDone(
+            article,
+            if (article.failed()) "Transcription failed" else "Ready in ${getString(R.string.app_name)}",
+            article.title,
+        )
+    }
+
+    /** One notification per episode, tapping through to it. */
+    private fun notifyDone(article: RemoteArticle, title: String, text: String) {
+        val open = Intent(this, MainActivity::class.java)
+            .putExtra(MainActivity.EXTRA_OPEN_ARTICLE, article.id)
+            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP)
+        val requestCode = article.id.hashCode()
+        val notification = NotificationCompat.Builder(this, READY_CHANNEL_ID)
+            .setSmallIcon(R.drawable.ic_notification)
+            .setContentTitle(title)
+            .setContentText(text)
+            .setContentIntent(
+                PendingIntent.getActivity(
+                    this, requestCode, open,
+                    PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+                )
+            )
+            .setAutoCancel(true)
+            .build()
+        // Notification permission denied: no notification, nothing else lost.
+        runCatching {
+            (getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager).notify(requestCode, notification)
+        }
+    }
+
     private fun stopNow() {
         ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
         stopSelf()
@@ -128,6 +211,7 @@ class ShareUploadService : Service() {
             else "Sending episode to ${getString(R.string.app_name)}…"
         )
         var spool: File? = null
+        var imported: RemoteArticle? = null
         try {
             // Copy out of the sending app before uploading, rather than
             // streaming the upload straight from its content:// URI. Pocket
@@ -141,7 +225,7 @@ class ShareUploadService : Service() {
             val size = file.length()
             if (size > MAX_AUDIO_BYTES) { tooBig(size); return }
             val hash = withContext(Dispatchers.IO) { PodcastFiles.hashOf(file) }
-            val title = try {
+            val article = try {
                 app.apiClient.importAudio(uploadName(name, titleHint), size) { file.inputStream() }
             } finally {
                 // Kept for playing the episode itself, whichever way the upload
@@ -152,7 +236,8 @@ class ShareUploadService : Service() {
                     runCatching { app.podcastFiles.keep(file, hash, audioExt(name)) }
                 }
             }
-            toast("Transcribing: $title")
+            imported = article
+            if (article.transcribing()) toast("Transcribing: ${article.title}")
             runCatching { app.repository.syncNow() } // the stub shows up in the list
         } catch (e: Exception) {
             // A genuine network failure can still come after the server has
@@ -164,6 +249,11 @@ class ShareUploadService : Service() {
             toast("Couldn't confirm: ${e.message ?: "error"} — check the list, it may have saved anyway")
         } finally {
             spool?.delete() // no-op once kept; clears a spool that never got that far
+        }
+        // Outside the try: cancelling the wait isn't an upload failure.
+        imported?.let {
+            if (it.transcribing()) showProgress("Transcribing: ${it.title}")
+            awaitTranscript(app, it)
         }
     }
 

@@ -43,8 +43,8 @@ android {
         create("podcasts") {
             dimension = "app"
             applicationId = "com.readlater.podcasts"
-            versionCode = 4
-            versionName = "1.3"
+            versionCode = 5
+            versionName = "1.4"
             buildConfigField("boolean", "PODCAST_APP", "true")
             buildConfigField("String", "SIBLING_PACKAGE", "\"com.readlater.app\"")
             buildConfigField("String", "APK_NAME", "\"podcasts\"")

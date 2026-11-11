@@ -402,7 +402,8 @@ class ApiClient(private val settings: Settings) {
     /**
      * POST /api/import/audio — a podcast episode shared out of a player, which
      * the server transcribes in the background. Returns straight away with a
-     * "Transcribing…" stub; the text lands on a later sync.
+     * "Transcribing…" stub (or the finished article, when this file was already
+     * transcribed); the text lands on a later sync.
      *
      * The body is streamed from [openStream] rather than passed as a ByteArray:
      * a two-hour episode is ~85MB, and holding that in the heap is how a phone
@@ -416,7 +417,7 @@ class ApiClient(private val settings: Settings) {
         filename: String,
         contentLength: Long,
         openStream: () -> InputStream,
-    ): String {
+    ): RemoteArticle {
         val body = object : RequestBody() {
             override fun contentType() = audioMediaType
             override fun contentLength() = contentLength
@@ -430,7 +431,7 @@ class ApiClient(private val settings: Settings) {
                 .build(),
             uploadClient,
         )
-        return JSONObject(response).optString("title", "Episode")
+        return parseArticle(JSONObject(response))
     }
 
     /**
