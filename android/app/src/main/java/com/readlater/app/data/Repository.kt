@@ -253,6 +253,31 @@ class Repository(
             null // reached the end of the view
         }
 
+    /**
+     * Sleep mode: a random long article from the archive, skipping [exclude]
+     * (the ones already offered this time). Steps down the length bar rather
+     * than coming back empty when the long ones run out.
+     */
+    suspend fun randomSleepArticle(exclude: Collection<String>): ArticleEntity? =
+        withContext(Dispatchers.IO) {
+            val ex = exclude.toList()
+            for (minWords in intArrayOf(5000, 3000, 1500)) {
+                articleDao.randomLongArchived(minWords, ex)?.let { return@withContext it }
+            }
+            // Everything long has been offered: start the round again.
+            if (ex.isNotEmpty()) articleDao.randomLongArchived(3000, emptyList()) else null
+        }
+
+    /** Make sure [id]'s body is on the phone (archived ones usually aren't)
+     *  and return the article with it. */
+    suspend fun articleWithBody(id: String): Result<ArticleEntity> = withContext(Dispatchers.IO) {
+        articleDao.getById(id)?.takeIf { !it.html.isNullOrBlank() }?.let { return@withContext Result.success(it) }
+        fetchArticleBody(id).mapCatching {
+            articleDao.getById(id)?.takeIf { a -> !a.html.isNullOrBlank() }
+                ?: error("the article has no text")
+        }
+    }
+
     fun highlightsFor(articleId: String): Flow<List<HighlightEntity>> =
         highlightDao.byArticle(articleId)
 

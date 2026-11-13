@@ -23,6 +23,8 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.Notes
 import androidx.compose.material.icons.automirrored.filled.OpenInNew
 import androidx.compose.material.icons.automirrored.filled.Sort
+import androidx.compose.material.icons.filled.Bedtime
+import androidx.compose.material.icons.filled.Shuffle
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Archive
 import androidx.compose.material.icons.filled.Check
@@ -197,6 +199,7 @@ fun ArticleListScreen(
         mutableStateOf(runCatching { SortMode.valueOf(app.settings.listSort) }.getOrDefault(SortMode.NEWEST))
     }
     var sortMenuOpen by remember { mutableStateOf(false) }
+    var sleepOpen by remember { mutableStateOf(false) }
     // Stable shuffle: the seed survives recomposition AND the order is derived
     // per-article from (seed, id), so the list does not reorder when its
     // contents change. A new seed (re-tapping Random) gives a fresh order.
@@ -534,6 +537,23 @@ fun ArticleListScreen(
         }
     }
 
+    if (sleepOpen) SleepModeDialog(repo = repo, onDismiss = { sleepOpen = false })
+
+    /** Sleep mode's quick swap from the playing bar. */
+    var sleepSwapping by remember { mutableStateOf(false) }
+    fun sleepSwap() {
+        if (sleepSwapping) return
+        sleepSwapping = true
+        scope.launch {
+            val next = repo.randomSleepArticle(listOfNotNull(ttsState.articleId))
+            if (next == null) snackbarHostState.showSnackbar("No other long articles in the archive")
+            else playSleepArticle(context, repo, next, timerMinutes = null).onFailure {
+                snackbarHostState.showSnackbar("Couldn't load “${next.title}”: ${it.message ?: "offline?"}")
+            }
+            sleepSwapping = false
+        }
+    }
+
     Scaffold(
         snackbarHost = { SnackbarHost(snackbarHostState) },
         topBar = {
@@ -594,6 +614,11 @@ fun ArticleListScreen(
                             }
                         }
                     }
+                    if (!podcastApp && !searchActive) {
+                        IconButton(onClick = { sleepOpen = true }) {
+                            Icon(Icons.Filled.Bedtime, contentDescription = "Sleep mode")
+                        }
+                    }
                     if (!podcastApp) {
                         IconButton(onClick = onOpenHighlights) {
                             Icon(Icons.Filled.FormatQuote, contentDescription = "Highlights")
@@ -646,7 +671,7 @@ fun ArticleListScreen(
                                     ttsState.preparing -> "PREPARING AUDIO…"
                                     ttsState.isPlaying -> "NOW PLAYING"
                                     else -> "PAUSED"
-                                },
+                                } + if (ttsState.sleepMode) " · SLEEP MODE" else "",
                                 style = MaterialTheme.typography.labelSmall,
                                 color = MaterialTheme.colorScheme.primary
                             )
@@ -662,6 +687,11 @@ fun ArticleListScreen(
                                 modifier = Modifier.size(24.dp).padding(end = 4.dp),
                                 strokeWidth = 2.dp
                             )
+                        }
+                        if (ttsState.sleepMode) {
+                            IconButton(onClick = { sleepSwap() }, enabled = !sleepSwapping) {
+                                Icon(Icons.Filled.Shuffle, contentDescription = "Different article")
+                            }
                         }
                         IconButton(onClick = {
                             sendTts(context, if (ttsState.isPlaying) TtsService.ACTION_PAUSE else TtsService.ACTION_RESUME)

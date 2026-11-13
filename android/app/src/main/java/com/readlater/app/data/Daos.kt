@@ -53,6 +53,21 @@ interface ArticleDao {
     )
     fun problemArticles(): Flow<List<ArticleEntity>>
 
+    /** Sleep mode's pick: a random archived article of at least [minWords]
+     *  that a voice can read — not a podcast episode (it would play its own
+     *  audio), not a flagged save, not a highlights-only stub. Metadata only;
+     *  the body is fetched once the pick is confirmed. */
+    @Query(
+        "SELECT id, url, title, byline, siteName, excerpt, NULL AS html, savedAt, updatedAt, " +
+            "archived, favorite, readParagraph, dirty, wordCount, paragraphCount, ttsParagraph, " +
+            "imageUrl, publishedAt, problem, problemDetail, audioUrl FROM articles " +
+            "WHERE archived = 1 AND problem = 0 AND audioUrl IS NULL AND url NOT LIKE 'audio:%' " +
+            "AND wordCount >= :minWords " +
+            "AND (source IS NULL OR source NOT IN ('kindle', 'browser-highlight')) " +
+            "AND id NOT IN (:exclude) ORDER BY RANDOM() LIMIT 1"
+    )
+    suspend fun randomLongArchived(minWords: Int, exclude: List<String>): ArticleEntity?
+
     @Query("SELECT * FROM articles WHERE id = :id")
     fun articleFlow(id: String): Flow<ArticleEntity?>
 

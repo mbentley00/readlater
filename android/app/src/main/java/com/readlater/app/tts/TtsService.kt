@@ -54,7 +54,9 @@ data class TtsPlaybackState(
     /** Binge mode: archive each article on completion and play the next. */
     val autoAdvance: Boolean = false,
     /** Playing a shared podcast episode's own audio (not a voice reading its transcript). */
-    val podcast: Boolean = false
+    val podcast: Boolean = false,
+    /** Sleep mode: a random long archive article at a fixed speed (see EXTRA_SPEED). */
+    val sleepMode: Boolean = false
 )
 
 /**
@@ -88,6 +90,12 @@ class TtsService : Service() {
         const val EXTRA_ARTICLE_ID = "articleId"
         const val EXTRA_START_PARAGRAPH = "startParagraph"
         const val EXTRA_SLEEP_MINUTES = "sleepMinutes"
+
+        /** On ACTION_PLAY: speak at this rate instead of the voice settings,
+         *  without changing them — sleep mode. Lasts until Stop, or until a
+         *  PLAY that sets the queue mode (EXTRA_AUTO_ADVANCE), i.e. a normal
+         *  listen started from the reader. */
+        const val EXTRA_SPEED = "speed"
 
         /** On ACTION_PLAY: also switch auto-advance on, so this article plays and
          *  then keeps going through the inbox. Only ever enables it — the
@@ -210,6 +218,11 @@ class TtsService : Service() {
     // plays the next inbox article, chaining until the user stops. Survives
     // pause/resume and the hop between articles; cleared only by Stop.
     private var autoAdvance = false
+
+    /** Sleep mode's fixed speed; 0 = use the voice settings. */
+    private var rateOverride = 0f
+    private fun deviceRate(): Float = if (rateOverride > 0f) rateOverride else app.settings.ttsSpeechRate
+    private fun serverRate(): Float = if (rateOverride > 0f) rateOverride else app.settings.serverSpeechRate
     // elapsedRealtime() when the current paragraph began playing — lets a
     // double-tap highlight tell "just crossed into this paragraph" from
     // "well into it" without per-word position tracking.
@@ -447,6 +460,13 @@ class TtsService : Service() {
             if (intent.hasExtra(EXTRA_AUTO_ADVANCE)) {
                 autoAdvance = intent.getBooleanExtra(EXTRA_AUTO_ADVANCE, false)
             }
+            // Sleep mode's speed: set by its PLAY; a reader-started listen
+            // (which always states its queue mode) goes back to the settings.
+            if (intent.hasExtra(EXTRA_SPEED)) {
+                rateOverride = intent.getFloatExtra(EXTRA_SPEED, 0f).coerceIn(0f, 2f)
+            } else if (intent.hasExtra(EXTRA_AUTO_ADVANCE)) {
+                rateOverride = 0f
+            }
             disarmArchive() // a pending confirmation never carries to a new article
             reviving = false
             // Make this the cold-start resume target: if the process is killed
@@ -667,7 +687,7 @@ class TtsService : Service() {
     /** Estimate per-block speech durations so the media session can expose a
      *  seekable timeline (lock-screen progress bar). */
     private fun recomputeDurations() {
-        val rate = app.settings.ttsSpeechRate
+        val rate = deviceRate()
         blockDurationsMs = LongArray(blocks.size) { i ->
             val len = speakableText(blocks[i])?.length ?: 0
             (len / (baseCharsPerSecond * rate) * 1000).toLong()
@@ -787,7 +807,7 @@ class TtsService : Service() {
     /** Skip forward by roughly 30 seconds of estimated speech, paragraph-granular. */
     private fun handleForward30() {
         if (articleId == null || blocks.isEmpty()) return
-        var remaining = 30f * baseCharsPerSecond * app.settings.ttsSpeechRate
+        var remaining = 30f * baseCharsPerSecond * deviceRate()
         var idx = currentIndex
         while (true) {
             remaining -= (blocks.getOrNull(idx)?.let { speakableText(it) }?.length ?: 0)
@@ -834,8 +854,8 @@ class TtsService : Service() {
         // A podcast's ms are the recording's own, spoken at a natural pace.
         val rate = when {
             podcastFile != null -> 1.0f
-            serverMode -> app.settings.serverSpeechRate
-            else -> app.settings.ttsSpeechRate
+            serverMode -> serverRate()
+            else -> deviceRate()
         }
         val msInto = if (serverMode && serverOffsetsMs.isNotEmpty()) {
             (trackPositionMs() - msForBlock(currentIndex)).coerceAtLeast(0)
@@ -1029,6 +1049,7 @@ class TtsService : Service() {
         isPlaying = false
         disarmArchive()
         autoAdvance = false // Stop is the "user intervenes" that ends a binge
+        rateOverride = 0f // ...and sleep mode
         tts?.stop()
         mainHandler.removeCallbacks(sleepRunnable)
         sleepTimerEndsAt = 0L
@@ -2037,7 +2058,7 @@ class TtsService : Service() {
         val engine = tts ?: return
         val text = synthTextFor(idx) ?: return
         synthesizing.add(idx)
-        engine.setSpeechRate(app.settings.ttsSpeechRate)
+        engine.setSpeechRate(deviceRate())
         val chunks = chunkForSynthesis(text)
         if (chunks.size == 1) {
             logDbg("synth queue idx=$idx (${text.length} chars) engine=${initializedEngine ?: "system"}")
@@ -2345,7 +2366,7 @@ class TtsService : Service() {
     /** Speed for the whole-file player: the podcast setting for an episode,
      *  the server voice's otherwise. */
     private fun fileSpeed(): Float =
-        if (podcastFile != null) app.settings.podcastSpeed else app.settings.serverSpeechRate
+        if (podcastFile != null) app.settings.podcastSpeed else serverRate()
 
     /**
      * Buffer for a whole-file track that will run at [speed]. AudioTrack only
@@ -2377,7 +2398,7 @@ class TtsService : Service() {
         try {
             val channelMask = if (wav.channels >= 2) android.media.AudioFormat.CHANNEL_OUT_STEREO
                 else android.media.AudioFormat.CHANNEL_OUT_MONO
-            val minBuf = fileTrackBufferBytes(wav.sampleRate, channelMask, wav.channels * 2, app.settings.serverSpeechRate)
+            val minBuf = fileTrackBufferBytes(wav.sampleRate, channelMask, wav.channels * 2, serverRate())
             val track = android.media.AudioTrack.Builder()
                 .setAudioAttributes(playbackAudioAttributes)
                 .setAudioFormat(
@@ -2398,7 +2419,7 @@ class TtsService : Service() {
             cancelAudioWatchdog()
             track.play()
             markTrackStarted()
-            applyTrackSpeed(track, app.settings.serverSpeechRate) // after play(): see applyTrackSpeed
+            applyTrackSpeed(track, serverRate()) // after play(): see applyTrackSpeed
             logDbg("playing (server) from=${fromMs}ms speed=$trackSpeed")
             publishState(); updatePlaybackState(); updateNotification()
 
@@ -2674,7 +2695,7 @@ class TtsService : Service() {
         currentIndex = idx
         audioStarted = false
         playToken++
-        engine.setSpeechRate(app.settings.ttsSpeechRate)
+        engine.setSpeechRate(deviceRate())
         // Same input-length limit applies to speak(); split long blocks and queue
         // the pieces. Only the last piece carries the un-suffixed "spk-<idx>" id
         // that advances to the next paragraph.
@@ -2820,7 +2841,8 @@ class TtsService : Service() {
     private fun publishState() {
         stateFlow.value = TtsPlaybackState(
             articleId, currentIndex, isPlaying, isPlaying && !audioStarted, serverMode, sleepTimerEndsAt, autoAdvance,
-            podcast = podcastFile != null
+            podcast = podcastFile != null,
+            sleepMode = rateOverride > 0f
         )
     }
 
