@@ -21,8 +21,8 @@ android {
         applicationId = "com.readlater.app"
         minSdk = 26
         targetSdk = 34
-        versionCode = 92
-        versionName = "5.51"
+        versionCode = 93
+        versionName = "5.52"
     }
 
     // Two apps from one codebase, signed with the same key and signed in to the

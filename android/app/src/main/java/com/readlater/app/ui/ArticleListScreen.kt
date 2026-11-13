@@ -614,6 +614,25 @@ fun ArticleListScreen(
                                     }
                                 )
                             }
+                            if (!podcastApp) {
+                                // The archive has no chip on the main screen;
+                                // it is opened (and left) from here.
+                                HorizontalDivider()
+                                DropdownMenuItem(
+                                    text = { Text(chipLabel("Archive", archiveCount)) },
+                                    leadingIcon = {
+                                        Icon(
+                                            if (showArchived) Icons.Filled.Check else Icons.Filled.Archive,
+                                            contentDescription = null
+                                        )
+                                    },
+                                    onClick = {
+                                        showArchived = !showArchived
+                                        showProblems = false; showPodcasts = false; selectedViewId = null
+                                        sortMenuOpen = false
+                                    }
+                                )
+                            }
                         }
                     }
                     if (!podcastApp && !searchActive) {
@@ -768,24 +787,6 @@ fun ArticleListScreen(
                     selected = !showArchived && !showProblems && !onPodcasts && selectedView == null,
                     onClick = { showArchived = false; showProblems = false; showPodcasts = false; selectedViewId = null },
                     label = { Text(chipLabel("Inbox", inboxCount), maxLines = 1) }
-                )
-                if (podcastsTab) {
-                    FilterChip(
-                        selected = onPodcasts && selectedView == null,
-                        onClick = {
-                            if (earshotLaunch != null) runCatching { context.startActivity(earshotLaunch) }
-                            else { showPodcasts = true; showArchived = false; showProblems = false; selectedViewId = null }
-                        },
-                        label = { Text(chipLabel("Podcasts", podcastCount?.plus(waitingAll.size)), maxLines = 1) },
-                        trailingIcon = if (earshotLaunch != null) {
-                            { Icon(Icons.AutoMirrored.Filled.OpenInNew, contentDescription = "Opens Hark", modifier = Modifier.size(16.dp)) }
-                        } else null
-                    )
-                }
-                FilterChip(
-                    selected = showArchived && selectedView == null,
-                    onClick = { showArchived = true; showProblems = false; showPodcasts = false; selectedViewId = null },
-                    label = { Text(chipLabel("Archive", archiveCount), maxLines = 1) }
                 )
                 // Hidden until there is something in it — an empty Problems tab
                 // is a chip asking about a problem you don't have.
