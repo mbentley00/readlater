@@ -545,11 +545,13 @@ fun ArticleListScreen(
         if (sleepSwapping) return
         sleepSwapping = true
         scope.launch {
-            val next = repo.randomSleepArticle(listOfNotNull(ttsState.articleId))
-            if (next == null) snackbarHostState.showSnackbar("No other long articles in the archive")
-            else playSleepArticle(context, repo, next, timerMinutes = null).onFailure {
-                snackbarHostState.showSnackbar("Couldn't load “${next.title}”: ${it.message ?: "offline?"}")
-            }
+            nextSleepPick(repo, SleepSource.of(app.settings.sleepSource), setOfNotNull(ttsState.articleId))
+                .onSuccess { next ->
+                    playSleepPick(context, repo, next, timerMinutes = null).onFailure {
+                        snackbarHostState.showSnackbar("Couldn't load “${next.title}”: ${it.message ?: "offline?"}")
+                    }
+                }
+                .onFailure { snackbarHostState.showSnackbar(it.message ?: "Couldn't find another article") }
             sleepSwapping = false
         }
     }

@@ -39,6 +39,7 @@ const skip = require('./skip');
 const { emailToCleanHtml } = require('./email');
 const { reparse, textOf } = require('./reparse');
 const youtube = require('./youtube');
+const sleepSources = require('./sleep');
 
 // Cap raw source we keep for reparse/"view original" so a single huge message
 // can't blow the data volume. Big enough for any real newsletter or page.
@@ -1737,6 +1738,64 @@ const server = http.createServer(async (req, res) => {
       console.log(`article saved [${source}] ${artUrl}`);
       fillSavedUrl(a.id, user.id, artUrl); // background fetch + extract
       return json(res, 201, pubArticleMeta(store.getArticle(a.id, user.id)));
+    }
+
+    // ---- sleep mode's outside sources (sleep.js). POST /api/sleep/candidate
+    // {source, exclude: [urls already offered]} → a random long article not in
+    // the library, without saving it. POST /api/sleep/save {url} → saves that
+    // one into the ARCHIVE and returns it in full, ready to play.
+    if (req.method === 'POST' && parts[1] === 'sleep' && parts[2] === 'candidate' && parts.length === 3) {
+      const b = parseBody(await readBody(req), req.headers['content-type']);
+      const source = String(b.source || '');
+      if (!sleepSources.SOURCES[source]) return json(res, 400, { error: 'unknown source' });
+      const exclude = new Set(Array.isArray(b.exclude) ? b.exclude.filter((u) => typeof u === 'string').slice(0, 500) : []);
+      try {
+        for (let i = 0; i < 4; i++) {
+          const art = await sleepSources.candidate(source, fetchPage, exclude);
+          if (!art) break;
+          // Already saved (an earlier night's pick, or saved by hand): the
+          // phone offers library articles itself, so look further.
+          if (store.articleByUrl(user.id, art.url)) { exclude.add(art.url); continue; }
+          const { html, textContent, ...meta } = art;
+          return json(res, 200, { ...meta, source });
+        }
+        return json(res, 404, { error: 'no long article found — try again' });
+      } catch (e) {
+        console.error(`sleep candidate (${source}) failed: ${e.message}`);
+        return json(res, 502, { error: e.message });
+      }
+    }
+    if (req.method === 'POST' && parts[1] === 'sleep' && parts[2] === 'save' && parts.length === 3) {
+      const b = parseBody(await readBody(req), req.headers['content-type']);
+      const artUrl = sanitizeString(b.url, 4000);
+      const source = artUrl && sleepSources.sourceOf(artUrl);
+      if (!source) return json(res, 400, { error: 'not a sleep-mode source url' });
+      const existing = store.articleByUrl(user.id, artUrl);
+      if (existing) return json(res, 200, pubArticle(existing));
+      let art;
+      try {
+        art = await sleepSources.article(artUrl, fetchPage);
+      } catch (e) {
+        return json(res, 502, { error: e.message });
+      }
+      const now = Date.now();
+      const a = {
+        id: newId(), userId: user.id, url: artUrl, savedAt: now,
+        archived: true, favorite: false, readParagraph: 0,
+        source: `sleep-${source}`,
+        ...withSkipRules(user.id, {
+          title: sanitizeString(art.title, 500) || artUrl,
+          byline: sanitizeString(art.byline, 200),
+          siteName: sanitizeString(art.siteName, 200),
+          excerpt: sanitizeString(art.excerpt, 500),
+          html: art.html,
+          textContent: art.textContent,
+          updatedAt: now,
+        }, artUrl),
+      };
+      store.insertArticle(a);
+      console.log(`article saved [${a.source}] ${artUrl} (${art.wordCount} words)`);
+      return json(res, 201, pubArticle(store.getArticle(a.id, user.id)));
     }
 
     // ---- single article

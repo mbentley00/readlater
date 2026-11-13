@@ -275,6 +275,31 @@ class ApiClient(private val settings: Settings) {
         }
     }
 
+    /** A sleep-mode pick from outside the library (server/sleep.js). */
+    data class SleepCandidate(
+        val url: String, val title: String, val byline: String?, val siteName: String?,
+        val excerpt: String?, val wordCount: Int, val source: String
+    )
+
+    /** POST /api/sleep/candidate — a random long article from [source]
+     *  ("historylink" | "cambridge") that isn't saved yet, skipping [exclude]. */
+    suspend fun sleepCandidate(source: String, exclude: Collection<String>): SleepCandidate {
+        val json = JSONObject().put("source", source).put("exclude", org.json.JSONArray(exclude.toList()))
+        val o = JSONObject(execute(builder("/api/sleep/candidate").post(json.toString().toRequestBody(jsonMediaType)).build()))
+        return SleepCandidate(
+            url = o.getString("url"), title = o.optString("title", o.getString("url")),
+            byline = o.stringOrNull("byline"), siteName = o.stringOrNull("siteName"),
+            excerpt = o.stringOrNull("excerpt"), wordCount = o.optInt("wordCount"), source = source
+        )
+    }
+
+    /** POST /api/sleep/save — save a sleep candidate into the archive; the
+     *  full article comes back. */
+    suspend fun sleepSave(url: String): RemoteArticle {
+        val json = JSONObject().put("url", url)
+        return parseArticle(JSONObject(execute(builder("/api/sleep/save").post(json.toString().toRequestBody(jsonMediaType)).build())))
+    }
+
     /** GET /api/articles/{id} — full article including html. */
     suspend fun getArticle(id: String): RemoteArticle {
         val body = execute(builder("/api/articles/$id").get().build())

@@ -153,6 +153,13 @@ class Settings(context: Context) {
             prefs.edit().putString(KEY_RESUME_ARTICLE, value).apply()
         }
 
+    /** Where sleep mode picks from: mix | archive | inbox | historylink | cambridge. */
+    var sleepSource: String
+        get() = prefs.getString("sleep_source", "mix").orEmpty().ifBlank { "mix" }
+        set(value) {
+            prefs.edit().putString("sleep_source", value).apply()
+        }
+
     /** Whether play-through was on for [resumeArticleId]. */
     var resumeAutoAdvance: Boolean
         get() = prefs.getBoolean(KEY_RESUME_AUTO_ADVANCE, false)

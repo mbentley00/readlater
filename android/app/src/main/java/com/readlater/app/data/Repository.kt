@@ -258,15 +258,41 @@ class Repository(
      * (the ones already offered this time). Steps down the length bar rather
      * than coming back empty when the long ones run out.
      */
-    suspend fun randomSleepArticle(exclude: Collection<String>): ArticleEntity? =
+    suspend fun randomSleepArticle(exclude: Collection<String>, inbox: Boolean = false): ArticleEntity? =
         withContext(Dispatchers.IO) {
             val ex = exclude.toList()
+            val find: suspend (Int, List<String>) -> ArticleEntity? = if (inbox) {
+                { w, e -> articleDao.randomLongInbox(w, e) }
+            } else {
+                { w, e -> articleDao.randomLongArchived(w, e) }
+            }
             for (minWords in intArrayOf(5000, 3000, 1500)) {
-                articleDao.randomLongArchived(minWords, ex)?.let { return@withContext it }
+                find(minWords, ex)?.let { return@withContext it }
             }
             // Everything long has been offered: start the round again.
-            if (ex.isNotEmpty()) articleDao.randomLongArchived(3000, emptyList()) else null
+            if (ex.isNotEmpty()) find(3000, emptyList()) else null
         }
+
+    /** A sleep-mode pick from a site outside the library (not saved yet). */
+    suspend fun sleepCandidate(source: String, exclude: Collection<String>): Result<ApiClient.SleepCandidate> =
+        runCatching { api.sleepCandidate(source, exclude) }
+
+    /** Save a sleep candidate (into the archive) and store it here, body and all. */
+    suspend fun saveSleepCandidate(url: String): Result<ArticleEntity> = withContext(Dispatchers.IO) {
+        runCatching {
+            val r = api.sleepSave(url)
+            val e = ArticleEntity(
+                id = r.id, url = r.url, title = r.title, byline = r.byline, siteName = r.siteName,
+                excerpt = r.excerpt, html = r.html, savedAt = r.savedAt, updatedAt = r.updatedAt,
+                archived = r.archived, favorite = r.favorite, readParagraph = r.readParagraph,
+                ttsParagraph = r.ttsParagraph, dirty = false, wordCount = r.wordCount,
+                paragraphCount = paragraphCountOf(r.html), imageUrl = r.imageUrl, publishedAt = r.publishedAt,
+                source = r.source, archivedAt = if (r.archived) System.currentTimeMillis() else null
+            )
+            articleDao.upsertAll(listOf(e))
+            e
+        }
+    }
 
     /** Make sure [id]'s body is on the phone (archived ones usually aren't)
      *  and return the article with it. */
