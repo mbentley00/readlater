@@ -28,7 +28,7 @@ const MAX_PER_POLL = 3;
 const POLL_INTERVAL_MS = 30 * 60 * 1000;
 
 /** A feed body past this is not a feed. */
-const FEED_MAX_BYTES = 8 * 1024 * 1024;
+const FEED_MAX_BYTES = 16 * 1024 * 1024;
 
 const UA = 'Earmark/1.0 (+podcast subscriptions)';
 
