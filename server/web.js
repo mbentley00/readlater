@@ -309,6 +309,8 @@ mark.flash { animation: hlflash 1.6s ease; }
 .hl-block .note { color:var(--muted); font-size:.9rem; }
 .hl-block .from { font-size:.8rem; font-family:system-ui,sans-serif; margin-top:.2rem; }
 .hl-count { font-size:.8rem; font-family:system-ui,sans-serif; color:var(--accent); white-space:nowrap; }
+.topic-why { font-size:.85rem; font-family:system-ui,sans-serif; margin:.3rem 0; }
+blockquote.topic-hl { margin:.35rem 0; padding:.1rem 0 .1rem .7rem; border-left:3px solid var(--accent); color:var(--muted); font-size:.9rem; }
 .rel-msg { padding:.4rem .8rem; }
 .rel-item { padding:.7rem .8rem; border-bottom:1px solid var(--line); }
 .rel-item:last-child { border-bottom:0; }
@@ -444,6 +446,7 @@ function page({ title, body, user, active = '', nonce = '', script = '', article
       <a href="/?src=phone" class="${active === 'phone' ? 'active' : ''}" title="Saved from the phone's share sheet and short enough (under ~5 minutes of text) that the fetch may have missed content — open the original and re-save from Firefox to be sure the right version was kept">From phone</a>
       <a href="/highlights" class="${active === 'highlights' ? 'active' : ''}">Highlights</a>
       <a href="/highlights?sort=random" class="${active === 'highlights-random' ? 'active' : ''}">Random Highlights</a>
+      <a href="/topics" class="${active === 'topics' ? 'active' : ''}" title="Find highlighted articles by what they are about, e.g. “eastern European history before 1900”">Topics</a>
     </nav>` : '<nav></nav>';
   const who = user ? `
     <div class="who">
@@ -2124,6 +2127,64 @@ ${total ? `<div class="meta">${total.toLocaleString('en-US')} article${total ===
   return { body, script: FILTER_SUBMIT_SCRIPT, setCookie };
 }
 
+const TOPICS_SCRIPT = `
+const f = document.querySelector('form.topic-search');
+if (f) f.addEventListener('submit', () => {
+  const b = f.querySelector('button'); b.disabled = true; b.textContent = 'Searching…';
+  const s = document.getElementById('topic-status');
+  if (s) s.textContent = 'Reading your library’s topic cards — this takes a few seconds.';
+});`;
+
+/** Highlighted articles found by topic (topics.js): the model reads every
+ *  article's topic card and picks the ones that fit the request. */
+async function topicsPage(ctx, user, url) {
+  const q = ((url && url.searchParams.get('q')) || '').trim().slice(0, 300);
+  const stats = ctx.store.topicStats(user.id);
+  const enabled = require('./llm').enabled();
+  const coverage = stats.carded < stats.highlighted
+    ? `Topic cards cover ${stats.carded.toLocaleString('en-US')} of ${stats.highlighted.toLocaleString('en-US')} highlighted articles; the rest are being written in the background.`
+    : `Searches all ${stats.highlighted.toLocaleString('en-US')} highlighted articles by what they are about.`;
+  const form = `<form class="search topic-search" method="get" action="/topics">
+  <input type="search" name="q" value="${escapeHtml(q)}" placeholder="A topic — e.g. eastern European history before 1900" autofocus>
+  <button class="act" type="submit">Search</button>
+  ${q ? '<a class="back" href="/topics">Clear</a>' : ''}
+</form>
+<div class="meta" id="topic-status">${escapeHtml(coverage)}</div>`;
+
+  if (!enabled) {
+    return { body: '<h1>Topics</h1><div class="empty">Topic search needs an Anthropic API key (ANTHROPIC_API_KEY) on the server.</div>' };
+  }
+  if (!q) return { body: `<h1>Topics</h1>${form}`, script: TOPICS_SCRIPT };
+
+  const found = await require('./topics').search(ctx.store, user.id, q);
+  const backTo = `/topics?q=${encodeURIComponent(q)}`;
+  const items = [];
+  for (const r of found.results) {
+    const a = ctx.store.topicArticleMeta(r.articleId, user.id);
+    if (!a) continue;
+    const hls = ctx.store.highlightsForArticle(a.id);
+    const shown = hls.slice(0, 3).map((h) => `<blockquote class="topic-hl">${escapeHtml(snipText(h.text, 280))}</blockquote>`).join('');
+    const more = hls.length > 3 ? `<div class="meta">+${hls.length - 3} more highlight${hls.length - 3 > 1 ? 's' : ''}</div>` : '';
+    const meta = [a.siteName || a.domain || null, r.fit === 'partial' ? 'partial match' : null]
+      .filter(Boolean).map(escapeHtml).join(' · ');
+    items.push(`<li>
+      <div class="main"><a class="title" href="${escapeHtml(readHref(a.id, backTo))}">${escapeHtml(a.title)}</a>
+      <div class="meta">${meta}</div>
+      <div class="topic-why">${escapeHtml(r.why)}</div>
+      ${shown}${more}</div>
+      <div class="actions"><span class="hl-count">${hls.length} highlight${hls.length === 1 ? '' : 's'}</span></div>
+    </li>`);
+  }
+  const warn = found.failed
+    ? `<div class="meta" style="color:#b3261e">Part of the library couldn’t be searched just now (${found.failed} of its sections failed), so some matches may be missing — try again in a minute.</div>`
+    : '';
+  const body = `<h1>Topics</h1>${form}${warn}
+${items.length
+    ? `<div class="meta">${items.length} article${items.length === 1 ? '' : 's'} about “${escapeHtml(q)}”.</div><ul class="articles">${items.join('\n')}</ul>`
+    : '<div class="empty">No highlighted articles fit that topic.</div>'}`;
+  return { body, script: TOPICS_SCRIPT };
+}
+
 function settingsPage(ctx, user, url, req) {
   const feedList = ctx.store.listFeeds(user.id);
   const feedIntervalMinutes = Math.round(require('./feeds').POLL_INTERVAL_MS / 60000);
@@ -2586,6 +2647,8 @@ async function handle(ctx, req, res, url) {
     const random = url.searchParams.get('sort') === 'random';
     title = random ? 'Random highlights' : 'Highlights';
     active = random ? 'highlights-random' : 'highlights';
+  } else if (route === 'GET /topics') {
+    made = await topicsPage(ctx, user, url); title = 'Topics'; active = 'topics';
   } else if (route === 'GET /settings') {
     made = settingsPage(ctx, user, url, req); title = 'Settings'; active = 'settings';
   } else if (route === 'GET /favicon.ico') {

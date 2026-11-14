@@ -567,6 +567,15 @@ async function main() {
     assert.ok(html.includes('1 highlight'), 'highlights page shows per-article count');
     assert.ok(html.includes(`/read/${articleId}`), 'highlights page links to the article');
 
+    // topics page: the form and coverage line render (search itself is covered
+    // by testTopics; this server's mock LLM only speaks HTML)
+    res = await fetch(BASE + '/topics', { headers: { Cookie: aliceCookie } });
+    html = await res.text();
+    assert.strictEqual(res.status, 200);
+    assert.ok(html.includes('class="search topic-search"') && html.includes('highlighted articles'), 'topics page renders its search form');
+    res = await fetch(BASE + '/topics?q=history', { headers: { Cookie: aliceCookie } });
+    assert.strictEqual(res.status, 200, 'a topic search with no cards yet still renders');
+
     res = await fetch(BASE + '/settings', { headers: { Cookie: aliceCookie } });
     html = await res.text();
     assert.ok(html.includes(TOKEN), 'settings shows the API token');
@@ -1877,6 +1886,97 @@ async function main() {
   }
 }
 
+/** Topic cards and topic search (topics.js) against an in-process store and a
+ *  mock Anthropic API: cards are written per highlighted article, the search
+ *  sees them as catalogue lines, invented ids are dropped, strong matches
+ *  rank above partial ones, and an unchanged library is answered from cache. */
+async function testTopics() {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'readlater-topics-'));
+  const requests = [];
+  const mock = http.createServer((req, res) => {
+    let body = '';
+    req.on('data', (c) => { body += c; });
+    req.on('end', () => {
+      const b = JSON.parse(body);
+      const system = Array.isArray(b.system) ? b.system.map((x) => x.text).join('\n') : b.system;
+      let out;
+      if (system.startsWith('You catalogue') || system.includes('Catalogue:')) requests.push(b);
+      if (system.startsWith('You catalogue')) {
+        const polish = /Partitions/.test(b.messages[0].content);
+        out = polish
+          ? { summary: 'The partitions of Poland.', subjects: ['history', 'partitions of Poland'], places: ['Poland', 'Eastern Europe'], from: 1795, to: 1772 }
+          : { summary: 'Sourdough baking.', subjects: ['baking'], places: [], from: null, to: null };
+      } else if (!system.includes('Catalogue:')) {
+        // Another test's LLM call running concurrently in this process.
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify({ id: 'msg_o', type: 'message', role: 'assistant', model: b.model,
+          content: [{ type: 'text', text: 'NONE' }], stop_reason: 'end_turn', stop_sequence: null,
+          usage: { input_tokens: 1, output_tokens: 1 } }));
+      } else {
+        const ids = [...system.matchAll(/^#(\d+) \| ([^|]*)\|/gm)];
+        const pl = ids.find((m) => /Partitions/.test(m[2]));
+        out = { matches: [{ id: 999999, fit: 'strong', why: 'invented' },
+          { id: Number(ids[0][1]) === Number(pl[1]) ? Number(ids[1][1]) : Number(ids[0][1]), fit: 'partial', why: 'side theme' },
+          { id: Number(pl[1]), fit: 'strong', why: 'Poland, 1772–1795' }] };
+      }
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ id: 'msg_t', type: 'message', role: 'assistant', model: b.model,
+        content: [{ type: 'thinking', thinking: '', signature: 'x' }, { type: 'text', text: JSON.stringify(out) }],
+        stop_reason: 'end_turn', stop_sequence: null, usage: { input_tokens: 10, output_tokens: 10 } }));
+    });
+  });
+  await new Promise((r) => mock.listen(0, '127.0.0.1', r));
+  const saved = { key: process.env.ANTHROPIC_API_KEY, url: process.env.ANTHROPIC_BASE_URL };
+  process.env.ANTHROPIC_API_KEY = 'sk-ant-test-not-real';
+  process.env.ANTHROPIC_BASE_URL = `http://127.0.0.1:${mock.address().port}`;
+  const store = require('./db').open(dir);
+  try {
+    const topics = require('./topics');
+    const now = Date.now();
+    const art = (id, title) => store.insertArticle({ id, userId: 'u1', url: `https://ex.com/${id}`, savedAt: now,
+      archived: false, favorite: false, readParagraph: 0, byline: null, siteName: null, excerpt: null,
+      title, html: `<p>${title} body text.</p>`, updatedAt: now });
+    art('t1', 'The Partitions of Poland'); art('t2', 'Bread at home'); art('t3', 'Never highlighted');
+    store.insertHighlight({ id: 'h1', userId: 'u1', clientId: null, note: null, paragraphIndex: null, articleId: 't1', text: 'Prussia, Russia and Austria divided the Commonwealth.', createdAt: now });
+    store.insertHighlight({ id: 'h2', userId: 'u1', clientId: null, note: null, paragraphIndex: null, articleId: 't2', text: 'Feed the starter twice a day.', createdAt: now });
+
+    assert.strictEqual(await topics.cardBatch(store), 2, 'one card per highlighted article');
+    assert.strictEqual(store.topicPending(10).length, 0, 'nothing left pending');
+    assert.strictEqual(requests.length, 2);
+    assert.strictEqual(requests[0].model, 'claude-haiku-5-5');
+    assert.strictEqual(requests[0].output_config.format.type, 'json_schema', 'cards use structured output');
+    const cards = store.topicCards('u1');
+    const pol = JSON.parse(cards.find((c) => c.articleId === 't1').card);
+    assert.deepStrictEqual([pol.from, pol.to], [1772, 1795], 'reversed year span is put in order');
+    assert.match(topics.catalogueLine(1, pol), /^#1 \| The Partitions of Poland \| - \| 1772–1795 \| Poland; Eastern Europe \|/);
+
+    let found = await topics.search(store, 'u1', 'eastern European history before 1900');
+    assert.strictEqual(requests.length, 3, 'one shard, one search request');
+    assert.strictEqual(requests[2].system[1].cache_control.type, 'ephemeral', 'catalogue is prompt-cached');
+    assert.deepStrictEqual(found.results.map((r) => [r.articleId, r.fit]), [['t1', 'strong'], ['t2', 'partial']],
+      'invented id dropped, strong ranked above partial');
+    assert.strictEqual(found.searched, 2);
+    found = await topics.search(store, 'u1', 'Eastern European history before 1900 ');
+    assert.strictEqual(requests.length, 3, 'same query on an unchanged library comes from cache');
+
+    store.insertHighlight({ id: 'h3', userId: 'u1', clientId: null, note: null, paragraphIndex: null, articleId: 't2', text: 'Salt last.', createdAt: now + 1 });
+    assert.deepStrictEqual(store.topicPending(10).map((p) => p.articleId), ['t2'], 'a new highlight makes the card stale');
+
+    // Shards split on size and keep card order.
+    const many = Array.from({ length: 5000 }, (_, i) => ({ n: i + 1, card: { ...pol, summary: 'x'.repeat(80) } }));
+    const shards = topics.shardsOf(many);
+    assert.ok(shards.length >= 2 && shards.every((sh) => sh.join('\n').length <= 240000), 'shards stay under the size cap');
+    assert.ok(shards[1][0].startsWith(`#${shards[0].length + 1} |`), 'shards continue in card order');
+    console.log('  topic cards and topic search ✔');
+  } finally {
+    mock.close();
+    process.env.ANTHROPIC_API_KEY = saved.key; process.env.ANTHROPIC_BASE_URL = saved.url;
+    if (saved.key === undefined) delete process.env.ANTHROPIC_API_KEY;
+    if (saved.url === undefined) delete process.env.ANTHROPIC_BASE_URL;
+    store.close?.();
+  }
+}
+
 /**
  * The Dockerfile lists source files by name, so adding a module and forgetting
  * to COPY it produces an image that crashes on boot with "Cannot find module".
@@ -2687,6 +2787,8 @@ testNewYorkerCartoons();
 testChunkedBodyMerge();
 testLiteraryReviewByline();
 testEmailPreambleTrim();
-testReparseEngine().catch((e) => { console.error(e); process.exit(1); });
+const reparseDone = testReparseEngine().catch((e) => { console.error(e); process.exit(1); });
 checkDockerfileCopiesEveryModule();
-main().catch((e) => { console.error(e); process.exit(1); });
+// testTopics points this process's Anthropic client at its own mock, so it
+// waits for the reparse checks (which must see the LLM disabled) to finish.
+reparseDone.then(() => testTopics()).then(() => main()).catch((e) => { console.error(e); process.exit(1); });

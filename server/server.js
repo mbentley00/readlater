@@ -28,6 +28,7 @@ const crypto = require('crypto');
 const web = require('./web');
 const { open, hostOf } = require('./db');
 const llm = require('./llm');
+const topics = require('./topics');
 const { extractReadable } = require('./extract');
 const pdf = require('./pdf');
 const epub = require('./epub');
@@ -2451,6 +2452,8 @@ server.listen(PORT, '0.0.0.0', () => {
   const repair = () => repairProblems().catch((e) => console.error(`problems: repair failed (${e.message})`));
   setTimeout(repair, 2 * 60 * 1000).unref();
   setInterval(repair, REPAIR_INTERVAL_MS).unref();
+  // Topic cards for the /topics search, kept current in the background.
+  topics.startWorker(store);
   const feedCount = store.listAllFeeds().length;
   if (feedCount) {
     console.log(`feeds: ${feedCount} podcast subscription(s), checked every ${feeds.POLL_INTERVAL_MS / 60000} min`);

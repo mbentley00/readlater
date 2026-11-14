@@ -308,6 +308,26 @@ CREATE TABLE IF NOT EXISTS article_audio (
   addedAt INTEGER NOT NULL
 );
 
+-- Topic cards (topics.js): for each highlighted article, a short LLM-written
+-- description of what it is about — summary, subject tags, places, and the
+-- span of years it covers — so "eastern european history before 1900" can be
+-- answered by meaning rather than by words. A side table so the topic search
+-- reads a few hundred bytes per article instead of the articles rows' blobs.
+-- [n] is a small stable integer the model cites in its answers (cheaper and
+-- harder to garble than an article id); [sig] is the highlight count and
+-- newest highlight time the card was written from, so a card is rewritten when
+-- its highlights change. card = '' marks an article the model declined or
+-- couldn't describe — skipped until its highlights change.
+CREATE TABLE IF NOT EXISTS article_topics (
+  n INTEGER PRIMARY KEY,
+  articleId TEXT NOT NULL UNIQUE,
+  userId TEXT NOT NULL,
+  sig TEXT NOT NULL,
+  card TEXT NOT NULL,
+  updatedAt INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS article_topics_user ON article_topics(userId, n);
+
 CREATE VIRTUAL TABLE IF NOT EXISTS articles_fts USING fts5(
   title, byline, siteName, excerpt, textContent,
   content='articles', content_rowid='rowid'
@@ -1656,6 +1676,49 @@ function open(dataDir) {
       prep('hd', 'DELETE FROM highlights WHERE id = ? AND userId = ?').run(id, userId),
     deleteHighlightsForArticle: (articleId, userId) =>
       prep('hda', 'DELETE FROM highlights WHERE articleId = ? AND userId = ?').run(articleId, userId),
+
+    // ---------------- topic cards (topics.js)
+    /** Highlighted articles whose topic card is missing or was written from a
+     *  different set of highlights. Reads only the highlights table and the
+     *  small article_topics one. */
+    topicPending: (limit) => prep('topPend', `SELECT h.articleId, h.userId,
+        COUNT(*) || ':' || MAX(h.createdAt) AS sig
+      FROM highlights h GROUP BY h.articleId
+      HAVING sig IS NOT (SELECT t.sig FROM article_topics t WHERE t.articleId = h.articleId)
+      LIMIT ?`).all(limit),
+    /** What a card is written from: the article's early (cheap) columns, the
+     *  opening of its text, and its highlights. Null when the article is gone. */
+    topicSource: (articleId, { openingChars = 3000 } = {}) => {
+      const a = prep('topSrc', `SELECT title, siteName, byline, excerpt,
+          substr(textContent, 1, @n) AS opening FROM articles WHERE id = @id`)
+        .get({ id: articleId, n: openingChars });
+      if (!a) return null;
+      a.highlights = prep('topHls', 'SELECT text, note FROM highlights WHERE articleId = ? ORDER BY createdAt')
+        .all(articleId);
+      return a;
+    },
+    putTopicCard: ({ articleId, userId, sig, card }) => prep('topPut', `INSERT INTO article_topics
+        (articleId, userId, sig, card, updatedAt) VALUES (@articleId, @userId, @sig, @card, @now)
+      ON CONFLICT(articleId) DO UPDATE SET sig = excluded.sig, card = excluded.card,
+        updatedAt = excluded.updatedAt`).run({ articleId, userId, sig, card, now: Date.now() }),
+    /** Every usable card of a user's still-highlighted articles, in [n] order
+     *  — stable, so the search's prompt-cached catalogue shards stay valid as
+     *  new cards are added at the end. */
+    topicCards: (userId) => prep('topCards', `SELECT t.n, t.articleId, t.card FROM article_topics t
+      WHERE t.userId = ? AND t.card != ''
+        AND EXISTS (SELECT 1 FROM highlights h WHERE h.articleId = t.articleId)
+      ORDER BY t.n`).all(userId),
+    /** For the topics page: how much of the highlighted library has cards, and
+     *  a version that changes whenever any card does (keys the result cache). */
+    topicStats: (userId) => {
+      const highlighted = prep('topHlArts', 'SELECT COUNT(DISTINCT articleId) c FROM highlights WHERE userId = ?').get(userId).c;
+      const t = prep('topStat', `SELECT COUNT(*) c, MAX(updatedAt) v FROM article_topics t
+        WHERE t.userId = ? AND EXISTS (SELECT 1 FROM highlights h WHERE h.articleId = t.articleId)`).get(userId);
+      return { highlighted, carded: t.c, version: `${t.c}:${t.v || 0}` };
+    },
+    /** The early-column metadata a result row shows (no blob reads). */
+    topicArticleMeta: (id, userId) =>
+      prep('topMeta', 'SELECT id, title, siteName, domain FROM articles WHERE id = ? AND userId = ?').get(id, userId),
   };
   return db;
 }

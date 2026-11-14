@@ -209,4 +209,4 @@ async function structureTranscript(sentences) {
 
 const enabled = () => Boolean(process.env.ANTHROPIC_API_KEY);
 
-module.exports = { extractArticle, titleForTranscript, structureTranscript, enabled };
+module.exports = { extractArticle, titleForTranscript, structureTranscript, enabled, getClient };
