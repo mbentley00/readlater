@@ -271,11 +271,12 @@ fun ArticleListScreen(
         }
         // On the plain Archive tab, "newest/oldest" means most-/least-recently
         // archived, so it defaults to what you just archived. Elsewhere it's by
-        // when the article was saved. (archivedAt falls back to updatedAt for rows
-        // archived before it was tracked, or archived on another device.)
+        // when the article was saved. Rows archived before archive dates were
+        // kept fall back to when they were saved — not updatedAt, which every
+        // position sync bumps and so shuffled old articles to the top.
         val archiveOrder = showArchived && !showProblems && view == null && !searchActive
         val timeKey: (ArticleEntity) -> Long =
-            if (archiveOrder) { a -> a.archivedAt ?: a.updatedAt } else { a -> a.savedAt }
+            if (archiveOrder) { a -> a.archivedAt ?: a.savedAt } else { a -> a.savedAt }
         when (sortMode) {
             SortMode.NEWEST -> filtered.sortedByDescending(timeKey)
             SortMode.OLDEST -> filtered.sortedBy(timeKey)
@@ -1172,7 +1173,8 @@ fun ArticleListScreen(
                             onToggleArchive = { repo.toggleArchive(article) },
                             onToggleFavorite = { repo.toggleFavorite(article) },
                             onDelete = { repo.deleteArticle(article) },
-                            shareItems = { close -> ShareMenuItems(article, repo, scope, snackbarHostState, close) }
+                            shareItems = { close -> ShareMenuItems(article, repo, scope, snackbarHostState, close) },
+                            archivedDate = showArchived && !showProblems && selectedView == null && !searchActive
                         )
                     }
                 }
@@ -1248,7 +1250,9 @@ private fun ArticleCard(
     /** On the Podcasts tab: processed / downloaded, shown under the title. */
     episode: EpisodeBadge? = null,
     /** Menu entries of its own (an episode's download / remove). */
-    extraItems: (@Composable (closeMenu: () -> Unit) -> Unit)? = null
+    extraItems: (@Composable (closeMenu: () -> Unit) -> Unit)? = null,
+    /** On the Archive list, ordered by when things were archived: say so. */
+    archivedDate: Boolean = false
 ) {
     var menuOpen by remember { mutableStateOf(false) }
     val unread = article.readParagraph == 0 && article.ttsParagraph == 0
@@ -1354,7 +1358,9 @@ private fun ArticleCard(
                 }
 
                 // date · excerpt
-                val date = cardDate(article.savedAt)
+                val date = article.archivedAt?.takeIf { archivedDate }
+                    ?.let { "Archived ${cardDate(it)}" }
+                    ?: cardDate(article.savedAt)
                 val excerpt = article.excerpt?.takeIf {
                     it.isNotBlank() && it != "Fetching…" && !(episode != null && it == "Transcribing…")
                 }

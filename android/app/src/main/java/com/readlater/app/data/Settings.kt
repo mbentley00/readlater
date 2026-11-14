@@ -153,6 +153,13 @@ class Settings(context: Context) {
             prefs.edit().putString(KEY_RESUME_ARTICLE, value).apply()
         }
 
+    /** A full sync has run since the app began taking archive dates from the server. */
+    var archiveDatesPulled: Boolean
+        get() = prefs.getBoolean("archive_dates_pulled", false)
+        set(value) {
+            prefs.edit().putBoolean("archive_dates_pulled", value).apply()
+        }
+
     /** Where sleep mode picks from: mix | archive | inbox | historylink | cambridge. */
     var sleepSource: String
         get() = prefs.getString("sleep_source", "mix").orEmpty().ifBlank { "mix" }

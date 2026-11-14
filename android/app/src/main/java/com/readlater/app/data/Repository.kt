@@ -287,7 +287,7 @@ class Repository(
                 archived = r.archived, favorite = r.favorite, readParagraph = r.readParagraph,
                 ttsParagraph = r.ttsParagraph, dirty = false, wordCount = r.wordCount,
                 paragraphCount = paragraphCountOf(r.html), imageUrl = r.imageUrl, publishedAt = r.publishedAt,
-                source = r.source, archivedAt = if (r.archived) System.currentTimeMillis() else null
+                source = r.source, archivedAt = if (r.archived) r.archivedAt ?: System.currentTimeMillis() else null
             )
             articleDao.upsertAll(listOf(e))
             e
@@ -319,7 +319,10 @@ class Repository(
      * 4. on full syncs only, delete local articles gone from the server;
      * 5. fetch bodies for inbox articles whose html is missing or stale.
      */
-    suspend fun syncNow(full: Boolean = false): Result<Unit> = withContext(Dispatchers.IO) {
+    suspend fun syncNow(fullAsked: Boolean = false): Result<Unit> = withContext(Dispatchers.IO) {
+        // One full pull after the update that started reading the server's
+        // archive dates, so rows that haven't changed since get theirs too.
+        val full = fullAsked || !settings.archiveDatesPulled
         runCatching {
             val syncStartedAt = System.currentTimeMillis()
 
@@ -403,8 +406,12 @@ class Repository(
                         imageUrl = r.imageUrl,
                         publishedAt = r.publishedAt,
                         source = r.source,
-                        // archivedAt is local-only; keep whatever we recorded on archive.
-                        archivedAt = local?.archivedAt,
+                        // The server's archive date, or the one recorded here when
+                        // archived on this phone (whichever is later); none once
+                        // it's back in the inbox.
+                        archivedAt = if (pending?.archived ?: r.archived) {
+                            listOfNotNull(r.archivedAt, local?.archivedAt).maxOrNull()
+                        } else null,
                         problem = r.problem,
                         problemDetail = r.problemDetail,
                         audioUrl = r.audioUrl
@@ -442,6 +449,7 @@ class Repository(
             }
 
             settings.lastSyncAt = syncStartedAt
+            if (full) settings.archiveDatesPulled = true
 
             // 6. Let go of stored episodes that were archived elsewhere.
             podcasts.sweep { articleDao.stateByUrl(it) }

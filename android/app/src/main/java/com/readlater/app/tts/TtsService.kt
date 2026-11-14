@@ -532,7 +532,10 @@ class TtsService : Service() {
             if (episode != null && startPodcast(episode, article.id)) return@launch
             // Prefer the server (Kokoro) voice when enabled and available;
             // otherwise (incl. not-yet-generated) fall back to the device voice.
-            if (app.settings.useServerVoice && tryStartServerVoice(article.id)) {
+            // Sleep mode always wants the server voice, and waits for it:
+            // there's time, and it is the voice worth falling asleep to.
+            val sleep = rateOverride > 0f
+            if ((app.settings.useServerVoice || sleep) && tryStartServerVoice(article.id, wait = sleep)) {
                 return@launch
             }
             // The server check/wait can take time; bail if the user cancelled
@@ -2305,10 +2308,11 @@ class TtsService : Service() {
      * When the audio isn't cached yet it asks the server to generate it (so it's
      * ready next time) and returns false so the caller uses the device voice now.
      */
-    private suspend fun tryStartServerVoice(id: String): Boolean {
+    private suspend fun tryStartServerVoice(id: String, wait: Boolean = false): Boolean {
         // Bounded check so a slow/cold server doesn't delay the device-voice
         // fallback. The audio-status GET also queues generation server-side.
-        val initial = kotlinx.coroutines.withTimeoutOrNull(3500) { app.apiClient.audioMeta(id) }
+        // Sleep mode ([wait]) gives a cold server longer before settling.
+        val initial = kotlinx.coroutines.withTimeoutOrNull(if (wait) 15_000L else 3500L) { app.apiClient.audioMeta(id) }
         if (initial == null) {
             scope.launch { runCatching { app.apiClient.audioMeta(id) } } // ensure generation is queued
             logDbg("server audio check slow — device voice now; generating in background")
@@ -2318,19 +2322,24 @@ class TtsService : Service() {
 
         val meta: com.readlater.app.data.ApiClient.AudioMeta = if (initial.ready) {
             initial
-        } else if (!app.settings.waitForServerVoice) {
+        } else if (!initial.queued) {
+            logDbg("server audio failed recently — device voice")
+            return false
+        } else if (!app.settings.waitForServerVoice && !wait) {
             logDbg("server audio not cached — generating; using device voice now")
             return false
         } else {
             // Forced wait: poll until the server finishes generating (generation
-            // was already queued by the status GET). Cancellable; ~3 min cap.
+            // was already queued by the status GET). Cancellable; ~3 min cap,
+            // 10 for sleep mode's long articles.
             logDbg("server audio not cached — waiting for server voice")
             var got: com.readlater.app.data.ApiClient.AudioMeta? = null
-            for (i in 0 until 60) {
+            for (i in 0 until if (wait) 200 else 60) {
                 if (id != articleId || !isPlaying) return false // cancelled
                 kotlinx.coroutines.delay(3000)
                 val m = app.apiClient.audioMeta(id)
                 if (m?.ready == true) { got = m; break }
+                if (m != null && !m.queued) { logDbg("server voice generation failed — device voice"); return false }
             }
             got ?: run { logDbg("server voice wait timed out — device voice"); return false }
         }

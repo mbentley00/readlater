@@ -41,7 +41,10 @@ data class RemoteArticle(
     /** One line saying what went wrong. */
     val problemDetail: String? = null,
     /** Where to download this episode's audio (feed episodes only). */
-    val audioUrl: String? = null
+    val audioUrl: String? = null,
+    /** When it was archived, as the server recorded it (null if it isn't, or
+     *  was archived before the server kept track). */
+    val archivedAt: Long? = null
 )
 
 /** Saved filter view as returned by the server. */
@@ -339,7 +342,10 @@ class ApiClient(private val settings: Settings) {
         val durationMs: Int,
         val sampleRate: Int,
         val format: String, // "opus" or "wav"
-        val offsetsMs: IntArray
+        val offsetsMs: IntArray,
+        /** Not ready and not being generated either — the server gave up on
+         *  it for now (a recent failure), so waiting is pointless. */
+        val queued: Boolean = true
     )
 
     /** GET /api/articles/{id}/audio — status + per-paragraph offsets. Also asks
@@ -354,7 +360,8 @@ class ApiClient(private val settings: Settings) {
             durationMs = o.optInt("durationMs", 0),
             sampleRate = o.optInt("sampleRate", 24000),
             format = o.optString("format", "wav"),
-            offsetsMs = offsets
+            offsetsMs = offsets,
+            queued = o.optBoolean("queued", true)
         )
     } catch (_: Exception) {
         null
@@ -718,7 +725,8 @@ class ApiClient(private val settings: Settings) {
         source = o.stringOrNull("source"),
         problem = o.optBoolean("problem", false),
         problemDetail = o.stringOrNull("problemDetail"),
-        audioUrl = o.stringOrNull("audioUrl")
+        audioUrl = o.stringOrNull("audioUrl"),
+        archivedAt = if (o.has("archivedAt") && !o.isNull("archivedAt")) o.optLong("archivedAt").takeIf { it > 0 } else null
     )
 
     private fun parseHighlight(o: JSONObject): RemoteHighlight = RemoteHighlight(
